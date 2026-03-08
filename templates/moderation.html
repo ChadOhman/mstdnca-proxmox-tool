@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% block title %}Moderation - Mastodon Canada Administration Tool{% endblock %}
+
+{% block content %}
+<h2 class="mb-4"><i class="bi bi-shield-exclamation"></i> Moderation</h2>
+
+<ul class="nav nav-pills mb-4" role="tablist">
+    <li class="nav-item" role="presentation">
+        <button class="nav-link active" id="peertube-tab" data-bs-toggle="pill"
+                data-bs-target="#peertube-pane" type="button" role="tab"
+                aria-controls="peertube-pane" aria-selected="true">
+            <i class="bi bi-play-btn"></i> PeerTube
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link" id="mastodon-tab" data-bs-toggle="pill"
+                data-bs-target="#mastodon-pane" type="button" role="tab"
+                aria-controls="mastodon-pane" aria-selected="false">
+            <i class="bi bi-mastodon"></i> Mastodon
+        </button>
+    </li>
+</ul>
+
+<div class="tab-content">
+    <!-- PeerTube Moderation -->
+    <div class="tab-pane fade show active" id="peertube-pane" role="tabpanel" aria-labelledby="peertube-tab">
+        <div class="row g-4">
+            <!-- Configuration -->
+            <div class="col-lg-6">
+                <div class="card bg-dark">
+                    <div class="card-header">
+                        <h5 class="mb-0"><i class="bi bi-gear"></i> PeerTube Moderation Configuration</h5>
+                    </div>
+                    <div class="card-body">
+                        <form method="post" action="/moderation/save">
+                            <div class="mb-3">
+                                <label class="form-label">PeerTube API URL</label>
+                                <input type="url" class="form-control font-monospace" name="peertube_api_url"
+                                       value="{{ settings.peertube_api_url }}"
+                                       placeholder="https://peertube.example.com">
+                                <div class="form-text">Base URL of your PeerTube instance (no trailing slash).</div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">PeerTube Admin API Token</label>
+                                <input type="password" class="form-control font-monospace" name="peertube_api_token"
+                                       placeholder="{{ '********' if settings.peertube_api_token else '' }}">
+                                <div class="form-text">Admin OAuth2 bearer token. Leave blank to keep existing token.</div>
+                            </div>
+                            <div class="row mb-3">
+                                <div class="col-md-6">
+                                    <label class="form-label">Check Interval (hours)</label>
+                                    <input type="number" class="form-control" name="check_interval_hours"
+                                           value="{{ settings.check_interval_hours }}" min="1" max="168">
+                                    <div class="form-text">How often the scheduled check runs.</div>
+                                </div>
+                                <div class="col-md-6 d-flex align-items-end">
+                                    <div class="form-check form-switch mb-3">
+                                        <input class="form-check-input" type="checkbox" id="auto_ban_enabled"
+                                               name="auto_ban_enabled" {{ 'checked' if settings.auto_ban_enabled }}>
+                                        <label class="form-check-label" for="auto_ban_enabled">
+                                            Auto-ban unmatched users
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-primary">
+                                <i class="bi bi-check-lg"></i> Save Settings
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Status & Run -->
+            <div class="col-lg-6">
+                <div class="card bg-dark mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0"><i class="bi bi-activity"></i> Check Status</h5>
+                        <form method="post" action="/moderation/run" class="m-0">
+                            <button type="submit" class="btn btn-sm btn-outline-info"
+                                    {{ 'disabled' if job.running }}
+                                    data-confirm="Run a moderation check now? This will compare PeerTube users against Mastodon emails.">
+                                <i class="bi bi-play-fill"></i> Run Now
+                            </button>
+                        </form>
+                    </div>
+                    <div class="card-body">
+                        {% if settings.last_check_at %}
+                        <p class="mb-2">
+                            <strong>Last check:</strong>
+                            <span class="local-dt" data-utc="{{ settings.last_check_at.isoformat() if settings.last_check_at }}">
+                                {{ settings.last_check_at }}
+                            </span>
+                        </p>
+                        {% endif %}
+
+                        {% if last_result %}
+                        <div class="row text-center mb-3">
+                            <div class="col">
+                                <div class="fs-4 fw-bold text-info">{{ last_result.total_peertube_users }}</div>
+                                <small class="text-muted">PeerTube Users</small>
+                            </div>
+                            <div class="col">
+                                <div class="fs-4 fw-bold text-success">{{ last_result.matched }}</div>
+                                <small class="text-muted">Matched</small>
+                            </div>
+                            <div class="col">
+                                <div class="fs-4 fw-bold text-warning">{{ last_result.unmatched | length }}</div>
+                                <small class="text-muted">Unmatched</small>
+                            </div>
+                            <div class="col">
+                                <div class="fs-4 fw-bold text-secondary">{{ last_result.skipped_admins }}</div>
+                                <small class="text-muted">Admins Skipped</small>
+                            </div>
+                        </div>
+                        {% else %}
+                        <p class="text-muted mb-0">No checks have been run yet.</p>
+                        {% endif %}
+
+                        <!-- Job log area (populated via polling) -->
+                        <div id="moderation-log-area" style="display: {{ 'block' if job.running else 'none' }}">
+                            <hr>
+                            <pre id="moderation-log" class="bg-black text-light p-2 rounded"
+                                 style="max-height: 300px; overflow-y: auto; font-size: 0.8rem;"></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Results Table -->
+        {% if last_result and last_result.unmatched %}
+        <div class="card bg-dark mt-4">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-table"></i> Unmatched PeerTube Users</h5>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-dark table-striped table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>Username</th>
+                                <th>Email</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for user in last_result.unmatched %}
+                            <tr>
+                                <td>{{ user.username }}</td>
+                                <td class="font-monospace">{{ user.email }}</td>
+                                <td>
+                                    {% if user.banned %}
+                                    <span class="badge bg-danger">Banned</span>
+                                    {% else %}
+                                    <span class="badge bg-warning text-dark">Unmatched</span>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- Mastodon Moderation (placeholder) -->
+    <div class="tab-pane fade" id="mastodon-pane" role="tabpanel" aria-labelledby="mastodon-tab">
+        <div class="card bg-dark">
+            <div class="card-body text-center py-5">
+                <i class="bi bi-mastodon fs-1 text-muted"></i>
+                <h4 class="mt-3 text-muted">Mastodon Moderation</h4>
+                <p class="text-muted">Mastodon moderation features coming soon.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+    const logArea = document.getElementById('moderation-log-area');
+    const logPre = document.getElementById('moderation-log');
+    let polling = {{ 'true' if job.running else 'false' }};
+
+    function pollStatus() {
+        if (!polling) return;
+        fetch('/moderation/status')
+            .then(r => r.json())
+            .then(data => {
+                if (data.log && data.log.length) {
+                    logArea.style.display = 'block';
+                    logPre.textContent = data.log.join('\n');
+                    logPre.scrollTop = logPre.scrollHeight;
+                }
+                if (data.running) {
+                    setTimeout(pollStatus, 2000);
+                } else {
+                    polling = false;
+                    if (data.success !== null) {
+                        // Reload to show updated results
+                        setTimeout(() => window.location.reload(), 1000);
+                    }
+                }
+            })
+            .catch(() => setTimeout(pollStatus, 5000));
+    }
+
+    if (polling) pollStatus();
+})();
+</script>
+{% endblock %}
