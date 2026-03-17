@@ -1,0 +1,47 @@
+<!-- AI Chat Sidebar (Bootstrap Offcanvas) -->
+<div class="offcanvas offcanvas-end" tabindex="-1" id="aiChatSidebar" aria-labelledby="aiChatSidebarLabel"
+     style="width: 420px; background-color: var(--bs-dark);">
+    <div class="offcanvas-header border-bottom border-secondary py-2">
+        <h6 class="offcanvas-title mb-0" id="aiChatSidebarLabel">
+            <i class="bi bi-robot"></i> AI Assistant
+        </h6>
+        <div class="d-flex align-items-center gap-2">
+            <div class="dropdown">
+                <button class="btn btn-outline-secondary btn-sm dropdown-toggle" type="button"
+                        id="aiSessionDropdown" data-bs-toggle="dropdown" aria-expanded="false"
+                        title="Chat sessions">
+                    <i class="bi bi-chat-left-text"></i>
+                </button>
+                <ul class="dropdown-menu dropdown-menu-dark dropdown-menu-end" id="aiSessionList"
+                    aria-labelledby="aiSessionDropdown" style="max-height: 300px; overflow-y: auto;">
+                    <li><a class="dropdown-item" href="#" id="aiNewChatBtn"><i class="bi bi-plus-lg"></i> New Chat</a></li>
+                    <li><hr class="dropdown-divider"></li>
+                </ul>
+            </div>
+            <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+        </div>
+    </div>
+
+    <div class="offcanvas-body p-0 d-flex flex-column">
+        <!-- Messages area -->
+        <div class="flex-grow-1 overflow-auto p-3" id="aiChatMessages" style="font-size: 0.9rem;">
+            <div class="text-center text-muted py-4" id="aiEmptyState">
+                <i class="bi bi-robot" style="font-size: 2rem;"></i>
+                <p class="mt-2 mb-0">Ask me about your infrastructure</p>
+                <p class="small">I can query guests, check services, view updates, and more.</p>
+            </div>
+        </div>
+
+        <!-- Input area -->
+        <div class="border-top border-secondary p-3">
+            <form id="aiChatForm" class="d-flex gap-2">
+                <textarea class="form-control form-control-sm" id="aiChatInput" rows="1"
+                          placeholder="Ask something..." style="resize: none; max-height: 120px;"
+                          aria-label="Chat message"></textarea>
+                <button type="submit" class="btn btn-primary btn-sm" id="aiSendBtn" title="Send">
+                    <i class="bi bi-send"></i>
+                </button>
+            </form>
+        </div>
+    </div>
+</div>

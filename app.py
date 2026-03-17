@@ -42,6 +42,7 @@ def create_app(test_config=None):
         db.create_all()
         _migrate_ipmi_columns()
         _migrate_moderation_columns()
+        _migrate_ai_columns()
         _migrate_smcipmi_to_ipmi_exporter()
         _seed_roles()
         _ensure_default_admin()
@@ -89,6 +90,7 @@ def create_app(test_config=None):
     app.config["GIT_BRANCH"] = git_branch
 
     # Register blueprints
+    from routes.ai_chat import bp as ai_chat_bp
     from routes.api import bp as api_bp
     from routes.api_v1 import bp as api_v1_bp
     from routes.applications import bp as applications_bp
@@ -142,6 +144,7 @@ def create_app(test_config=None):
     app.register_blueprint(unpoller_bp, url_prefix="/unpoller")
     app.register_blueprint(api_v1_bp, url_prefix="/api/v1")
     app.register_blueprint(trends_bp, url_prefix="/trends")
+    app.register_blueprint(ai_chat_bp, url_prefix="/ai")
 
     # Initialize WebSocket for terminal
     from routes.terminal import init_websocket
@@ -334,6 +337,11 @@ def _migrate_moderation_columns():
     except Exception as e:
         db.session.rollback()
         logger.debug("Migration check for roles.can_moderate: %s", e)
+
+
+def _migrate_ai_columns():
+    """Add AI-related columns to existing tables that were created before this feature."""
+    _add_column_if_missing("roles", "can_use_ai", "BOOLEAN DEFAULT 0")
 
 
 def _migrate_ipmi_columns():

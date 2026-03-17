@@ -1113,6 +1113,62 @@ def _run_moderation_check(app):
             logger.error("Scheduled moderation check failed")
 
 
+def _run_ai_upgrade_analysis(app):
+    """Analyze pending updates across all guests using Claude AI."""
+    with app.app_context():
+        from models import Guest, Setting
+
+        if Setting.get("ai_enabled", "false") != "true":
+            return
+        if not Setting.get("ai_api_key"):
+            return
+
+        from clients.claude_client import get_claude_client
+        client = get_claude_client()
+        if not client:
+            return
+
+        guests = Guest.query.filter_by(enabled=True).all()
+        guests_with_updates = [g for g in guests if g.pending_updates()]
+        if not guests_with_updates:
+            logger.debug("AI upgrade analysis: no pending updates found.")
+            return
+
+        logger.info("Running AI upgrade analysis for %d guest(s) with pending updates...", len(guests_with_updates))
+
+        summary_lines = []
+        for g in guests_with_updates:
+            updates = g.pending_updates()
+            pkg_list = ", ".join(u.package_name for u in updates[:20])
+            security = g.security_updates()
+            reboot = g.reboot_updates()
+            summary_lines.append(
+                f"- {g.name}: {len(updates)} updates ({len(security)} security, "
+                f"{len(reboot)} require reboot). Packages: {pkg_list}"
+            )
+
+        prompt = (
+            "Analyze these pending updates across our datacenter guests. "
+            "Flag any risky packages, suggest an update order, and note any "
+            "breaking changes or packages that require special attention.\n\n"
+            + "\n".join(summary_lines)
+        )
+
+        response = client.send_message(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="You are an infrastructure analyst. Provide concise, actionable analysis.",
+        )
+
+        if response:
+            text = response.content[0].text if response.content else ""
+            Setting.set("ai_upgrade_analysis", text)
+            Setting.set("ai_upgrade_analysis_time",
+                         __import__("datetime").datetime.now(
+                             __import__("datetime").timezone.utc
+                         ).isoformat())
+            logger.info("AI upgrade analysis complete (%d chars).", len(text))
+
+
 def init_scheduler(app):
     global _scheduler
 
@@ -1358,6 +1414,17 @@ def init_scheduler(app):
         args=[app],
         id="moderation_check",
         name="Cross-check PeerTube users against Mastodon emails",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # AI upgrade analysis - runs daily
+    _scheduler.add_job(
+        _run_ai_upgrade_analysis,
+        trigger=IntervalTrigger(hours=24),
+        args=[app],
+        id="ai_upgrade_analysis",
+        name="AI-powered upgrade risk analysis",
         replace_existing=True,
         max_instances=1,
     )
