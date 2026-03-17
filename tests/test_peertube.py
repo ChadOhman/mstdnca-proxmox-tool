@@ -263,7 +263,7 @@ class TestPeerTubeRouteAuthed:
         auth_client.post(
             "/peertube/save",
             data={
-                "peertube_db_password": "mysecretpass",
+                "peertube_db_password": "test-only-db-pass",
                 "peertube_protection_type": "snapshot",
             },
             follow_redirects=False,
@@ -271,10 +271,10 @@ class TestPeerTubeRouteAuthed:
         with app.app_context():
             stored = Setting.get("peertube_db_password", "")
             assert stored != ""
-            assert stored != "mysecretpass"
+            assert stored != "test-only-db-pass"
             # Verify it can be decrypted back
             from auth.credential_store import decrypt
-            assert decrypt(stored) == "mysecretpass"
+            assert decrypt(stored) == "test-only-db-pass"
 
     def test_save_keeps_existing_password_when_blank(self, app, auth_client):
         """Submitting blank password preserves existing encrypted value."""
