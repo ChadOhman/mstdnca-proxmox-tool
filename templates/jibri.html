@@ -1,0 +1,610 @@
+{% extends "base.html" %}
+{% block title %}Jibri Recording - Mastodon Canada Administration Tool{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="mb-3">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/applications">Applications</a></li>
+        <li class="breadcrumb-item active">Jibri Recording &amp; Streaming</li>
+    </ol>
+</nav>
+
+<h2 class="mb-4"><i class="bi bi-record-circle"></i> Jibri Recording &amp; Streaming</h2>
+
+{% if not settings.jitsi_installed %}
+<div class="alert alert-warning">
+    <i class="bi bi-exclamation-triangle"></i>
+    <strong>Jitsi Meet must be installed first.</strong>
+    Jibri connects to Jitsi Meet via XMPP for recording and streaming.
+    <a href="/jitsi/upgrade" class="alert-link">Go to Jitsi Meet</a>.
+</div>
+{% endif %}
+
+<div class="row g-4">
+    <!-- Configuration Card -->
+    <div class="col-lg-6">
+        <div class="card bg-dark">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-gear"></i> Configuration</h5>
+            </div>
+            <div class="card-body">
+                <form method="post" action="/jibri/save">
+                    <div class="mb-3">
+                        <label class="form-label">Jibri VM</label>
+                        <select class="form-select" name="jibri_guest_id">
+                            <option value="">-- Select VM --</option>
+                            {% for guest in guests %}
+                            <option value="{{ guest.id }}" {{ 'selected' if settings.guest_id == guest.id|string }}>
+                                {{ guest.name }}{% if not safety_mode %} ({{ guest.ip_address or 'no IP' }}){% endif %}
+                            </option>
+                            {% endfor %}
+                        </select>
+                        <div class="form-text">Must be a VM (not LXC) for the <code>snd-aloop</code> kernel module.</div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Recording Directory</label>
+                        <input type="text" class="form-control font-monospace" name="jibri_recording_dir"
+                               value="{{ settings.recording_dir }}" placeholder="/srv/recordings">
+                        <div class="form-text">Directory on the Jibri VM where recordings are saved (also the SMB mount point).</div>
+                    </div>
+
+                    {% if settings.jitsi_hostname %}
+                    <div class="mb-3">
+                        <label class="form-label">Jitsi Meet Server</label>
+                        <input type="text" class="form-control font-monospace" value="{{ settings.jitsi_hostname }}" disabled>
+                        <div class="form-text">Auto-detected from Jitsi settings. <a href="/jitsi/upgrade">Change in Jitsi</a>.</div>
+                    </div>
+                    {% endif %}
+
+                    <div class="mb-3">
+                        <label class="form-label">Pre-Install Protection</label>
+                        <div class="form-check">
+                            <input type="radio" class="form-check-input" name="jibri_protection_type"
+                                   id="protSnap" value="snapshot" onchange="toggleBackupFields()"
+                                   {{ 'checked' if settings.protection_type != 'backup' and snapshots_supported }}>
+                            <label class="form-check-label" for="protSnap">
+                                Snapshot <small class="text-muted">— instant, reverts in place</small>
+                            </label>
+                        </div>
+                        <div class="form-check">
+                            <input type="radio" class="form-check-input" name="jibri_protection_type"
+                                   id="protBack" value="backup" onchange="toggleBackupFields()"
+                                   {{ 'checked' if settings.protection_type == 'backup' or not snapshots_supported }}>
+                            <label class="form-check-label" for="protBack">
+                                Backup (vzdump) <small class="text-muted">— portable, stored separately</small>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="mb-3 {{ '' if settings.protection_type == 'backup' or not snapshots_supported else 'd-none' }}" id="backupStorageRow">
+                        <label class="form-label">Backup Storage</label>
+                        <select class="form-select font-monospace" name="jibri_backup_storage">
+                            <option value="">-- Select Storage --</option>
+                            {% for st in backup_storages %}
+                            <option value="{{ st.storage }}" {{ 'selected' if settings.backup_storage == st.storage }}>
+                                {{ st.storage }} ({{ st.content }})
+                            </option>
+                            {% endfor %}
+                            {% if settings.backup_storage and not (backup_storages | selectattr('storage', 'equalto', settings.backup_storage) | list) %}
+                            <option value="{{ settings.backup_storage }}" selected>{{ settings.backup_storage }} (saved)</option>
+                            {% endif %}
+                        </select>
+                    </div>
+
+                    <div class="mb-3 {{ '' if settings.protection_type == 'backup' or not snapshots_supported else 'd-none' }}" id="backupModeRow">
+                        <label class="form-label">Backup Mode</label>
+                        <select class="form-select" name="jibri_backup_mode">
+                            <option value="snapshot" {{ 'selected' if settings.backup_mode == 'snapshot' }}>Snapshot (live)</option>
+                            <option value="suspend" {{ 'selected' if settings.backup_mode == 'suspend' }}>Suspend</option>
+                            <option value="stop" {{ 'selected' if settings.backup_mode == 'stop' }}>Stop</option>
+                        </select>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-save"></i> Save Settings</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Status & Actions Card -->
+    <div class="col-lg-6">
+        <div class="card bg-dark">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-activity"></i> Status &amp; Actions</h5>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <strong>Jibri:</strong>
+                    {% if settings.installed %}
+                    <span class="badge bg-success">Installed</span>
+                    {% else %}
+                    <span class="badge bg-secondary">Not installed</span>
+                    {% endif %}
+
+                    {% if settings.enabled %}
+                    <span class="badge bg-success">Recording enabled</span>
+                    {% elif settings.installed %}
+                    <span class="badge bg-warning text-dark">Recording not configured on Jitsi</span>
+                    {% endif %}
+
+                    <span id="jibriStatusBadge" class="badge bg-secondary">Checking...</span>
+                </div>
+
+                {% if settings.last_install_at %}
+                <div class="mb-3">
+                    <small class="text-muted">
+                        Last install: {{ settings.last_install_at.strftime('%Y-%m-%d %H:%M UTC') }}
+                        {% if settings.last_install_status == 'success' %}
+                        <span class="badge bg-success">Success</span>
+                        {% elif settings.last_install_status == 'error' %}
+                        <span class="badge bg-danger">Failed</span>
+                        {% endif %}
+                    </small>
+                </div>
+                {% endif %}
+
+                {% if settings.last_configure_at %}
+                <div class="mb-3">
+                    <small class="text-muted">
+                        Last Jitsi configure: {{ settings.last_configure_at.strftime('%Y-%m-%d %H:%M UTC') }}
+                        {% if settings.last_configure_status == 'success' %}
+                        <span class="badge bg-success">Success</span>
+                        {% elif settings.last_configure_status == 'error' %}
+                        <span class="badge bg-danger">Failed</span>
+                        {% endif %}
+                    </small>
+                </div>
+                {% endif %}
+
+                <div class="d-flex flex-wrap gap-2 mb-3">
+                    <button class="btn btn-outline-info btn-sm" id="preflightBtn" onclick="startPreflight()"
+                            {{ 'disabled' if not settings.guest_id or not settings.jitsi_installed }}>
+                        <i class="bi bi-clipboard-check"></i> Pre-flight Check
+                    </button>
+                    <span id="preflightStatusBadge"></span>
+                </div>
+
+                <div class="d-flex flex-wrap gap-2 mb-3">
+                    <form method="post" action="/jibri/install" onsubmit="return startInstall(event)" class="d-inline">
+                        <button type="submit" class="btn btn-outline-success btn-sm" id="installBtn"
+                                {{ 'disabled' if not settings.guest_id or not settings.jitsi_installed or settings.installed }}>
+                            <i class="bi bi-download"></i> Install Jibri
+                        </button>
+                    </form>
+
+                    <form method="post" action="/jibri/configure-jitsi" onsubmit="return startConfigure(event)" class="d-inline">
+                        <button type="submit" class="btn btn-outline-warning btn-sm" id="configureBtn"
+                                {{ 'disabled' if not settings.installed }}>
+                            <i class="bi bi-sliders"></i> Configure Jitsi Server
+                        </button>
+                    </form>
+                </div>
+
+                <span id="operationStatusBadge"></span>
+                <span id="operationSpinner" class="spinner-border spinner-border-sm text-info d-none" role="status"></span>
+            </div>
+        </div>
+    </div>
+
+    <!-- SMB Storage Card -->
+    <div class="col-lg-6">
+        <div class="card bg-dark">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-hdd-network"></i> SMB Storage</h5>
+            </div>
+            <div class="card-body">
+                <form method="post" action="/jibri/save">
+                    <div class="mb-3">
+                        <label class="form-label">SMB Share Path</label>
+                        <input type="text" class="form-control font-monospace" name="jibri_smb_share"
+                               value="{{ settings.smb_share }}" placeholder="//server/share">
+                        <div class="form-text">Network share path (e.g. <code>//nas.local/recordings</code>).</div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Username</label>
+                        <input type="text" class="form-control" name="jibri_smb_username"
+                               value="{{ settings.smb_username }}" placeholder="username">
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Password</label>
+                        <input type="password" class="form-control" name="jibri_smb_password"
+                               placeholder="{{ '(saved)' if settings.smb_configured else 'password' }}">
+                        <div class="form-text">Leave blank to keep existing password.</div>
+                    </div>
+
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-primary btn-sm"><i class="bi bi-save"></i> Save SMB Settings</button>
+                        <button type="button" class="btn btn-outline-success btn-sm" id="smbBtn"
+                                onclick="startSMBConfigure()"
+                                {{ 'disabled' if not settings.installed or not settings.smb_share }}>
+                            <i class="bi bi-hdd-network"></i> Mount SMB Share
+                        </button>
+                    </div>
+
+                    {% if settings.smb_configured %}
+                    <div class="mt-2">
+                        <span class="badge bg-success"><i class="bi bi-check-lg"></i> SMB mounted</span>
+                    </div>
+                    {% endif %}
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recording Control Card (OBS-like) -->
+    <div class="col-lg-6">
+        <div class="card bg-dark">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-record-circle"></i> Recording &amp; Streaming Control</h5>
+            </div>
+            <div class="card-body">
+                {% if not settings.installed or not settings.enabled %}
+                <div class="alert alert-secondary mb-3">
+                    <small>Install Jibri and configure the Jitsi server to enable recording controls.</small>
+                </div>
+                {% endif %}
+
+                <div class="mb-3">
+                    <label class="form-label">Conference Room Name</label>
+                    <input type="text" class="form-control" id="roomName" placeholder="my-meeting"
+                           {{ 'disabled' if not settings.enabled }}>
+                    <div class="form-text">The room name from the Jitsi Meet URL.</div>
+                </div>
+
+                <!-- Recording -->
+                <div class="d-flex flex-wrap gap-2 mb-3">
+                    <form method="post" action="/jibri/record/start" class="d-inline" id="recordStartForm">
+                        <input type="hidden" name="room_name" id="recordRoomInput">
+                        <button type="submit" class="btn btn-danger btn-sm" id="recordStartBtn"
+                                onclick="document.getElementById('recordRoomInput').value=document.getElementById('roomName').value"
+                                {{ 'disabled' if not settings.enabled }}>
+                            <i class="bi bi-record-fill"></i> Start Recording
+                        </button>
+                    </form>
+                    <form method="post" action="/jibri/record/stop" class="d-inline">
+                        <button type="submit" class="btn btn-outline-secondary btn-sm" id="recordStopBtn"
+                                {{ 'disabled' if not settings.enabled }}>
+                            <i class="bi bi-stop-fill"></i> Stop Recording
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Streaming -->
+                <hr>
+                <div class="mb-3">
+                    <label class="form-label">RTMP URL</label>
+                    <input type="text" class="form-control font-monospace" id="rtmpUrl"
+                           placeholder="rtmp://a.rtmp.youtube.com/live2"
+                           {{ 'disabled' if not settings.enabled }}>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Stream Key</label>
+                    <input type="password" class="form-control font-monospace" id="streamKey"
+                           placeholder="xxxx-xxxx-xxxx-xxxx"
+                           {{ 'disabled' if not settings.enabled }}>
+                </div>
+                <div class="d-flex flex-wrap gap-2">
+                    <form method="post" action="/jibri/stream/start" class="d-inline" id="streamStartForm">
+                        <input type="hidden" name="room_name" id="streamRoomInput">
+                        <input type="hidden" name="rtmp_url" id="streamRtmpInput">
+                        <input type="hidden" name="stream_key" id="streamKeyInput">
+                        <button type="submit" class="btn btn-primary btn-sm" id="streamStartBtn"
+                                onclick="document.getElementById('streamRoomInput').value=document.getElementById('roomName').value;document.getElementById('streamRtmpInput').value=document.getElementById('rtmpUrl').value;document.getElementById('streamKeyInput').value=document.getElementById('streamKey').value"
+                                {{ 'disabled' if not settings.enabled }}>
+                            <i class="bi bi-broadcast"></i> Start Streaming
+                        </button>
+                    </form>
+                    <form method="post" action="/jibri/stream/stop" class="d-inline">
+                        <button type="submit" class="btn btn-outline-secondary btn-sm" id="streamStopBtn"
+                                {{ 'disabled' if not settings.enabled }}>
+                            <i class="bi bi-stop-fill"></i> Stop Streaming
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recordings List Card -->
+    <div class="col-12">
+        <div class="card bg-dark">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-film"></i> Recordings</h5>
+                <button class="btn btn-outline-secondary btn-sm" onclick="loadRecordings()"
+                        {{ 'disabled' if not settings.installed }}>
+                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                </button>
+            </div>
+            <div class="card-body">
+                <div id="recordingsTable">
+                    {% if settings.installed %}
+                    <p class="text-muted">Loading recordings...</p>
+                    {% else %}
+                    <p class="text-muted">Install Jibri to manage recordings.</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Log Card -->
+    <div class="col-12" id="logCard">
+        <div class="card bg-dark">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-terminal"></i> Operation Log</h5>
+            </div>
+            <div class="card-body">
+                <pre id="liveLog" class="bg-black text-light p-3 rounded" style="max-height: 400px; overflow-y: auto; white-space: pre-wrap; font-size: 0.85rem;">{% if settings.last_install_log %}{{ settings.last_install_log }}{% else %}No operations run yet.{% endif %}</pre>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── Protection type toggle ──────────────────────────────────────────────────
+function toggleBackupFields() {
+    const isBackup = document.getElementById('protBack').checked;
+    document.getElementById('backupStorageRow').classList.toggle('d-none', !isBackup);
+    document.getElementById('backupModeRow').classList.toggle('d-none', !isBackup);
+}
+
+// ── Status polling ──────────────────────────────────────────────────────────
+function updateJibriStatus() {
+    fetch('/jibri/status')
+        .then(r => r.json())
+        .then(data => {
+            const badge = document.getElementById('jibriStatusBadge');
+            if (data.status === 'idle') {
+                badge.className = 'badge bg-success';
+                badge.textContent = 'Idle';
+            } else if (data.status === 'busy') {
+                badge.className = 'badge bg-danger';
+                badge.textContent = 'Recording/Streaming';
+            } else {
+                badge.className = 'badge bg-secondary';
+                badge.textContent = data.service === 'not_installed' ? 'Not installed' : 'Unhealthy';
+            }
+        })
+        .catch(() => {
+            const badge = document.getElementById('jibriStatusBadge');
+            badge.className = 'badge bg-secondary';
+            badge.textContent = 'Unknown';
+        });
+}
+
+{% if settings.installed %}
+updateJibriStatus();
+setInterval(updateJibriStatus, 15000);
+{% endif %}
+
+// ── Pre-flight ──────────────────────────────────────────────────────────────
+let _preflightLogLen = 0;
+
+function _setPreflightBadge(success) {
+    const badge = document.getElementById('preflightStatusBadge');
+    if (success === true) {
+        badge.innerHTML = '<span class="badge bg-success">All clear</span>';
+    } else if (success === false) {
+        badge.innerHTML = '<span class="badge bg-danger">Failed</span>';
+    }
+}
+
+function pollPreflightStatus() {
+    fetch('/jibri/preflight/status')
+        .then(r => r.json())
+        .then(data => {
+            const logEl = document.getElementById('liveLog');
+            const newLines = data.log.slice(_preflightLogLen);
+            if (newLines.length) {
+                if (_preflightLogLen === 0) logEl.textContent = '';
+                logEl.textContent += newLines.join('\n') + '\n';
+                _preflightLogLen = data.log.length;
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+            if (data.running) {
+                setTimeout(pollPreflightStatus, 1500);
+            } else {
+                _setOperationRunning(false);
+                const preflightBtn = document.getElementById('preflightBtn');
+                if (preflightBtn) preflightBtn.disabled = false;
+                if (data.success !== null) _setPreflightBadge(data.success);
+            }
+        })
+        .catch(() => setTimeout(pollPreflightStatus, 3000));
+}
+
+function startPreflight() {
+    _preflightLogLen = 0;
+    const logEl = document.getElementById('liveLog');
+    logEl.textContent = 'Starting pre-flight check\u2026\n';
+    document.getElementById('operationStatusBadge').innerHTML = '';
+    const badgeEl = document.getElementById('preflightStatusBadge');
+    if (badgeEl) badgeEl.innerHTML = '';
+    _setOperationRunning(true);
+    const preflightBtn = document.getElementById('preflightBtn');
+    if (preflightBtn) preflightBtn.disabled = true;
+    document.getElementById('logCard').scrollIntoView({behavior: 'smooth'});
+
+    fetch('/jibri/preflight', {method: 'POST'})
+        .then(r => {
+            if (r.status === 409) {
+                return r.json().then(d => {
+                    logEl.textContent = 'ERROR: ' + (d.error || 'Another operation is in progress') + '\n';
+                    _setOperationRunning(false);
+                    if (preflightBtn) preflightBtn.disabled = false;
+                });
+            }
+            setTimeout(pollPreflightStatus, 1500);
+        })
+        .catch(() => {
+            logEl.textContent = 'ERROR: Could not start pre-flight check\n';
+            _setOperationRunning(false);
+            if (preflightBtn) preflightBtn.disabled = false;
+        });
+}
+
+// ── Operation log polling ───────────────────────────────────────────────────
+let _logLen = 0;
+
+function _setOperationRunning(running) {
+    const spinner = document.getElementById('operationSpinner');
+    const installBtn = document.getElementById('installBtn');
+    const configureBtn = document.getElementById('configureBtn');
+    const smbBtn = document.getElementById('smbBtn');
+    spinner.classList.toggle('d-none', !running);
+    if (installBtn) installBtn.disabled = running;
+    if (configureBtn) configureBtn.disabled = running;
+    if (smbBtn) smbBtn.disabled = running;
+}
+
+function _setOperationBadge(success, type) {
+    const badge = document.getElementById('operationStatusBadge');
+    const label = type === 'install' ? 'Install' : type === 'configure' ? 'Configure Jitsi' : type === 'smb' ? 'SMB Mount' : type;
+    if (success === true) {
+        badge.innerHTML = '<span class="badge bg-success">' + label + ' Success</span>';
+    } else if (success === false) {
+        badge.innerHTML = '<span class="badge bg-danger">' + label + ' Failed</span>';
+    }
+}
+
+function pollOperationStatus(endpoint, type) {
+    fetch(endpoint)
+        .then(r => r.json())
+        .then(data => {
+            const logEl = document.getElementById('liveLog');
+            const newLines = data.log.slice(_logLen);
+            if (newLines.length) {
+                if (_logLen === 0) logEl.textContent = '';
+                logEl.textContent += newLines.join('\n') + '\n';
+                _logLen = data.log.length;
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+            if (data.running) {
+                setTimeout(() => pollOperationStatus(endpoint, type), 1500);
+            } else {
+                _setOperationRunning(false);
+                if (data.success !== null) _setOperationBadge(data.success, type);
+                if (type === 'install' || type === 'configure') {
+                    setTimeout(() => location.reload(), 2000);
+                }
+            }
+        })
+        .catch(() => setTimeout(() => pollOperationStatus(endpoint, type), 3000));
+}
+
+function startInstall(e) {
+    if (!confirm('This will provision the selected VM as a Jibri recording server.\n\n'
+        + 'Steps:\n'
+        + '1. Snapshot/backup the VM\n'
+        + '2. Install prerequisites (Java, Chrome, FFmpeg, ALSA)\n'
+        + '3. Install Jibri package\n'
+        + '4. Configure and start Jibri service\n\n'
+        + 'This may take 10-15 minutes. Continue?')) {
+        e.preventDefault();
+        return false;
+    }
+    _logLen = 0;
+    document.getElementById('liveLog').textContent = 'Starting Jibri installation\u2026\n';
+    document.getElementById('operationStatusBadge').innerHTML = '';
+    _setOperationRunning(true);
+    document.getElementById('logCard').scrollIntoView({behavior: 'smooth'});
+    setTimeout(() => pollOperationStatus('/jibri/install/status', 'install'), 1500);
+    return true;
+}
+
+function startConfigure(e) {
+    if (!confirm('This will configure the Jitsi Meet server to enable Jibri recording and streaming.\n\n'
+        + 'Steps:\n'
+        + '1. Patch Prosody (XMPP) configuration\n'
+        + '2. Patch Jicofo conference focus\n'
+        + '3. Enable recording/streaming in Jitsi Meet UI\n'
+        + '4. Restart Jitsi services\n\n'
+        + 'Continue?')) {
+        e.preventDefault();
+        return false;
+    }
+    _logLen = 0;
+    document.getElementById('liveLog').textContent = 'Configuring Jitsi server for Jibri\u2026\n';
+    document.getElementById('operationStatusBadge').innerHTML = '';
+    _setOperationRunning(true);
+    document.getElementById('logCard').scrollIntoView({behavior: 'smooth'});
+    setTimeout(() => pollOperationStatus('/jibri/configure-jitsi/status', 'configure'), 1500);
+    return true;
+}
+
+function startSMBConfigure() {
+    if (!confirm('This will configure the SMB/CIFS mount on the Jibri VM.\n\n'
+        + 'Make sure you have saved the SMB settings first.\n\n'
+        + 'Continue?')) return;
+    _logLen = 0;
+    document.getElementById('liveLog').textContent = 'Configuring SMB mount\u2026\n';
+    document.getElementById('operationStatusBadge').innerHTML = '';
+    _setOperationRunning(true);
+    document.getElementById('logCard').scrollIntoView({behavior: 'smooth'});
+
+    fetch('/jibri/configure-smb', {method: 'POST'})
+        .then(() => setTimeout(() => pollOperationStatus('/jibri/configure-smb/status', 'smb'), 1500))
+        .catch(() => {
+            document.getElementById('liveLog').textContent = 'ERROR: Could not start SMB configuration\n';
+            _setOperationRunning(false);
+        });
+}
+
+// ── Recordings list ─────────────────────────────────────────────────────────
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+
+function loadRecordings() {
+    const container = document.getElementById('recordingsTable');
+    fetch('/jibri/recordings')
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                container.innerHTML = '<p class="text-warning">' + data.error + '</p>';
+                return;
+            }
+            if (!data.recordings || data.recordings.length === 0) {
+                container.innerHTML = '<p class="text-muted">No recordings found.</p>';
+                return;
+            }
+            let html = '<div class="table-responsive"><table class="table table-dark table-sm">'
+                + '<thead><tr><th>Filename</th><th>Size</th><th>Date</th><th>Actions</th></tr></thead><tbody>';
+            data.recordings.forEach(rec => {
+                const date = rec.created_at ? new Date(rec.created_at * 1000).toLocaleString() : '—';
+                html += '<tr>'
+                    + '<td class="font-monospace small">' + rec.filename + '</td>'
+                    + '<td>' + formatBytes(rec.size_bytes) + '</td>'
+                    + '<td>' + date + '</td>'
+                    + '<td>'
+                    + '<form method="post" action="/jibri/recordings/delete" class="d-inline" '
+                    + 'onsubmit="return confirm(\'Delete ' + rec.filename + '?\')">'
+                    + '<input type="hidden" name="filename" value="' + rec.filename + '">'
+                    + '<button type="submit" class="btn btn-outline-danger btn-sm"><i class="bi bi-trash"></i></button>'
+                    + '</form>'
+                    + '</td>'
+                    + '</tr>';
+            });
+            html += '</tbody></table></div>';
+            container.innerHTML = html;
+        })
+        .catch(() => {
+            container.innerHTML = '<p class="text-danger">Failed to load recordings.</p>';
+        });
+}
+
+{% if settings.installed %}
+loadRecordings();
+{% endif %}
+</script>
+{% endblock %}

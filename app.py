@@ -98,6 +98,7 @@ def create_app(test_config=None):
     from routes.guests import bp as guests_bp
     from routes.hosts import bp as hosts_bp
     from routes.ipmi import bp as ipmi_bp
+    from routes.jibri import bp as jibri_bp
     from routes.jitsi import bp as jitsi_bp
     from routes.mastodon import bp as mastodon_bp
     from routes.peertube import bp as peertube_bp
@@ -124,6 +125,7 @@ def create_app(test_config=None):
     app.register_blueprint(ghost_bp, url_prefix="/ghost")
     app.register_blueprint(peertube_bp, url_prefix="/peertube")
     app.register_blueprint(elk_bp, url_prefix="/elk")
+    app.register_blueprint(jibri_bp, url_prefix="/jibri")
     app.register_blueprint(jitsi_bp, url_prefix="/jitsi")
     app.register_blueprint(services_bp, url_prefix="/services")
     app.register_blueprint(unifi_bp, url_prefix="/unifi")

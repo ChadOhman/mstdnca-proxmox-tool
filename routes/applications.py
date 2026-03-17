@@ -50,6 +50,10 @@ def index():
             "latest_version": Setting.get("jitsi_latest_version", ""),
             "installed": Setting.get("jitsi_installed", "false") == "true",
         },
+        "jibri": {
+            "installed": Setting.get("jibri_installed", "false") == "true",
+            "enabled": Setting.get("jibri_enabled", "false") == "true",
+        },
         "prometheus": {
             "auto_upgrade": Setting.get("prometheus_auto_upgrade", "false") == "true",
             "update_available": Setting.get("prometheus_update_available", "false") == "true",
