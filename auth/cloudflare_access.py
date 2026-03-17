@@ -147,8 +147,8 @@ def init_cf_access(app):
     @app.before_request
     def _check_cf_access():
         """Validate CF Access JWT on every request if enabled."""
-        # Skip for static files
-        if request.path.startswith("/static/"):
+        # Skip for static files and mobile API (API uses its own JWT auth)
+        if request.path.startswith(("/static/", "/api/v1/")):
             return
 
         # Skip if already authenticated (e.g. by local network bypass)

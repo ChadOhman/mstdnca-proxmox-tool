@@ -91,8 +91,8 @@ def init_local_bypass(app):
 
     @app.before_request
     def _local_network_bypass():
-        # Skip for static assets
-        if request.path.startswith("/static/"):
+        # Skip for static assets and mobile API (API uses its own JWT auth)
+        if request.path.startswith(("/static/", "/api/v1/")):
             return
 
         # Already authenticated -- nothing to do

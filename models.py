@@ -709,3 +709,35 @@ class UnifiLogEntry(db.Model):
 
     def __repr__(self):
         return f"<UnifiLogEntry {self.log_type} {self.action} {self.src_ip}->{self.dst_ip}>"
+
+
+class RevokedToken(db.Model):
+    """Revoked JWT refresh tokens.  Pruned daily by the scheduler."""
+    __tablename__ = "revoked_tokens"
+
+    id = db.Column(db.Integer, primary_key=True)
+    jti = db.Column(db.String(36), unique=True, nullable=False, index=True)
+    expires_at = db.Column(db.DateTime, nullable=False)
+
+    def __repr__(self):
+        return f"<RevokedToken jti={self.jti}>"
+
+
+class PushWebhook(db.Model):
+    """Mobile push notification webhook registration."""
+    __tablename__ = "push_webhooks"
+
+    VALID_EVENTS = {"security_update", "service_down", "reboot_required", "guest_error"}
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    url = db.Column(db.String(512), nullable=False)
+    device_token = db.Column(db.String(512), nullable=False)
+    platform = db.Column(db.String(10), nullable=False)   # ios, android
+    events = db.Column(db.Text, nullable=False)            # JSON array
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user = db.relationship("User", backref="push_webhooks")
+
+    def __repr__(self):
+        return f"<PushWebhook user={self.user_id} platform={self.platform}>"
