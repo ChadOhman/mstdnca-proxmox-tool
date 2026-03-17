@@ -209,6 +209,7 @@ class TestInitScheduler:
             "unpoller_check",
             "ipmi_sensor_poll",
             "ipmi_snapshot_purge",
+            "revoked_token_prune",
         }
         assert expected_ids == registered_ids
 

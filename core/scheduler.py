@@ -1033,6 +1033,16 @@ def _purge_old_ipmi_snapshots(app):
             logger.info("Purged %d old IPMI metric snapshots (older than %d days).", deleted, days)
 
 
+def _prune_revoked_tokens(app):
+    """Remove expired revoked JWT tokens (they can no longer be used anyway)."""
+    with app.app_context():
+        from models import RevokedToken, db
+        deleted = RevokedToken.query.filter(RevokedToken.expires_at < datetime.now(timezone.utc)).delete()
+        if deleted:
+            db.session.commit()
+            logger.info("Pruned %d expired revoked JWT tokens.", deleted)
+
+
 def init_scheduler(app):
     global _scheduler
 
@@ -1255,6 +1265,17 @@ def init_scheduler(app):
         args=[app],
         id="ipmi_snapshot_purge",
         name="Purge old IPMI metric snapshots",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # Revoked JWT token cleanup - runs daily
+    _scheduler.add_job(
+        _prune_revoked_tokens,
+        trigger=IntervalTrigger(hours=24),
+        args=[app],
+        id="revoked_token_prune",
+        name="Prune expired revoked JWT tokens",
         replace_existing=True,
         max_instances=1,
     )

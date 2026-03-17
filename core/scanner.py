@@ -1235,8 +1235,16 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
     existing = GuestService.query.filter_by(guest_id=guest.id, unit_name=unit_name).first()
     if status in ("running", "failed"):
         if existing:
+            old_status = existing.status
             existing.status = status
             existing.last_checked = now
+            # Push notification when a service transitions to failed
+            if status == "failed" and old_status != "failed":
+                try:
+                    from core.push_notifier import dispatch_push_alerts
+                    dispatch_push_alerts(guest, "service_down", {"service": service_key, "unit": unit_name})
+                except Exception:
+                    pass
         else:
             svc = GuestService(
                 guest_id=guest.id,
@@ -1248,6 +1256,12 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
                 auto_detected=True,
             )
             db.session.add(svc)
+            if status == "failed":
+                try:
+                    from core.push_notifier import dispatch_push_alerts
+                    dispatch_push_alerts(guest, "service_down", {"service": service_key, "unit": unit_name})
+                except Exception:
+                    pass
     elif status == "stopped" and existing:
         existing.status = status
         existing.last_checked = now
@@ -3012,6 +3026,18 @@ def scan_guest(guest):
         check_reboot_required(guest)
     except Exception as e:
         logger.debug(f"Reboot check failed for {guest.name}: {e}")
+
+    # Push notifications for mobile app
+    try:
+        from core.push_notifier import dispatch_push_alerts
+        if security_count > 0:
+            dispatch_push_alerts(guest, "security_update", {"count": security_count})
+        if guest.reboot_required:
+            dispatch_push_alerts(guest, "reboot_required")
+        if guest.status == "error":
+            dispatch_push_alerts(guest, "guest_error", {"error": error or "scan failed"})
+    except Exception as e:
+        logger.debug(f"Push notification dispatch failed for {guest.name}: {e}")
 
     return result
 

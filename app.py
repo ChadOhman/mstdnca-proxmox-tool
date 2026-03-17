@@ -89,6 +89,7 @@ def create_app(test_config=None):
 
     # Register blueprints
     from routes.api import bp as api_bp
+    from routes.api_v1 import bp as api_v1_bp
     from routes.applications import bp as applications_bp
     from routes.auth import bp as auth_bp
     from routes.credentials import bp as credentials_bp
@@ -135,6 +136,7 @@ def create_app(test_config=None):
     app.register_blueprint(prometheus_app_bp, url_prefix="/prometheus")
     app.register_blueprint(ipmi_bp, url_prefix="/ipmi")
     app.register_blueprint(unpoller_bp, url_prefix="/unpoller")
+    app.register_blueprint(api_v1_bp, url_prefix="/api/v1")
 
     # Initialize WebSocket for terminal
     from routes.terminal import init_websocket
