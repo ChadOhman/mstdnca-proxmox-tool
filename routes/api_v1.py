@@ -407,7 +407,8 @@ def guest_power(guest_id):
         db.session.commit()
         return jsonify({"data": {"ok": True, "message": f"{action.capitalize()} command sent."}})
 
-    return _error("POWER_FAILED", f"Power {action} failed: {msg}", 500)
+    logger.warning("Power %s failed for guest %s (vmid %s): %s", action, guest.name, guest.vmid, msg)
+    return _error("POWER_FAILED", f"Power {action} failed.", 500)
 
 
 # ============================================================================
