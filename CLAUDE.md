@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Flask-based Proxmox datacenter administration tool (Python 3.13). Manages VMs/LXCs across PVE/PBS hosts with web SSH terminal, service monitoring, app upgrade automation, UniFi integration, and real-time collaboration via SSE + WebSocket.
+Flask-based Proxmox datacenter administration tool (Python 3.13). Manages VMs/LXCs across PVE/PBS hosts with web SSH terminal, service monitoring, app upgrade automation (Mastodon, Ghost, PeerTube, Elk, Jitsi Meet, Jibri, Prometheus, Unpoller), UniFi integration, and real-time collaboration via SSE + WebSocket.
 
 ## Commands
 
