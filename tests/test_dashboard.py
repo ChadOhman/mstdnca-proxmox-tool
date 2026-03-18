@@ -1,6 +1,6 @@
 """Tests for the dashboard route."""
 
-from models import Guest, db
+from models import Guest, User, db
 
 
 class TestDashboard:
@@ -36,3 +36,42 @@ class TestDashboard:
         resp = client.get("/", follow_redirects=False)
         assert resp.status_code == 302
         assert "/login" in resp.headers["Location"]
+
+
+class TestDashboardStatsHostUpdates:
+    def test_host_update_counts_included(self, app):
+        with app.app_context():
+            from models import HostUpdatePackage, ProxmoxHost
+
+            host = ProxmoxHost(name="pve1", hostname="pve1.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+
+            pkg1 = HostUpdatePackage(host_id=host.id, package_name="curl", status="pending", severity="normal")
+            pkg2 = HostUpdatePackage(host_id=host.id, package_name="openssl", status="pending", severity="critical")
+            pkg3 = HostUpdatePackage(host_id=host.id, package_name="vim", status="applied", severity="normal")
+            db.session.add_all([pkg1, pkg2, pkg3])
+            db.session.commit()
+
+            try:
+                user = User.query.filter_by(username="admin").first()
+                from core.dashboard_stats import get_dashboard_stats
+
+                result = get_dashboard_stats(user)
+
+                assert result["stats"]["host_pending_updates"] == 2
+                assert result["stats"]["host_security_updates"] == 1
+            finally:
+                HostUpdatePackage.query.filter_by(host_id=host.id).delete()
+                ProxmoxHost.query.filter_by(id=host.id).delete()
+                db.session.commit()
+
+    def test_host_updates_zero_when_none(self, app):
+        with app.app_context():
+            user = User.query.filter_by(username="admin").first()
+            from core.dashboard_stats import get_dashboard_stats
+
+            result = get_dashboard_stats(user)
+
+            assert result["stats"]["host_pending_updates"] == 0
+            assert result["stats"]["host_security_updates"] == 0
