@@ -468,6 +468,29 @@ def _run_discovery(app):
                 logger.error(f"Scheduled discovery failed for '{host.name}': {e}")
 
 
+def _persist_host_packages(host, api_updates):
+    """Persist APT update packages from Proxmox API to HostUpdatePackage table."""
+    from models import HostUpdatePackage, db
+
+    HostUpdatePackage.query.filter_by(host_id=host.id, status="pending").delete()
+
+    _PRIORITY_MAP = {"important": "critical", "required": "important"}
+
+    for upd in api_updates:
+        severity = _PRIORITY_MAP.get(upd.get("Priority", ""), "normal")
+        pkg = HostUpdatePackage(
+            host_id=host.id,
+            package_name=upd.get("Package", "unknown"),
+            current_version=upd.get("OldVersion", ""),
+            available_version=upd.get("Version") or upd.get("NewVersion", ""),
+            severity=severity,
+            status="pending",
+        )
+        db.session.add(pkg)
+
+    db.session.commit()
+
+
 def _check_host_updates(app):
     """Check all Proxmox hosts for pending APT updates and notify."""
     with app.app_context():
@@ -492,6 +515,8 @@ def _check_host_updates(app):
                     client = ProxmoxClient(host)
                     node_name = client.get_local_node_name()
                     updates = client.get_apt_updates(node_name) if node_name else []
+
+                _persist_host_packages(host, updates)
 
                 host_results.append({
                     "name": host.name,

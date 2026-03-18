@@ -1539,3 +1539,104 @@ class TestRunDiscovery:
 
         # ProxmoxClient was attempted once per host
         assert mock_proxmox_api.ProxmoxClient.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# _persist_host_packages — DB persistence of APT update packages
+# ---------------------------------------------------------------------------
+
+
+class TestPersistHostPackages:
+    def test_host_packages_persisted_to_db(self, app):
+        with app.app_context():
+            from models import HostUpdatePackage, ProxmoxHost, db
+
+            host = ProxmoxHost(name="pve-test", hostname="pve-test.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+
+            fake_updates = [
+                {"Package": "linux-image-6.1", "OldVersion": "6.1.0-1", "Version": "6.1.0-2", "Priority": "important"},
+                {"Package": "curl", "OldVersion": "7.81.0", "Version": "7.85.0", "Priority": "optional"},
+            ]
+
+            from core.scheduler import _persist_host_packages
+
+            _persist_host_packages(host, fake_updates)
+
+            pkgs = HostUpdatePackage.query.filter_by(host_id=host.id, status="pending").all()
+            assert len(pkgs) == 2
+            assert any(p.package_name == "linux-image-6.1" and p.severity == "critical" for p in pkgs)
+            assert any(p.package_name == "curl" and p.severity == "normal" for p in pkgs)
+
+    def test_clears_old_pending_before_inserting(self, app):
+        with app.app_context():
+            from models import HostUpdatePackage, ProxmoxHost, db
+
+            host = ProxmoxHost(name="pve-clear", hostname="pve-clear.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+
+            # Add an old pending package
+            old = HostUpdatePackage(host_id=host.id, package_name="old-pkg", status="pending", severity="normal")
+            db.session.add(old)
+            db.session.commit()
+
+            from core.scheduler import _persist_host_packages
+
+            _persist_host_packages(
+                host, [{"Package": "new-pkg", "OldVersion": "1.0", "Version": "2.0", "Priority": "optional"}]
+            )
+
+            pkgs = HostUpdatePackage.query.filter_by(host_id=host.id, status="pending").all()
+            assert len(pkgs) == 1
+            assert pkgs[0].package_name == "new-pkg"
+
+    def test_preserves_applied_packages(self, app):
+        with app.app_context():
+            from models import HostUpdatePackage, ProxmoxHost, db
+
+            host = ProxmoxHost(name="pve-keep", hostname="pve-keep.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+
+            applied = HostUpdatePackage(
+                host_id=host.id, package_name="applied-pkg", status="applied", severity="normal"
+            )
+            db.session.add(applied)
+            db.session.commit()
+
+            from core.scheduler import _persist_host_packages
+
+            _persist_host_packages(
+                host, [{"Package": "new-pkg", "OldVersion": "1.0", "Version": "2.0", "Priority": "optional"}]
+            )
+
+            all_pkgs = HostUpdatePackage.query.filter_by(host_id=host.id).all()
+            assert len(all_pkgs) == 2
+            assert any(p.package_name == "applied-pkg" and p.status == "applied" for p in all_pkgs)
+
+    def test_priority_mapping(self, app):
+        with app.app_context():
+            from models import HostUpdatePackage, ProxmoxHost, db
+
+            host = ProxmoxHost(name="pve-prio", hostname="pve-prio.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+
+            fake_updates = [
+                {"Package": "pkg1", "OldVersion": "1.0", "Version": "2.0", "Priority": "important"},
+                {"Package": "pkg2", "OldVersion": "1.0", "Version": "2.0", "Priority": "required"},
+                {"Package": "pkg3", "OldVersion": "1.0", "Version": "2.0", "Priority": "standard"},
+                {"Package": "pkg4", "OldVersion": "1.0", "Version": "2.0", "Priority": "extra"},
+            ]
+
+            from core.scheduler import _persist_host_packages
+
+            _persist_host_packages(host, fake_updates)
+
+            pkgs = {p.package_name: p.severity for p in HostUpdatePackage.query.filter_by(host_id=host.id).all()}
+            assert pkgs["pkg1"] == "critical"
+            assert pkgs["pkg2"] == "important"
+            assert pkgs["pkg3"] == "normal"
+            assert pkgs["pkg4"] == "normal"
