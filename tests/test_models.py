@@ -1,7 +1,7 @@
 """Unit tests for model helpers."""
 import pytest
 
-from models import Guest, HostUpdatePackage, ProxmoxHost, Setting, UpdatePackage, db
+from models import Guest, HostUpdatePackage, ProxmoxHost, PushWebhook, Setting, UpdatePackage, db
 
 
 @pytest.fixture()
@@ -165,3 +165,14 @@ class TestHostUpdatePackageModel:
             db.session.commit()
 
             assert HostUpdatePackage.query.get(pkg_id) is None
+
+
+class TestPushWebhookValidEvents:
+    def test_service_failed_is_valid_event(self):
+        assert "service_failed" in PushWebhook.VALID_EVENTS
+
+    def test_service_recovered_is_valid_event(self):
+        assert "service_recovered" in PushWebhook.VALID_EVENTS
+
+    def test_service_down_still_valid_for_backwards_compat(self):
+        assert "service_down" in PushWebhook.VALID_EVENTS

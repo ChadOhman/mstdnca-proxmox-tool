@@ -755,7 +755,7 @@ class PushWebhook(db.Model):
     """Mobile push notification webhook registration."""
     __tablename__ = "push_webhooks"
 
-    VALID_EVENTS = {"security_update", "service_down", "reboot_required", "guest_error"}
+    VALID_EVENTS = {"security_update", "service_down", "service_failed", "service_recovered", "reboot_required", "guest_error"}
 
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
