@@ -633,6 +633,34 @@ def _run_apply(host_id, hostname, credential_model, app_ctx):
             except Exception:
                 pass
 
+        if success:
+            try:
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
+
+                from models import HostUpdatePackage
+                host = ProxmoxHost.query.get(host_id)
+                if host:
+                    now_utc = _dt.now(_tz.utc)
+                    pending = HostUpdatePackage.query.filter_by(host_id=host_id, status="pending").all()
+                    applied_count = len(pending)
+                    security_count = len([p for p in pending if p.severity == "critical"])
+                    for pkg in pending:
+                        pkg.status = "applied"
+                        pkg.applied_at = now_utc
+                    db.session.commit()
+
+                    from core.notifier import send_updates_applied_notification
+                    type_label = "PBS" if host.host_type == "pbs" else "PVE"
+                    send_updates_applied_notification([{
+                        "name": host.name,
+                        "type": type_label,
+                        "applied": applied_count,
+                        "security": security_count,
+                    }])
+            except Exception as e:
+                logger.error(f"Failed to record host update apply: {e}")
+
         with _apply_lock:
             job = _apply_jobs.get(host_id)
             if job:

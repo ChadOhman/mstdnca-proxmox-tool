@@ -39,6 +39,10 @@ def _run_auto_updates(app):
         current_day = calendar.day_name[now.weekday()].lower()
         current_time = now.strftime("%H:%M")
 
+        from datetime import timezone as _tz
+        batch_start = datetime.now(_tz.utc)
+        apply_results = []
+
         guests = Guest.query.filter_by(enabled=True, auto_update=True).all()
 
         for guest in guests:
@@ -64,8 +68,23 @@ def _run_auto_updates(app):
             ok, output = apply_updates(guest, dist_upgrade=dist_upgrade)
             if ok:
                 logger.info(f"Auto-update successful for {guest.name}")
+                applied_pkgs = [
+                    u for u in guest.updates
+                    if u.status == "applied" and u.applied_at and u.applied_at >= batch_start
+                ]
+                security_count = len([p for p in applied_pkgs if p.severity == "critical"])
+                apply_results.append({
+                    "name": guest.name,
+                    "type": guest.guest_type.upper(),
+                    "applied": len(applied_pkgs),
+                    "security": security_count,
+                })
             else:
                 logger.error(f"Auto-update failed for {guest.name}: {output}")
+
+        if apply_results:
+            from core.notifier import send_updates_applied_notification
+            send_updates_applied_notification(apply_results)
 
 
 def _check_mastodon_release(app):

@@ -146,6 +146,20 @@ def _run_update_background(app, guest_id, dist_upgrade=False):
                                     pkg.applied_at = now
                                 guest.status = "up-to-date"
                                 db.session.commit()
+                                try:
+                                    from core.notifier import send_updates_applied_notification
+                                    applied_pkgs = [
+                                        p for p in guest.updates if p.status == "applied" and p.applied_at == now
+                                    ]
+                                    security_count = len([p for p in applied_pkgs if p.severity == "critical"])
+                                    send_updates_applied_notification([{
+                                        "name": guest.name,
+                                        "type": guest.guest_type.upper(),
+                                        "applied": len(applied_pkgs),
+                                        "security": security_count,
+                                    }])
+                                except Exception:
+                                    pass
                                 job.finish(True)
                                 return
                             else:
@@ -191,6 +205,20 @@ def _run_update_background(app, guest_id, dist_upgrade=False):
                                 pkg.applied_at = now
                             guest.status = "up-to-date"
                             db.session.commit()
+                            try:
+                                from core.notifier import send_updates_applied_notification
+                                applied_pkgs = [
+                                    p for p in guest.updates if p.status == "applied" and p.applied_at == now
+                                ]
+                                security_count = len([p for p in applied_pkgs if p.severity == "critical"])
+                                send_updates_applied_notification([{
+                                    "name": guest.name,
+                                    "type": guest.guest_type.upper(),
+                                    "applied": len(applied_pkgs),
+                                    "security": security_count,
+                                }])
+                            except Exception:
+                                pass
                             job.finish(True)
                             return
                         else:
