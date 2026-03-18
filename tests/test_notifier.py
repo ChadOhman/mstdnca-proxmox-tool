@@ -32,6 +32,8 @@ from core.notifier import (
     send_jitsi_update_notification,
     send_mastodon_update_notification,
     send_peertube_update_notification,
+    send_service_failed_notification,
+    send_service_recovery_notification,
     send_test_notification,
     send_update_notification,
     send_updates_applied_notification,
@@ -1945,3 +1947,90 @@ class TestSendUpdatesAppliedNotification:
                 with app.app_context():
                     send_updates_applied_notification(results)
             mock_open.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Service state change notifications
+# ---------------------------------------------------------------------------
+
+
+class TestSendServiceFailedNotification:
+    def _enable(self, app):
+        Setting.set("discord_enabled", "true")
+        Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+        Setting.set("discord_notify_services", "true")
+
+    def test_sends_red_notification(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_service_failed_notification("web01", "nginx")
+
+        assert len(captured) == 1
+        body = json.loads(captured[0].data.decode())
+        embed = body["embeds"][0]
+        assert embed["color"] == 14431557  # _COLOR_RED
+        assert "nginx" in embed["title"]
+        assert "web01" in embed["description"]
+
+    def test_disabled_sends_nothing(self, app):
+        with app.app_context():
+            Setting.set("discord_enabled", "true")
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+            Setting.set("discord_notify_services", "false")
+
+        with patch("urllib.request.urlopen") as mock_open:
+            with app.app_context():
+                send_service_failed_notification("web01", "nginx")
+
+        mock_open.assert_not_called()
+
+
+class TestSendServiceRecoveryNotification:
+    def _enable(self, app):
+        Setting.set("discord_enabled", "true")
+        Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+        Setting.set("discord_notify_services", "true")
+
+    def test_sends_green_notification(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_service_recovery_notification("web01", "nginx")
+
+        assert len(captured) == 1
+        body = json.loads(captured[0].data.decode())
+        embed = body["embeds"][0]
+        assert embed["color"] == 8505220  # _COLOR_GREEN
+        assert "nginx" in embed["title"]
+        assert "web01" in embed["description"]
+
+    def test_disabled_sends_nothing(self, app):
+        with app.app_context():
+            Setting.set("discord_enabled", "true")
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+            Setting.set("discord_notify_services", "false")
+
+        with patch("urllib.request.urlopen") as mock_open:
+            with app.app_context():
+                send_service_recovery_notification("web01", "nginx")
+
+        mock_open.assert_not_called()

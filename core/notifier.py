@@ -525,3 +525,41 @@ def send_updates_applied_notification(results):
         logger.info(f"Updates-applied notification sent for {entity_count} target(s)")
     else:
         logger.error(f"Failed to send updates-applied notification: {msg}")
+
+
+def send_service_failed_notification(guest_name, service_name):
+    """Send notification when a service transitions to failed state."""
+    if Setting.get("discord_notify_services", "true") != "true":
+        return
+
+    embeds = [{
+        "title": f"\u274c Service failed: {service_name}",
+        "description": f"**{service_name}** on **{guest_name}** has stopped running.",
+        "color": _COLOR_RED,
+        "footer": {"text": "Log in to MCAT to investigate."},
+    }]
+
+    ok, msg = _send_discord(embeds)
+    if ok:
+        logger.info(f"Service-failed notification sent: {service_name} on {guest_name}")
+    else:
+        logger.error(f"Failed to send service-failed notification: {msg}")
+
+
+def send_service_recovery_notification(guest_name, service_name):
+    """Send notification when a service recovers from failed state."""
+    if Setting.get("discord_notify_services", "true") != "true":
+        return
+
+    embeds = [{
+        "title": f"\u2705 Service recovered: {service_name}",
+        "description": f"**{service_name}** on **{guest_name}** is running again.",
+        "color": _COLOR_GREEN,
+        "footer": {"text": "Log in to MCAT to review."},
+    }]
+
+    ok, msg = _send_discord(embeds)
+    if ok:
+        logger.info(f"Service-recovery notification sent: {service_name} on {guest_name}")
+    else:
+        logger.error(f"Failed to send service-recovery notification: {msg}")
