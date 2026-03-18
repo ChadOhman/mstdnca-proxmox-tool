@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = 5  # seconds
 
+# Alias mapping: service_failed also matches subscriptions to service_down
+_EVENT_ALIASES = {"service_failed": "service_down"}
+
 
 def dispatch_push_alerts(guest, event_type, details=None):
     """Send push notifications to all users who registered for *event_type*
@@ -41,7 +44,8 @@ def dispatch_push_alerts(guest, event_type, details=None):
             subscribed_events = json.loads(wh.events)
         except (json.JSONDecodeError, TypeError):
             continue
-        if event_type not in subscribed_events:
+        alias = _EVENT_ALIASES.get(event_type)
+        if event_type not in subscribed_events and (alias is None or alias not in subscribed_events):
             continue
 
         # Check tag-based access: user must have access to this guest
