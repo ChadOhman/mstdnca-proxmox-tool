@@ -1,7 +1,7 @@
 """Unit tests for model helpers."""
 import pytest
 
-from models import Guest, Setting, UpdatePackage, db
+from models import Guest, HostUpdatePackage, ProxmoxHost, Setting, UpdatePackage, db
 
 
 @pytest.fixture()
@@ -92,3 +92,76 @@ class TestSettingModel:
             s = Setting.query.filter_by(key="_test_overwrite_").first()
             db.session.delete(s)
             db.session.commit()
+
+
+class TestHostUpdatePackageModel:
+    def test_create_host_update_package(self, app):
+        with app.app_context():
+            host = ProxmoxHost(name="pve1", hostname="pve1.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+
+            pkg = HostUpdatePackage(
+                host_id=host.id,
+                package_name="linux-image-6.1",
+                current_version="6.1.0-1",
+                available_version="6.1.0-2",
+                severity="critical",
+                status="pending",
+            )
+            db.session.add(pkg)
+            db.session.commit()
+
+            assert pkg.id is not None
+            assert pkg.host_id == host.id
+            assert pkg.package_name == "linux-image-6.1"
+            assert pkg.severity == "critical"
+            assert pkg.status == "pending"
+            assert pkg.applied_at is None
+
+    def test_pending_updates_method(self, app):
+        with app.app_context():
+            host = ProxmoxHost(name="pve2", hostname="pve2.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+
+            pkg1 = HostUpdatePackage(host_id=host.id, package_name="curl", status="pending", severity="normal")
+            pkg2 = HostUpdatePackage(host_id=host.id, package_name="vim", status="applied", severity="normal")
+            pkg3 = HostUpdatePackage(host_id=host.id, package_name="openssl", status="pending", severity="critical")
+            db.session.add_all([pkg1, pkg2, pkg3])
+            db.session.commit()
+
+            pending = host.pending_updates()
+            assert len(pending) == 2
+            assert all(p.status == "pending" for p in pending)
+
+    def test_security_updates_method(self, app):
+        with app.app_context():
+            host = ProxmoxHost(name="pve3", hostname="pve3.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+
+            pkg1 = HostUpdatePackage(host_id=host.id, package_name="curl", status="pending", severity="normal")
+            pkg2 = HostUpdatePackage(host_id=host.id, package_name="openssl", status="pending", severity="critical")
+            db.session.add_all([pkg1, pkg2])
+            db.session.commit()
+
+            sec = host.security_updates()
+            assert len(sec) == 1
+            assert sec[0].package_name == "openssl"
+
+    def test_cascade_delete(self, app):
+        with app.app_context():
+            host = ProxmoxHost(name="pve-del", hostname="pve-del.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+
+            pkg = HostUpdatePackage(host_id=host.id, package_name="curl", status="pending", severity="normal")
+            db.session.add(pkg)
+            db.session.commit()
+            pkg_id = pkg.id
+
+            db.session.delete(host)
+            db.session.commit()
+
+            assert HostUpdatePackage.query.get(pkg_id) is None
