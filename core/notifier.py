@@ -484,3 +484,44 @@ def send_app_update_notification(current_version, new_version):
     else:
         logger.error(f"Failed to send app update notification: {msg}")
     return ok, msg
+
+
+def send_updates_applied_notification(results):
+    """Send notification about updates that were just applied.
+
+    results: list of dicts with keys name, type, applied, security.
+    """
+    if Setting.get("discord_notify_updates", "true") != "true":
+        return
+
+    if not results:
+        return
+
+    total_applied = sum(r["applied"] for r in results)
+    entity_count = len(results)
+    entity_word = "guest(s)" if all(r["type"] in ("CT", "VM") for r in results) else "target(s)"
+
+    fields = []
+    for r in results:
+        value = f"{r['applied']} applied"
+        if r["security"] > 0:
+            value += f" ({r['security']} security)"
+        fields.append({
+            "name": f"{r['name']} ({r['type']})",
+            "value": value,
+            "inline": False,
+        })
+
+    embeds = [{
+        "title": "\u2705 Updates applied",
+        "description": f"**{total_applied}** update(s) applied across **{entity_count}** {entity_word}.",
+        "color": _COLOR_GREEN,
+        "fields": fields,
+        "footer": {"text": "Log in to MCAT to review details."},
+    }]
+
+    ok, msg = _send_discord(embeds)
+    if ok:
+        logger.info(f"Updates-applied notification sent for {entity_count} target(s)")
+    else:
+        logger.error(f"Failed to send updates-applied notification: {msg}")
