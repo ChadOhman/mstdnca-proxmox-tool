@@ -623,6 +623,85 @@ class TestAccessControl:
 # ============================================================================
 
 
+class TestDashboardSummaryHostUpdates:
+    def test_summary_includes_host_update_counts(self, client):
+        access, _ = _login(client)
+        with client.application.app_context():
+            from models import HostUpdatePackage, ProxmoxHost, db
+            host = ProxmoxHost(name="pve-api-test", hostname="pve-api.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+            pkg = HostUpdatePackage(host_id=host.id, package_name="curl", status="pending", severity="normal")
+            db.session.add(pkg)
+            db.session.commit()
+
+        resp = client.get("/api/v1/dashboard/summary", headers=_auth_headers(access))
+        data = resp.get_json()["data"]
+        assert "host_pending_updates" in data
+        assert "host_security_updates" in data
+
+
+class TestHostsEndpointUpdates:
+    def test_host_list_includes_update_counts(self, client):
+        access, _ = _login(client)
+        with client.application.app_context():
+            from models import HostUpdatePackage, ProxmoxHost, db
+            host = ProxmoxHost(name="pve-list-test", hostname="pve-list.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+            pkg = HostUpdatePackage(host_id=host.id, package_name="curl", status="pending", severity="critical")
+            db.session.add(pkg)
+            db.session.commit()
+
+        resp = client.get("/api/v1/hosts", headers=_auth_headers(access))
+        data = resp.get_json()["data"]
+        host_data = [h for h in data if h["name"] == "pve-list-test"][0]
+        assert host_data["pending_updates_count"] == 1
+        assert host_data["security_updates_count"] == 1
+
+    def test_host_detail_includes_updates_array(self, client):
+        access, _ = _login(client)
+        with client.application.app_context():
+            from models import HostUpdatePackage, ProxmoxHost, db
+            host = ProxmoxHost(name="pve-detail-test", hostname="pve-detail.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+            host_id = host.id
+            pkg = HostUpdatePackage(
+                host_id=host.id, package_name="curl", current_version="7.81",
+                available_version="7.85", status="pending", severity="normal",
+            )
+            db.session.add(pkg)
+            db.session.commit()
+
+        resp = client.get(f"/api/v1/hosts/{host_id}", headers=_auth_headers(access))
+        data = resp.get_json()["data"]
+        assert "updates" in data
+        assert "pending_updates_count" in data
+        assert len(data["updates"]) == 1
+        assert data["updates"][0]["package_name"] == "curl"
+
+
+class TestDashboardAlertsHostSecurity:
+    def test_alerts_include_host_security_updates(self, client):
+        access, _ = _login(client)
+        with client.application.app_context():
+            from models import HostUpdatePackage, ProxmoxHost, db
+            host = ProxmoxHost(name="pve-alert-test", hostname="pve-alert.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+            pkg = HostUpdatePackage(host_id=host.id, package_name="openssl", status="pending", severity="critical")
+            db.session.add(pkg)
+            db.session.commit()
+
+        resp = client.get("/api/v1/dashboard/alerts", headers=_auth_headers(access))
+        data = resp.get_json()["data"]
+        assert "host_security_updates" in data
+        assert len(data["host_security_updates"]) >= 1
+        matching = [h for h in data["host_security_updates"] if h["host_name"] == "pve-alert-test"]
+        assert len(matching) == 1
+
+
 class TestResponseFormat:
     def test_error_format(self, client):
         resp = client.get("/api/v1/me")  # no auth
