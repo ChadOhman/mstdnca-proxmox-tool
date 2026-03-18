@@ -1,10 +1,11 @@
 """Tests for guest list route and status filters."""
 import json
 from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from models import Guest, Setting, Tag, UpdatePackage, db
+from models import Guest, ProxmoxHost, Setting, Tag, UpdatePackage, db
 
 _NOW = datetime.now(timezone.utc)
 
@@ -245,3 +246,44 @@ class TestSaveBackupDefaults:
             assert storage == "guest-storage"
             assert mode == "stop"
             assert compress == "lzo"  # inherited from tag
+
+
+class TestPowerAction:
+    """Tests for the guest power action route."""
+
+    @patch("routes.guests.ProxmoxClient")
+    def test_reboot_clears_reboot_required(self, mock_client_cls, app, auth_client):
+        """Rebooting a guest should clear reboot_required flag."""
+        with app.app_context():
+            host = ProxmoxHost(name="test-only-node", hostname="test-only-pve.local", host_type="pve")
+            db.session.add(host)
+            db.session.flush()
+            guest = Guest(
+                name="_power-reboot-test",
+                guest_type="ct",
+                vmid=100,
+                proxmox_host_id=host.id,
+                reboot_required=True,
+            )
+            db.session.add(guest)
+            db.session.commit()
+            guest_id = guest.id
+
+        mock_instance = MagicMock()
+        mock_instance.reboot_guest.return_value = (True, "Reboot sent")
+        mock_instance.find_guest_node.return_value = None
+        mock_client_cls.return_value = mock_instance
+
+        resp = auth_client.post(f"/guests/{guest_id}/power/reboot", follow_redirects=False)
+        assert resp.status_code == 302
+
+        with app.app_context():
+            guest = Guest.query.get(guest_id)
+            assert guest.reboot_required is False
+
+            # Cleanup
+            db.session.delete(guest)
+            host = ProxmoxHost.query.filter_by(name="test-only-node").first()
+            if host:
+                db.session.delete(host)
+            db.session.commit()

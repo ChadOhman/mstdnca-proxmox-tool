@@ -532,6 +532,8 @@ def power_action(guest_id, action):
             guest.power_state = "running"
         elif action in ("shutdown", "stop"):
             guest.power_state = "stopped"
+        if action == "reboot":
+            guest.reboot_required = False
         log_action("guest_power", "guest", resource_id=guest.id, resource_name=guest.name,
                    details={"action": action})
         db.session.commit()
