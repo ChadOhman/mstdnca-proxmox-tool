@@ -32,8 +32,11 @@ from core.notifier import (
     send_jitsi_update_notification,
     send_mastodon_update_notification,
     send_peertube_update_notification,
+    send_service_failed_notification,
+    send_service_recovery_notification,
     send_test_notification,
     send_update_notification,
+    send_updates_applied_notification,
     send_upgrade_result_notification,
     send_upgrade_started_notification,
 )
@@ -1849,3 +1852,185 @@ class TestSendAppUpdateNotification:
 
         assert ok is False
         assert "401" in msg
+
+
+# ---------------------------------------------------------------------------
+# send_updates_applied_notification
+# ---------------------------------------------------------------------------
+
+class TestSendUpdatesAppliedNotification:
+    def _enable(self, app):
+        Setting.set("discord_enabled", "true")
+        Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+        Setting.set("discord_notify_updates", "true")
+
+    def test_empty_results_sends_nothing(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        with patch("urllib.request.urlopen") as mock_open:
+            with app.app_context():
+                send_updates_applied_notification([])
+
+        mock_open.assert_not_called()
+
+    def test_single_guest_sends_green_notification(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        results = [{"name": "web01", "type": "CT", "applied": 5, "security": 1}]
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_updates_applied_notification(results)
+
+        assert len(captured) == 1
+        body = json.loads(captured[0].data.decode())
+        embed = body["embeds"][0]
+        assert embed["color"] == 8505220  # _COLOR_GREEN
+        assert "5" in embed["description"]
+        assert "1 security" in embed["fields"][0]["value"]
+
+    def test_batch_with_hosts_and_guests(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        results = [
+            {"name": "web01", "type": "CT", "applied": 5, "security": 0},
+            {"name": "pve1", "type": "PVE", "applied": 3, "security": 0},
+        ]
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_updates_applied_notification(results)
+
+        assert len(captured) == 1
+        body = json.loads(captured[0].data.decode())
+        assert "8" in body["embeds"][0]["description"]  # 5 + 3
+        assert len(body["embeds"][0]["fields"]) == 2
+
+    def test_disabled_sends_nothing(self, app):
+        with app.app_context():
+            Setting.set("discord_enabled", "true")
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+            Setting.set("discord_notify_updates", "false")
+
+        results = [{"name": "web01", "type": "CT", "applied": 5, "security": 0}]
+        with patch("urllib.request.urlopen") as mock_open:
+            with app.app_context():
+                send_updates_applied_notification(results)
+
+        mock_open.assert_not_called()
+
+    def test_no_dedup(self, app):
+        """Applied notifications should always send (no dedup)."""
+        with app.app_context():
+            self._enable(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        results = [{"name": "web01", "type": "CT", "applied": 5, "security": 0}]
+
+        for _ in range(2):
+            with patch("urllib.request.urlopen", return_value=fake_resp) as mock_open:
+                with app.app_context():
+                    send_updates_applied_notification(results)
+            mock_open.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Service state change notifications
+# ---------------------------------------------------------------------------
+
+
+class TestSendServiceFailedNotification:
+    def _enable(self, app):
+        Setting.set("discord_enabled", "true")
+        Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+        Setting.set("discord_notify_services", "true")
+
+    def test_sends_red_notification(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_service_failed_notification("web01", "nginx")
+
+        assert len(captured) == 1
+        body = json.loads(captured[0].data.decode())
+        embed = body["embeds"][0]
+        assert embed["color"] == 14431557  # _COLOR_RED
+        assert "nginx" in embed["title"]
+        assert "web01" in embed["description"]
+
+    def test_disabled_sends_nothing(self, app):
+        with app.app_context():
+            Setting.set("discord_enabled", "true")
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+            Setting.set("discord_notify_services", "false")
+
+        with patch("urllib.request.urlopen") as mock_open:
+            with app.app_context():
+                send_service_failed_notification("web01", "nginx")
+
+        mock_open.assert_not_called()
+
+
+class TestSendServiceRecoveryNotification:
+    def _enable(self, app):
+        Setting.set("discord_enabled", "true")
+        Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+        Setting.set("discord_notify_services", "true")
+
+    def test_sends_green_notification(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_service_recovery_notification("web01", "nginx")
+
+        assert len(captured) == 1
+        body = json.loads(captured[0].data.decode())
+        embed = body["embeds"][0]
+        assert embed["color"] == 8505220  # _COLOR_GREEN
+        assert "nginx" in embed["title"]
+        assert "web01" in embed["description"]
+
+    def test_disabled_sends_nothing(self, app):
+        with app.app_context():
+            Setting.set("discord_enabled", "true")
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+            Setting.set("discord_notify_services", "false")
+
+        with patch("urllib.request.urlopen") as mock_open:
+            with app.app_context():
+                send_service_recovery_notification("web01", "nginx")
+
+        mock_open.assert_not_called()

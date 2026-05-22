@@ -5,7 +5,7 @@ Used by both the web dashboard route and the mobile API.
 
 from collections import Counter
 
-from models import Guest, GuestService, ProxmoxHost, Tag, UpdatePackage, db
+from models import Guest, GuestService, HostUpdatePackage, ProxmoxHost, Tag, UpdatePackage, db
 
 
 def get_dashboard_stats(user, tag_filter=None):
@@ -63,6 +63,14 @@ def get_dashboard_stats(user, tag_filter=None):
         total_updates = 0
         security_updates = 0
 
+    host_pending_updates = HostUpdatePackage.query.filter(
+        HostUpdatePackage.status == "pending",
+    ).count()
+    host_security_updates = HostUpdatePackage.query.filter(
+        HostUpdatePackage.status == "pending",
+        HostUpdatePackage.severity == "critical",
+    ).count()
+
     reboot_required = [g for g in filtered_guests if g.reboot_required]
 
     # Power state breakdown
@@ -110,6 +118,8 @@ def get_dashboard_stats(user, tag_filter=None):
         "total_services": total_services,
         "services_running": services_running,
         "services_failed": services_failed,
+        "host_pending_updates": host_pending_updates,
+        "host_security_updates": host_security_updates,
     }
 
     return {

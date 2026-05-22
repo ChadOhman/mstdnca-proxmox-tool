@@ -288,12 +288,19 @@ def dashboard_alerts():
                     "unit_name": svc.unit_name,
                 })
 
+    host_security_updates = []
+    for host in ProxmoxHost.query.all():
+        sec_count = len(host.security_updates())
+        if sec_count > 0:
+            host_security_updates.append({"host_id": host.id, "host_name": host.name, "count": sec_count})
+
     return jsonify({
         "data": {
             "security_updates": security_updates,
             "failed_services": failed_services,
             "reboots_required": reboots_required,
             "guests_with_errors": guests_with_errors,
+            "host_security_updates": host_security_updates,
         }
     })
 
@@ -434,6 +441,8 @@ def host_list():
             "port": h.port,
             "host_type": h.host_type,
             "guest_count": guest_count,
+            "pending_updates_count": len(h.pending_updates()),
+            "security_updates_count": len(h.security_updates()),
         })
 
     return jsonify({"data": data})
@@ -457,6 +466,17 @@ def host_detail(host_id):
         "port": host.port,
         "host_type": host.host_type,
         "verify_ssl": host.verify_ssl,
+        "pending_updates_count": len(host.pending_updates()),
+        "security_updates_count": len(host.security_updates()),
+        "updates": [
+            {
+                "package_name": p.package_name,
+                "current_version": p.current_version,
+                "available_version": p.available_version,
+                "severity": p.severity,
+            }
+            for p in host.pending_updates()
+        ],
     }
 
     # Try to fetch live stats from Proxmox

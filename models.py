@@ -364,10 +364,19 @@ class ProxmoxHost(db.Model):
 
     guests = db.relationship("Guest", backref="proxmox_host", lazy=True, cascade="all, delete-orphan")
     ssh_credential = db.relationship("Credential", foreign_keys=[ssh_credential_id])
+    host_update_packages = db.relationship(
+        "HostUpdatePackage", backref="host", lazy=True, cascade="all, delete-orphan"
+    )
 
     @property
     def is_pbs(self):
         return self.host_type == "pbs"
+
+    def pending_updates(self):
+        return [u for u in self.host_update_packages if u.status == "pending"]
+
+    def security_updates(self):
+        return [u for u in self.host_update_packages if u.status == "pending" and u.severity == "critical"]
 
     def __repr__(self):
         return f"<ProxmoxHost {self.name} ({self.hostname}) [{self.host_type}]>"
@@ -498,6 +507,25 @@ class UpdatePackage(db.Model):
 
 
 db.Index("ix_update_pkg_guest_status", UpdatePackage.guest_id, UpdatePackage.status)
+
+
+class HostUpdatePackage(db.Model):
+    """APT package update available on a Proxmox host."""
+
+    __tablename__ = "host_update_package"
+
+    id = db.Column(db.Integer, primary_key=True)
+    host_id = db.Column(db.Integer, db.ForeignKey("proxmox_hosts.id", ondelete="CASCADE"), nullable=False)
+    package_name = db.Column(db.String(256))
+    current_version = db.Column(db.String(128))
+    available_version = db.Column(db.String(128))
+    severity = db.Column(db.String(32), default="normal")
+    discovered_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    applied_at = db.Column(db.DateTime, nullable=True)
+    status = db.Column(db.String(32), default="pending")
+
+
+db.Index("ix_host_update_pkg_host_status", HostUpdatePackage.host_id, HostUpdatePackage.status)
 
 
 class ScanResult(db.Model):
@@ -727,7 +755,7 @@ class PushWebhook(db.Model):
     """Mobile push notification webhook registration."""
     __tablename__ = "push_webhooks"
 
-    VALID_EVENTS = {"security_update", "service_down", "reboot_required", "guest_error"}
+    VALID_EVENTS = {"security_update", "service_down", "service_failed", "service_recovered", "reboot_required", "guest_error"}
 
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)

@@ -169,6 +169,22 @@
             </div>
         </a>
     </div>
+    <div class="col-6 col-md-3">
+        <div class="card bg-dark h-100 stat-card">
+            <div class="card-body text-center py-3">
+                <div class="fs-3 fw-bold {% if stats.host_pending_updates > 0 %}text-warning{% else %}text-muted{% endif %}">{{ stats.host_pending_updates }}</div>
+                <div class="small text-muted">Host Updates</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="card bg-dark h-100 stat-card">
+            <div class="card-body text-center py-3">
+                <div class="fs-3 fw-bold {% if stats.host_security_updates > 0 %}text-danger{% else %}text-muted{% endif %}">{{ stats.host_security_updates }}</div>
+                <div class="small text-muted">Host Security</div>
+            </div>
+        </div>
+    </div>
 </div>
 
 <!-- Host Performance (async-loaded, auto-refreshes every 30s) -->

@@ -1238,11 +1238,27 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
             old_status = existing.status
             existing.status = status
             existing.last_checked = now
-            # Push notification when a service transitions to failed
+            # Notifications on state transitions
             if status == "failed" and old_status != "failed":
                 try:
+                    from core.notifier import send_service_failed_notification
+                    send_service_failed_notification(guest.name, service_key)
+                except Exception:
+                    pass
+                try:
                     from core.push_notifier import dispatch_push_alerts
-                    dispatch_push_alerts(guest, "service_down", {"service": service_key, "unit": unit_name})
+                    dispatch_push_alerts(guest, "service_failed", {"service": service_key, "unit": unit_name})
+                except Exception:
+                    pass
+            elif status == "running" and old_status == "failed":
+                try:
+                    from core.notifier import send_service_recovery_notification
+                    send_service_recovery_notification(guest.name, service_key)
+                except Exception:
+                    pass
+                try:
+                    from core.push_notifier import dispatch_push_alerts
+                    dispatch_push_alerts(guest, "service_recovered", {"service": service_key, "unit": unit_name})
                 except Exception:
                     pass
         else:
@@ -1258,8 +1274,13 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
             db.session.add(svc)
             if status == "failed":
                 try:
+                    from core.notifier import send_service_failed_notification
+                    send_service_failed_notification(guest.name, service_key)
+                except Exception:
+                    pass
+                try:
                     from core.push_notifier import dispatch_push_alerts
-                    dispatch_push_alerts(guest, "service_down", {"service": service_key, "unit": unit_name})
+                    dispatch_push_alerts(guest, "service_failed", {"service": service_key, "unit": unit_name})
                 except Exception:
                     pass
     elif status == "stopped" and existing:
