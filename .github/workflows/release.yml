@@ -70,7 +70,7 @@ jobs:
           echo "- **Change the default password after first login!**" >> release_notes.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: release_notes.md
           files: mstdnca-proxmox-tool-${{ steps.version.outputs.version }}.tar.gz
