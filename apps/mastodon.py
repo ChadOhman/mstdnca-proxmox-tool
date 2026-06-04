@@ -978,15 +978,11 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
     if mastodon_guest.ip_address:
         try:
             with SSHClient.from_credential(mastodon_guest.ip_address, credential) as ssh:
-                env_ok = _check_env_compliance(ssh, user, app_dir, branch, log)
-            if not env_ok:
-                log("ERROR: Environment does not meet requirements. Upgrade aborted.")
-                log("Fix the version issues above before running the upgrade.")
-                return False, "\n".join(log_lines)
-            log("Environment compliance: OK")
+                _check_env_compliance(ssh, user, app_dir, branch, log)
+            log("Runtime versions (Ruby / Node.js / Bundler) will be upgraded automatically if needed.")
         except Exception as e:
             log(f"WARNING: Could not run environment compliance check: {e}")
-            log("Proceeding with upgrade — verify environment manually if needed.")
+            log("Proceeding with upgrade — runtimes will still be checked in Step 3.")
     else:
         log("WARNING: No IP address for Mastodon guest — skipping environment compliance check")
     log("")
@@ -1160,38 +1156,16 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
                 else:
                     log("WARNING: git stash pop returned non-zero (may be no stash to pop)")
 
-            # 2e. Ensure correct Ruby version and Bundler are installed via rbenv.
-            # Reads the target version from .ruby-version in the app dir (updated by git pull).
-            # --skip-existing is a no-op if already installed; silently non-fatal if rbenv not present.
-            log("--- rbenv install (ensuring correct Ruby version) ---")
-            stdout, stderr, code = ssh.execute_sudo(
-                f"su - {user} -c '{_RBENV_PATH}; "
-                f"cd {app_dir} && rbenv install --skip-existing && gem install bundler --no-document'",
-                timeout=600,
-            )
-            out = ((stdout or "") + (stderr or "")).strip()
-            if out:
-                log(out[-500:] if len(out) > 500 else out)
-            if code != 0:
-                # Verify whether the required Ruby version is actually installed.
-                # If not, this is a hard failure — bundle install will fail immediately.
-                rv_out, _, _ = ssh.execute_sudo(
-                    f"su - {user} -c 'cat {app_dir}/.ruby-version 2>/dev/null'", timeout=5
-                )
-                required_rv = rv_out.strip()
-                ver_out, _, _ = ssh.execute_sudo(
-                    f"su - {user} -c '{_RBENV_PATH}; rbenv versions --bare 2>/dev/null'", timeout=10
-                )
-                if required_rv and required_rv not in (ver_out or ""):
-                    log(f"ERROR: rbenv install failed (exit {code}) and Ruby {required_rv} is not installed.")
-                    log("ruby-build may not know about this version yet. To fix on the server:")
-                    log("  cd ~/.rbenv/plugins/ruby-build && git pull")
-                    log(f"  rbenv install {required_rv}")
-                    _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-                    env_swapped = False
-                    return False, "\n".join(log_lines)
-                else:
-                    log(f"NOTE: rbenv/gem step exited {code} — rbenv not in use or bundler already present, continuing")
+            # 2e. Ensure Ruby / Bundler / Node.js meet the target's requirements.
+            # Runs after git pull so .ruby-version, Gemfile.lock and package.json
+            # reflect the new code, and after the snapshot so a failed runtime
+            # upgrade can be rolled back.
+            log("--- Ensuring runtime versions (Ruby / Bundler / Node.js) ---")
+            if not _remediate_environment(ssh, user, app_dir, log):
+                log("ERROR: Runtime version remediation failed. Aborting upgrade.")
+                _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
+                env_swapped = False
+                return False, "\n".join(log_lines)
 
             # 2f. bundle install
             log("--- bundle install ---")

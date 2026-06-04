@@ -1,4 +1,7 @@
 """Tests for Mastodon runtime version remediation (Ruby / Node.js / Bundler)."""
+import sys
+from unittest.mock import MagicMock, patch
+
 from apps.mastodon import (
     _bundler_from_lock,
     _check_env_compliance,
@@ -256,3 +259,65 @@ class TestComplianceNonBlocking:
         joined = "\n".join(logs)
         assert "[FAIL] Ruby" not in joined
         assert "will be upgraded" in joined
+
+
+class TestUpgradeWiring:
+    """run_mastodon_upgrade calls _remediate_environment and aborts on failure."""
+
+    def test_remediation_failure_aborts_upgrade(self):
+        import apps.mastodon as m
+
+        cfg = {
+            "guest_id": "1", "db_guest_id": "2", "db_name": "mastodon_production",
+            "user": "mastodon", "app_dir": "/srv/live", "branch": "main",
+            "pgbouncer_host": "10.0.0.9", "pgbouncer_port": "6432",
+            "direct_db_host": "10.0.0.2", "direct_db_port": "5432",
+            "protection_type": "snapshot", "backup_storage": "", "backup_mode": "snapshot",
+            "guest_id_2": "", "current_version": "4.0.0", "latest_version": "4.1.0",
+            "auto_upgrade": False,
+        }
+
+        # mastodon_guest: has ip, has credential; db_guest: no ip (skip pg_dump)
+        mastodon_guest = MagicMock()
+        mastodon_guest.ip_address = "10.0.0.5"
+        mastodon_guest.credential = MagicMock()
+        mastodon_guest.name = "mastodon-app"
+
+        db_guest = MagicMock()
+        db_guest.ip_address = None  # skip pg_dump step
+        db_guest.name = "mastodon-db"
+
+        # FakeSSH: make git operations succeed so we reach step 2e
+        fake_ssh = FakeSSH([
+            ("git ls-files --unmerged", ("", "", 0)),
+            ("git stash", ("No local changes", "", 0)),
+            ("git pull", ("Already up to date.", "", 0)),
+            ("git stash pop", ("No stash entries", "", 1)),  # non-zero but no unmerged = continue
+        ])
+        ssh_ctx = MagicMock()
+        ssh_ctx.__enter__ = MagicMock(return_value=fake_ssh)
+        ssh_ctx.__exit__ = MagicMock(return_value=False)
+
+        # Stub out models.Credential and models.db for the local import inside run_mastodon_upgrade
+        mock_credential_cls = MagicMock()
+        mock_db = MagicMock()
+        models_stub = MagicMock()
+        models_stub.Credential = mock_credential_cls
+        models_stub.db = mock_db
+
+        with patch.object(m, "_get_mastodon_config", return_value=cfg), \
+             patch.object(m, "Guest") as mock_guest_cls, \
+             patch.object(m, "snapshot_guest", return_value=(True, "ok")), \
+             patch.object(m, "SSHClient") as mock_ssh_cls, \
+             patch.object(m, "_swap_env_db", return_value=(True, "swapped")), \
+             patch.object(m, "_remediate_environment", return_value=False) as rem, \
+             patch.dict(sys.modules, {"models": models_stub}):
+
+            mock_guest_cls.query.get.side_effect = lambda gid: mastodon_guest if gid == 1 else db_guest
+            mock_ssh_cls.from_credential.return_value = ssh_ctx
+
+            ok, log_out = m.run_mastodon_upgrade()
+
+        assert ok is False
+        assert rem.called
+        assert "Runtime version remediation failed" in log_out
