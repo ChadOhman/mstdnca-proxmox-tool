@@ -54,6 +54,205 @@ def _check_version_range(installed, requirement):
     return None
 
 
+def _node_major_from_range(node_range):
+    """Return the floor major version from an engines.node range, or None.
+
+    '>=22' -> 22, '^22.1.0' -> 22, '22.x' -> 22, '>=20 <23' -> 20.
+    """
+    if not node_range:
+        return None
+    m = re.search(r'(\d+)', node_range)
+    return int(m.group(1)) if m else None
+
+
+_BUNDLED_WITH_RE = re.compile(r'BUNDLED WITH\s+([\d.]+)')
+
+
+def _bundler_from_lock(gemfile_lock):
+    """Return the version under 'BUNDLED WITH' in a Gemfile.lock, or None."""
+    if not gemfile_lock:
+        return None
+    m = _BUNDLED_WITH_RE.search(gemfile_lock)
+    return m.group(1).strip() if m else None
+
+
+def _remediate_node(ssh, required_major, installed_node, log):
+    """Ensure Node.js is on `required_major` via the NodeSource apt repo.
+
+    No-op when the installed major already matches. Returns True on success
+    (or no-op), False on install/verification failure.
+    """
+    if required_major is None:
+        log("  [WARN] No Node.js requirement detected — skipping Node remediation")
+        return True
+
+    installed_major = None
+    if installed_node:
+        m = re.match(r'(\d+)', installed_node)
+        if m:
+            installed_major = int(m.group(1))
+
+    if installed_major == required_major:
+        log(f"  [OK] Node.js {installed_node} already on major {required_major}")
+        return True
+
+    log(f"--- Upgrading Node.js {installed_node or '(none)'} → {required_major}.x (NodeSource) ---")
+    node_setup_cmds = (
+        "export DEBIAN_FRONTEND=noninteractive"
+        " && apt-get update -qq && apt-get install -y -qq ca-certificates curl gnupg"
+        " && mkdir -p /etc/apt/keyrings"
+        " && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"
+        " | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg --yes"
+        " && echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg]"
+        f" https://deb.nodesource.com/node_{required_major}.x nodistro main'"
+        " > /etc/apt/sources.list.d/nodesource.list"
+        " && apt-get update -qq && apt-get install -y -qq nodejs"
+    )
+    stdout, stderr, code = ssh.execute_sudo(node_setup_cmds, timeout=300)
+    _log_cmd_output(log, stdout, stderr, code, max_chars=2000)
+    if code != 0:
+        log(f"ERROR: Node.js install failed (exit {code})")
+        return False
+
+    stdout, stderr, code = ssh.execute_sudo("node --version 2>/dev/null", timeout=10)
+    m = re.search(r'v?(\d+)', stdout or "")
+    if code == 0 and m and int(m.group(1)) == required_major:
+        log(f"  [OK] Node.js {(stdout or '').strip()} installed")
+        return True
+    log(f"ERROR: Node.js verification failed (got {(stdout or '').strip() or 'nothing'})")
+    return False
+
+
+def _remediate_ruby(ssh, user, app_dir, log):
+    """Ensure the Ruby version in .ruby-version is installed and global via rbenv.
+
+    Updates the ruby-build plugin first so it knows about newer versions, then
+    `rbenv install -s <ver>` and `rbenv global <ver>`. No-op when already
+    matched. Returns True on success/no-op, False on failure.
+    """
+    out, _, code = ssh.execute_sudo(
+        f"su - {user} -c 'cat {app_dir}/.ruby-version 2>/dev/null'", timeout=10
+    )
+    required = (out or "").strip()
+    if not required:
+        log(f"ERROR: Could not read {app_dir}/.ruby-version — cannot verify Ruby version")
+        return False
+
+    installed = None
+    for cmd in (
+        f"su - {user} -c 'ruby --version 2>/dev/null'",
+        f"su - {user} -c '{_RBENV_PATH}; ruby --version 2>/dev/null'",
+    ):
+        rout, _, rcode = ssh.execute_sudo(cmd, timeout=10)
+        if rcode == 0 and rout.strip():
+            m = re.search(r'ruby\s+(\d+\.\d+\.\d+)', rout)
+            if m:
+                installed = m.group(1)
+                break
+
+    if installed == required:
+        log(f"  [OK] Ruby {installed} already installed")
+        return True
+
+    log(f"--- Upgrading Ruby {installed or '(none)'} → {required} (rbenv) ---")
+    install_cmd = (
+        f"su - {user} -c '{_RBENV_PATH}; "
+        f"(cd ~/.rbenv/plugins/ruby-build && git pull --quiet 2>/dev/null || true); "
+        f"rbenv install -s {required} && rbenv global {required}'"
+    )
+    stdout, stderr, code = ssh.execute_sudo(install_cmd, timeout=1800)
+    _log_cmd_output(log, stdout, stderr, code, max_chars=2000)
+    if code != 0:
+        log(f"ERROR: Ruby {required} install failed (exit {code})")
+        return False
+
+    vout, _, vcode = ssh.execute_sudo(
+        f"su - {user} -c '{_RBENV_PATH}; ruby --version 2>/dev/null'", timeout=10
+    )
+    m = re.search(r'ruby\s+(\d+\.\d+\.\d+)', vout or "")
+    if vcode == 0 and m and m.group(1) == required:
+        log(f"  [OK] Ruby {required} installed")
+        return True
+    log(f"ERROR: Ruby verification failed (got {(vout or '').strip() or 'nothing'})")
+    return False
+
+
+def _remediate_bundler(ssh, user, app_dir, log):
+    """Ensure the Bundler version pinned in Gemfile.lock is installed.
+
+    Falls back to latest Bundler when the lockfile has no 'BUNDLED WITH'.
+    No-op when already matched. Returns True on success/no-op, False on failure.
+    """
+    out, _, _ = ssh.execute_sudo(
+        f"su - {user} -c 'cat {app_dir}/Gemfile.lock 2>/dev/null'", timeout=15
+    )
+    required = _bundler_from_lock(out or "")
+
+    if not required:
+        log("  [WARN] No 'BUNDLED WITH' in Gemfile.lock — installing latest Bundler")
+        cmd = f"su - {user} -c '{_RBENV_PATH}; gem install bundler --no-document'"
+    else:
+        installed = None
+        for c_cmd in (
+            f"su - {user} -c 'bundle --version 2>/dev/null'",
+            f"su - {user} -c '{_RBENV_PATH}; bundle --version 2>/dev/null'",
+        ):
+            bout, _, bcode = ssh.execute_sudo(c_cmd, timeout=10)
+            if bcode == 0 and bout.strip():
+                m = re.search(r'(\d+\.\d+[\.\d]*)', bout)
+                if m:
+                    installed = m.group(1)
+                    break
+        if installed == required:
+            log(f"  [OK] Bundler {installed} already installed")
+            return True
+        log(f"--- Installing Bundler {required} (from Gemfile.lock) ---")
+        cmd = f"su - {user} -c '{_RBENV_PATH}; gem install bundler -v {required} --no-document'"
+
+    stdout, stderr, code = ssh.execute_sudo(cmd, timeout=300)
+    _log_cmd_output(log, stdout, stderr, code, max_chars=1000)
+    if code != 0:
+        log(f"ERROR: Bundler install failed (exit {code})")
+        return False
+    log("  [OK] Bundler installed")
+    return True
+
+
+def _remediate_environment(ssh, user, app_dir, log):
+    """Upgrade Ruby, Bundler, and Node.js to meet the target's requirements.
+
+    Reads required versions from the working tree (run after `git pull`). Order
+    is Ruby → Bundler → Node, since Bundler is a gem under the active Ruby.
+    Returns True only if every required remediation succeeded.
+    """
+    if not _remediate_ruby(ssh, user, app_dir, log):
+        return False
+    if not _remediate_bundler(ssh, user, app_dir, log):
+        return False
+
+    required_major = None
+    out, _, code = ssh.execute_sudo(
+        f"su - {user} -c 'cat {app_dir}/package.json 2>/dev/null'", timeout=15
+    )
+    if code == 0 and out.strip():
+        try:
+            node_range = json.loads(out).get("engines", {}).get("node", "")
+            required_major = _node_major_from_range(node_range)
+        except Exception:
+            pass
+
+    installed_node = None
+    nout, _, ncode = ssh.execute_sudo(
+        f"su - {user} -c 'node --version 2>/dev/null'", timeout=10
+    )
+    if ncode == 0 and nout.strip():
+        m = re.search(r'v?(\d+\.\d+\.\d+)', nout.strip())
+        if m:
+            installed_node = m.group(1)
+
+    return _remediate_node(ssh, required_major, installed_node, log)
+
+
 DEFAULT_MASTODON_REPO = "mastodon/mastodon"
 _REPO_RE = re.compile(r'^[\w.\-]+/[\w.\-]+$')
 
@@ -145,8 +344,9 @@ def check_mastodon_release():
 def _run_second_guest_sync(guest, user, app_dir, log, branch=""):
     """Sync code to a second Mastodon app guest via SSH (no DB migrations).
 
-    Runs: git stash, git pull, git stash pop, bundle install, yarn install,
-    asset precompile, restart mastodon services.
+    Runs: git stash, git pull, git stash pop, runtime remediation
+    (Ruby / Bundler / Node.js), bundle install, yarn install, asset precompile,
+    restart mastodon services.
     Returns True on success, False on failure.
     """
     from models import Credential
@@ -187,6 +387,11 @@ def _run_second_guest_sync(guest, user, app_dir, log, branch=""):
             log(stdout or stderr or "(no output)")
             if code != 0:
                 log("WARNING: [VM2] git stash pop returned non-zero (may be no stash to pop)")
+
+            log("--- [VM2] Ensuring runtime versions (Ruby / Bundler / Node.js) ---")
+            if not _remediate_environment(ssh, user, app_dir, log):
+                log("ERROR: [VM2] Runtime version remediation failed")
+                return False
 
             log("--- [VM2] bundle install ---")
             stdout, stderr, code = ssh.execute_sudo(
@@ -282,7 +487,9 @@ def _check_env_compliance(ssh, user, app_dir, branch, log):
     Reads .ruby-version and package.json from the remote ref via a non-destructive
     git fetch (updates tracking refs only, does not touch the working tree).
 
-    Returns True if all checks pass or only warnings; False if any [FAIL].
+    Runtime mismatches (Node any version, Ruby major.minor) are reported as
+    [INFO] because the upgrade auto-remediates them; this read-only check does
+    not block on them. Returns True (kept for the caller's pass/fail accounting).
     """
     remote_ref = f"origin/{branch}" if branch else "origin/HEAD"
     all_pass = True
@@ -363,9 +570,9 @@ def _check_env_compliance(ssh, user, app_dir, branch, log):
 
     # Step 5: Compare and log
 
-    # Ruby — compare full version. A patch-level difference is a [WARN] (rbenv install handles
-    # it automatically during upgrade). A major.minor mismatch is a [FAIL] and requires
-    # manual intervention.
+    # Ruby — compare full version. A patch-level difference is a [WARN] and a major.minor
+    # mismatch is [INFO]: both are upgraded automatically during the upgrade (rbenv for the
+    # patch level, _remediate_ruby for the major.minor), so neither blocks this check.
     if required_ruby and installed_ruby:
         req_parts = [int(x) for x in re.findall(r'\d+', required_ruby.strip())][:3]
         ins_parts = [int(x) for x in re.findall(r'\d+', installed_ruby)][:3]
@@ -378,11 +585,9 @@ def _check_env_compliance(ssh, user, app_dir, branch, log):
         elif ins_parts[:2] == req_parts[:2]:
             log(f"  [WARN] Ruby {installed_ruby} installed, required {required_ruby} — rbenv will install {required_ruby} automatically during upgrade")
         else:
-            log(f"  [FAIL] Ruby {installed_ruby} installed, required {required_ruby} — major.minor mismatch, manual Ruby upgrade required")
-            all_pass = False
+            log(f"  [INFO] Ruby {installed_ruby} installed, required {required_ruby} — will be upgraded during upgrade")
     elif required_ruby and not installed_ruby:
-        log(f"  [FAIL] Ruby required {required_ruby} but could not detect installed version")
-        all_pass = False
+        log(f"  [INFO] Ruby required {required_ruby} — will be installed during upgrade")
     elif installed_ruby and not required_ruby:
         log(f"  [WARN] Ruby {installed_ruby} installed (could not read .ruby-version from {remote_ref})")
     else:
@@ -394,13 +599,11 @@ def _check_env_compliance(ssh, user, app_dir, branch, log):
         if result is True:
             log(f"  [PASS] Node.js {installed_node} installed, required {required_node}")
         elif result is False:
-            log(f"  [FAIL] Node.js {installed_node} installed, required {required_node} — upgrade Node.js before proceeding")
-            all_pass = False
+            log(f"  [INFO] Node.js {installed_node} installed, required {required_node} — will be upgraded during upgrade")
         else:
             log(f"  [WARN] Node.js {installed_node} installed, required {required_node} (could not parse requirement range)")
     elif required_node and not installed_node:
-        log(f"  [FAIL] Node.js required {required_node} but could not detect installed version")
-        all_pass = False
+        log(f"  [INFO] Node.js required {required_node} — will be installed during upgrade")
     elif installed_node and not required_node:
         log(f"  [WARN] Node.js {installed_node} installed (engines.node not found in package.json)")
     else:
@@ -781,15 +984,11 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
     if mastodon_guest.ip_address:
         try:
             with SSHClient.from_credential(mastodon_guest.ip_address, credential) as ssh:
-                env_ok = _check_env_compliance(ssh, user, app_dir, branch, log)
-            if not env_ok:
-                log("ERROR: Environment does not meet requirements. Upgrade aborted.")
-                log("Fix the version issues above before running the upgrade.")
-                return False, "\n".join(log_lines)
-            log("Environment compliance: OK")
+                _check_env_compliance(ssh, user, app_dir, branch, log)
+            log("Runtime versions (Ruby / Node.js / Bundler) will be upgraded automatically if needed.")
         except Exception as e:
             log(f"WARNING: Could not run environment compliance check: {e}")
-            log("Proceeding with upgrade — verify environment manually if needed.")
+            log("Proceeding with upgrade — runtimes will still be checked in Step 3.")
     else:
         log("WARNING: No IP address for Mastodon guest — skipping environment compliance check")
     log("")
@@ -963,38 +1162,16 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
                 else:
                     log("WARNING: git stash pop returned non-zero (may be no stash to pop)")
 
-            # 2e. Ensure correct Ruby version and Bundler are installed via rbenv.
-            # Reads the target version from .ruby-version in the app dir (updated by git pull).
-            # --skip-existing is a no-op if already installed; silently non-fatal if rbenv not present.
-            log("--- rbenv install (ensuring correct Ruby version) ---")
-            stdout, stderr, code = ssh.execute_sudo(
-                f"su - {user} -c '{_RBENV_PATH}; "
-                f"cd {app_dir} && rbenv install --skip-existing && gem install bundler --no-document'",
-                timeout=600,
-            )
-            out = ((stdout or "") + (stderr or "")).strip()
-            if out:
-                log(out[-500:] if len(out) > 500 else out)
-            if code != 0:
-                # Verify whether the required Ruby version is actually installed.
-                # If not, this is a hard failure — bundle install will fail immediately.
-                rv_out, _, _ = ssh.execute_sudo(
-                    f"su - {user} -c 'cat {app_dir}/.ruby-version 2>/dev/null'", timeout=5
-                )
-                required_rv = rv_out.strip()
-                ver_out, _, _ = ssh.execute_sudo(
-                    f"su - {user} -c '{_RBENV_PATH}; rbenv versions --bare 2>/dev/null'", timeout=10
-                )
-                if required_rv and required_rv not in (ver_out or ""):
-                    log(f"ERROR: rbenv install failed (exit {code}) and Ruby {required_rv} is not installed.")
-                    log("ruby-build may not know about this version yet. To fix on the server:")
-                    log("  cd ~/.rbenv/plugins/ruby-build && git pull")
-                    log(f"  rbenv install {required_rv}")
-                    _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-                    env_swapped = False
-                    return False, "\n".join(log_lines)
-                else:
-                    log(f"NOTE: rbenv/gem step exited {code} — rbenv not in use or bundler already present, continuing")
+            # 2e. Ensure Ruby / Bundler / Node.js meet the target's requirements.
+            # Runs after git pull so .ruby-version, Gemfile.lock and package.json
+            # reflect the new code, and after the snapshot so a failed runtime
+            # upgrade can be rolled back.
+            log("--- Ensuring runtime versions (Ruby / Bundler / Node.js) ---")
+            if not _remediate_environment(ssh, user, app_dir, log):
+                log("ERROR: Runtime version remediation failed. Aborting upgrade.")
+                _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
+                env_swapped = False
+                return False, "\n".join(log_lines)
 
             # 2f. bundle install
             log("--- bundle install ---")
