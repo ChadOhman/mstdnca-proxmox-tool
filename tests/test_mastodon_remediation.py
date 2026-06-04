@@ -290,9 +290,11 @@ class TestUpgradeWiring:
         # FakeSSH: make git operations succeed so we reach step 2e
         fake_ssh = FakeSSH([
             ("git ls-files --unmerged", ("", "", 0)),
+            # "git stash pop" must precede "git stash" — FakeSSH matches the first
+            # substring contained in the command, and "git stash" is a prefix of it.
+            ("git stash pop", ("No stash entries", "", 1)),  # non-zero but no unmerged = continue
             ("git stash", ("No local changes", "", 0)),
             ("git pull", ("Already up to date.", "", 0)),
-            ("git stash pop", ("No stash entries", "", 1)),  # non-zero but no unmerged = continue
         ])
         ssh_ctx = MagicMock()
         ssh_ctx.__enter__ = MagicMock(return_value=fake_ssh)
