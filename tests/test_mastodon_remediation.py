@@ -1,6 +1,7 @@
 """Tests for Mastodon runtime version remediation (Ruby / Node.js / Bundler)."""
 from apps.mastodon import (
     _bundler_from_lock,
+    _check_env_compliance,
     _node_major_from_range,
     _remediate_bundler,
     _remediate_environment,
@@ -223,3 +224,35 @@ class TestRemediateEnvironment:
         # Bundler/Node must not be attempted after Ruby aborts
         assert not ssh.ran("gem install bundler")
         assert not ssh.ran("nodesource")
+
+
+class TestComplianceNonBlocking:
+    def _ssh(self, ruby_installed, node_installed):
+        # Provides: git fetch (ok), remote .ruby-version, remote package.json,
+        # installed ruby, installed node, installed bundler.
+        return FakeSSH([
+            ("git fetch", ("", "", 0)),
+            (".ruby-version", ("4.0.5\n", "", 0)),
+            ("package.json", ('{"engines":{"node":">=22"}}', "", 0)),
+            ("ruby --version", (f"ruby {ruby_installed} (2026)\n", "", 0)),
+            ("node --version", (f"v{node_installed}\n", "", 0)),
+            ("bundle --version", ("Bundler version 2.5.11\n", "", 0)),
+        ])
+
+    def test_node_mismatch_is_not_blocking(self):
+        logs, log = _collect_log()
+        ssh = self._ssh(ruby_installed="4.0.5", node_installed="20.20.2")
+        result = _check_env_compliance(ssh, "mastodon", "/srv/live", "main", log)
+        assert result is True  # no longer blocks
+        joined = "\n".join(logs)
+        assert "will be upgraded" in joined
+        assert "[FAIL] Node" not in joined
+
+    def test_ruby_major_minor_mismatch_is_not_blocking(self):
+        logs, log = _collect_log()
+        ssh = self._ssh(ruby_installed="3.4.1", node_installed="22.4.1")
+        result = _check_env_compliance(ssh, "mastodon", "/srv/live", "main", log)
+        assert result is True
+        joined = "\n".join(logs)
+        assert "[FAIL] Ruby" not in joined
+        assert "will be upgraded" in joined

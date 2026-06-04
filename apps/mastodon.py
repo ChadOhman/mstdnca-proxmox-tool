@@ -577,11 +577,9 @@ def _check_env_compliance(ssh, user, app_dir, branch, log):
         elif ins_parts[:2] == req_parts[:2]:
             log(f"  [WARN] Ruby {installed_ruby} installed, required {required_ruby} — rbenv will install {required_ruby} automatically during upgrade")
         else:
-            log(f"  [FAIL] Ruby {installed_ruby} installed, required {required_ruby} — major.minor mismatch, manual Ruby upgrade required")
-            all_pass = False
+            log(f"  [INFO] Ruby {installed_ruby} installed, required {required_ruby} — will be upgraded during upgrade")
     elif required_ruby and not installed_ruby:
-        log(f"  [FAIL] Ruby required {required_ruby} but could not detect installed version")
-        all_pass = False
+        log(f"  [INFO] Ruby required {required_ruby} — will be installed during upgrade")
     elif installed_ruby and not required_ruby:
         log(f"  [WARN] Ruby {installed_ruby} installed (could not read .ruby-version from {remote_ref})")
     else:
@@ -593,13 +591,11 @@ def _check_env_compliance(ssh, user, app_dir, branch, log):
         if result is True:
             log(f"  [PASS] Node.js {installed_node} installed, required {required_node}")
         elif result is False:
-            log(f"  [FAIL] Node.js {installed_node} installed, required {required_node} — upgrade Node.js before proceeding")
-            all_pass = False
+            log(f"  [INFO] Node.js {installed_node} installed, required {required_node} — will be upgraded during upgrade")
         else:
             log(f"  [WARN] Node.js {installed_node} installed, required {required_node} (could not parse requirement range)")
     elif required_node and not installed_node:
-        log(f"  [FAIL] Node.js required {required_node} but could not detect installed version")
-        all_pass = False
+        log(f"  [INFO] Node.js required {required_node} — will be installed during upgrade")
     elif installed_node and not required_node:
         log(f"  [WARN] Node.js {installed_node} installed (engines.node not found in package.json)")
     else:
