@@ -9,7 +9,7 @@ paramiko==4.0.0
 cryptography==46.0.7
 APScheduler==3.11.2
 Werkzeug==3.1.6
-PyJWT[crypto]==2.12.1
+PyJWT[crypto]==2.13.0
 gunicorn==25.1.0
 geoip2==5.2.0
 prometheus-client==0.24.1
