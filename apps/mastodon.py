@@ -177,6 +177,47 @@ def _remediate_ruby(ssh, user, app_dir, log):
     return False
 
 
+def _remediate_bundler(ssh, user, app_dir, log):
+    """Ensure the Bundler version pinned in Gemfile.lock is installed.
+
+    Falls back to latest Bundler when the lockfile has no 'BUNDLED WITH'.
+    No-op when already matched. Returns True on success/no-op, False on failure.
+    """
+    out, _, _ = ssh.execute_sudo(
+        f"su - {user} -c 'cat {app_dir}/Gemfile.lock 2>/dev/null'", timeout=15
+    )
+    required = _bundler_from_lock(out or "")
+
+    if not required:
+        log("  [WARN] No 'BUNDLED WITH' in Gemfile.lock — installing latest Bundler")
+        cmd = f"su - {user} -c '{_RBENV_PATH}; gem install bundler --no-document'"
+    else:
+        installed = None
+        for c_cmd in (
+            f"su - {user} -c 'bundle --version 2>/dev/null'",
+            f"su - {user} -c '{_RBENV_PATH}; bundle --version 2>/dev/null'",
+        ):
+            bout, _, bcode = ssh.execute_sudo(c_cmd, timeout=10)
+            if bcode == 0 and bout.strip():
+                m = re.search(r'(\d+\.\d+[\.\d]*)', bout)
+                if m:
+                    installed = m.group(1)
+                    break
+        if installed == required:
+            log(f"  [OK] Bundler {installed} already installed")
+            return True
+        log(f"--- Installing Bundler {required} (from Gemfile.lock) ---")
+        cmd = f"su - {user} -c '{_RBENV_PATH}; gem install bundler -v {required} --no-document'"
+
+    stdout, stderr, code = ssh.execute_sudo(cmd, timeout=300)
+    _log_cmd_output(log, stdout, stderr, code, max_chars=1000)
+    if code != 0:
+        log(f"ERROR: Bundler install failed (exit {code})")
+        return False
+    log("  [OK] Bundler installed")
+    return True
+
+
 DEFAULT_MASTODON_REPO = "mastodon/mastodon"
 _REPO_RE = re.compile(r'^[\w.\-]+/[\w.\-]+$')
 

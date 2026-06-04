@@ -1,5 +1,11 @@
 """Tests for Mastodon runtime version remediation (Ruby / Node.js / Bundler)."""
-from apps.mastodon import _bundler_from_lock, _node_major_from_range, _remediate_node, _remediate_ruby
+from apps.mastodon import (
+    _bundler_from_lock,
+    _node_major_from_range,
+    _remediate_bundler,
+    _remediate_node,
+    _remediate_ruby,
+)
 
 
 class FakeSSH:
@@ -148,3 +154,42 @@ class TestRemediateRuby:
             ("rbenv install", ("", "rbenv: command not found", 127)),
         ])
         assert _remediate_ruby(ssh, "mastodon", "/srv/live", log) is False
+
+
+class TestRemediateBundler:
+    def test_noop_when_version_matches(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("cat /srv/live/Gemfile.lock", ("BUNDLED WITH\n   2.5.11\n", "", 0)),
+            ("bundle --version", ("Bundler version 2.5.11\n", "", 0)),
+        ])
+        assert _remediate_bundler(ssh, "mastodon", "/srv/live", log) is True
+        assert not ssh.ran("gem install bundler")
+
+    def test_installs_pinned_version(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("cat /srv/live/Gemfile.lock", ("BUNDLED WITH\n   2.5.11\n", "", 0)),
+            ("bundle --version", ("Bundler version 2.4.1\n", "", 0)),
+            ("gem install bundler", ("done", "", 0)),
+        ])
+        assert _remediate_bundler(ssh, "mastodon", "/srv/live", log) is True
+        assert ssh.ran("gem install bundler -v 2.5.11")
+
+    def test_installs_latest_when_no_pin(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("cat /srv/live/Gemfile.lock", ("GEM\n  specs:\n", "", 0)),
+            ("gem install bundler --no-document", ("done", "", 0)),
+        ])
+        assert _remediate_bundler(ssh, "mastodon", "/srv/live", log) is True
+        assert ssh.ran("gem install bundler --no-document")
+
+    def test_fails_when_install_nonzero(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("cat /srv/live/Gemfile.lock", ("BUNDLED WITH\n   2.5.11\n", "", 0)),
+            ("bundle --version", ("Bundler version 2.4.1\n", "", 0)),
+            ("gem install bundler", ("", "boom", 1)),
+        ])
+        assert _remediate_bundler(ssh, "mastodon", "/srv/live", log) is False
