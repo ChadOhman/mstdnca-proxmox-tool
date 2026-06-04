@@ -3,6 +3,7 @@ from apps.mastodon import (
     _bundler_from_lock,
     _node_major_from_range,
     _remediate_bundler,
+    _remediate_environment,
     _remediate_node,
     _remediate_ruby,
 )
@@ -193,3 +194,32 @@ class TestRemediateBundler:
             ("gem install bundler", ("", "boom", 1)),
         ])
         assert _remediate_bundler(ssh, "mastodon", "/srv/live", log) is False
+
+
+class TestRemediateEnvironment:
+    def _ssh_all_current(self):
+        """Everything already compliant: Ruby 4.0.5, Bundler 2.5.11, Node 22."""
+        return FakeSSH([
+            ("cat /srv/live/.ruby-version", ("4.0.5\n", "", 0)),
+            ("ruby --version", ("ruby 4.0.5 (2026)\n", "", 0)),
+            ("cat /srv/live/Gemfile.lock", ("BUNDLED WITH\n   2.5.11\n", "", 0)),
+            ("bundle --version", ("Bundler version 2.5.11\n", "", 0)),
+            ("cat /srv/live/package.json", ('{"engines":{"node":">=22"}}', "", 0)),
+            ("node --version", ("v22.4.1\n", "", 0)),
+        ])
+
+    def test_all_compliant_no_actions(self):
+        logs, log = _collect_log()
+        ssh = self._ssh_all_current()
+        assert _remediate_environment(ssh, "mastodon", "/srv/live", log) is True
+        assert not ssh.ran("rbenv install")
+        assert not ssh.ran("gem install bundler")
+        assert not ssh.ran("nodesource")
+
+    def test_aborts_when_ruby_fails(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("cat /srv/live/.ruby-version", ("", "", 1))])
+        assert _remediate_environment(ssh, "mastodon", "/srv/live", log) is False
+        # Bundler/Node must not be attempted after Ruby aborts
+        assert not ssh.ran("gem install bundler")
+        assert not ssh.ran("nodesource")

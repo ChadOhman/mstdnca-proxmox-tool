@@ -218,6 +218,41 @@ def _remediate_bundler(ssh, user, app_dir, log):
     return True
 
 
+def _remediate_environment(ssh, user, app_dir, log):
+    """Upgrade Ruby, Bundler, and Node.js to meet the target's requirements.
+
+    Reads required versions from the working tree (run after `git pull`). Order
+    is Ruby → Bundler → Node, since Bundler is a gem under the active Ruby.
+    Returns True only if every required remediation succeeded.
+    """
+    if not _remediate_ruby(ssh, user, app_dir, log):
+        return False
+    if not _remediate_bundler(ssh, user, app_dir, log):
+        return False
+
+    required_major = None
+    out, _, code = ssh.execute_sudo(
+        f"su - {user} -c 'cat {app_dir}/package.json 2>/dev/null'", timeout=15
+    )
+    if code == 0 and out.strip():
+        try:
+            node_range = json.loads(out).get("engines", {}).get("node", "")
+            required_major = _node_major_from_range(node_range)
+        except Exception:
+            pass
+
+    installed_node = None
+    nout, _, ncode = ssh.execute_sudo(
+        f"su - {user} -c 'node --version 2>/dev/null'", timeout=10
+    )
+    if ncode == 0 and nout.strip():
+        m = re.search(r'v?(\d+\.\d+\.\d+)', nout.strip())
+        if m:
+            installed_node = m.group(1)
+
+    return _remediate_node(ssh, required_major, installed_node, log)
+
+
 DEFAULT_MASTODON_REPO = "mastodon/mastodon"
 _REPO_RE = re.compile(r'^[\w.\-]+/[\w.\-]+$')
 
