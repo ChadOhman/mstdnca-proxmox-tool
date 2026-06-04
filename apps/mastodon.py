@@ -76,6 +76,53 @@ def _bundler_from_lock(gemfile_lock):
     return m.group(1).strip() if m else None
 
 
+def _remediate_node(ssh, required_major, installed_node, log):
+    """Ensure Node.js is on `required_major` via the NodeSource apt repo.
+
+    No-op when the installed major already matches. Returns True on success
+    (or no-op), False on install/verification failure.
+    """
+    if required_major is None:
+        log("  [WARN] No Node.js requirement detected — skipping Node remediation")
+        return True
+
+    installed_major = None
+    if installed_node:
+        m = re.match(r'(\d+)', installed_node)
+        if m:
+            installed_major = int(m.group(1))
+
+    if installed_major == required_major:
+        log(f"  [OK] Node.js {installed_node} already on major {required_major}")
+        return True
+
+    log(f"--- Upgrading Node.js {installed_node or '(none)'} → {required_major}.x (NodeSource) ---")
+    node_setup_cmds = (
+        "export DEBIAN_FRONTEND=noninteractive"
+        " && apt-get update -qq && apt-get install -y -qq ca-certificates curl gnupg"
+        " && mkdir -p /etc/apt/keyrings"
+        " && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"
+        " | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg --yes"
+        " && echo 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg]"
+        f" https://deb.nodesource.com/node_{required_major}.x nodistro main'"
+        " > /etc/apt/sources.list.d/nodesource.list"
+        " && apt-get update -qq && apt-get install -y -qq nodejs"
+    )
+    stdout, stderr, code = ssh.execute_sudo(node_setup_cmds, timeout=300)
+    _log_cmd_output(log, stdout, stderr, code, max_chars=2000)
+    if code != 0:
+        log(f"ERROR: Node.js install failed (exit {code})")
+        return False
+
+    stdout, stderr, code = ssh.execute_sudo("node --version 2>/dev/null", timeout=10)
+    m = re.search(r'v?(\d+)', stdout or "")
+    if code == 0 and m and int(m.group(1)) == required_major:
+        log(f"  [OK] Node.js {(stdout or '').strip()} installed")
+        return True
+    log(f"ERROR: Node.js verification failed (got {(stdout or '').strip() or 'nothing'})")
+    return False
+
+
 DEFAULT_MASTODON_REPO = "mastodon/mastodon"
 _REPO_RE = re.compile(r'^[\w.\-]+/[\w.\-]+$')
 
