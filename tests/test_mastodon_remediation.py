@@ -323,3 +323,28 @@ class TestUpgradeWiring:
         assert ok is False
         assert rem.called
         assert "Runtime version remediation failed" in log_out
+
+
+class TestSecondGuestWiring:
+    def test_vm2_remediation_failure_returns_false(self):
+        import apps.mastodon as m
+
+        guest2 = MagicMock()
+        guest2.ip_address = "10.0.0.6"
+        guest2.credential = MagicMock()
+
+        fake_ssh = FakeSSH()
+        ssh_ctx = MagicMock()
+        ssh_ctx.__enter__ = MagicMock(return_value=fake_ssh)
+        ssh_ctx.__exit__ = MagicMock(return_value=False)
+
+        logs, log = _collect_log()
+        models_stub = MagicMock()
+        with patch.object(m.SSHClient, "from_credential", return_value=ssh_ctx), \
+             patch.object(m, "_remediate_environment", return_value=False) as rem, \
+             patch.dict(sys.modules, {"models": models_stub}):
+            ok = m._run_second_guest_sync(guest2, "mastodon", "/srv/live", log, branch="main")
+
+        assert ok is False
+        assert rem.called
+        assert any("[VM2] Runtime version remediation failed" in line for line in logs)

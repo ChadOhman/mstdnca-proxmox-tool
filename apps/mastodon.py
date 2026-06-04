@@ -387,6 +387,11 @@ def _run_second_guest_sync(guest, user, app_dir, log, branch=""):
             if code != 0:
                 log("WARNING: [VM2] git stash pop returned non-zero (may be no stash to pop)")
 
+            log("--- [VM2] Ensuring runtime versions (Ruby / Bundler / Node.js) ---")
+            if not _remediate_environment(ssh, user, app_dir, log):
+                log("ERROR: [VM2] Runtime version remediation failed")
+                return False
+
             log("--- [VM2] bundle install ---")
             stdout, stderr, code = ssh.execute_sudo(
                 f"su - {user} -c '{_RBENV_PATH}; cd {app_dir} && bundle install'", timeout=600
