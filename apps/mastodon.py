@@ -54,6 +54,17 @@ def _check_version_range(installed, requirement):
     return None
 
 
+def _node_major_from_range(node_range):
+    """Return the floor major version from an engines.node range, or None.
+
+    '>=22' -> 22, '^22.1.0' -> 22, '22.x' -> 22, '>=20 <23' -> 20.
+    """
+    if not node_range:
+        return None
+    m = re.search(r'(\d+)', node_range)
+    return int(m.group(1)) if m else None
+
+
 DEFAULT_MASTODON_REPO = "mastodon/mastodon"
 _REPO_RE = re.compile(r'^[\w.\-]+/[\w.\-]+$')
 
