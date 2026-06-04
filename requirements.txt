@@ -6,7 +6,7 @@ SQLAlchemy==2.0.48
 proxmoxer==2.3.0
 requests==2.33.0
 paramiko==4.0.0
-cryptography==46.0.5
+cryptography==46.0.7
 APScheduler==3.11.2
 Werkzeug==3.1.6
 PyJWT[crypto]==2.12.1
