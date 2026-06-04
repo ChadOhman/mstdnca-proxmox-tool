@@ -1,5 +1,5 @@
 """Tests for Mastodon runtime version remediation (Ruby / Node.js / Bundler)."""
-from apps.mastodon import _bundler_from_lock, _node_major_from_range, _remediate_node
+from apps.mastodon import _bundler_from_lock, _node_major_from_range, _remediate_node, _remediate_ruby
 
 
 class FakeSSH:
@@ -96,3 +96,55 @@ class TestRemediateNode:
     def test_warns_and_passes_when_no_requirement(self):
         logs, log = _collect_log()
         assert _remediate_node(FakeSSH(), None, "20.20.2", log) is True
+
+
+class TestRemediateRuby:
+    def test_noop_when_version_matches(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("cat /srv/live/.ruby-version", ("4.0.5\n", "", 0)),
+            ("ruby --version", ("ruby 4.0.5 (2026-01-01)\n", "", 0)),
+        ])
+        assert _remediate_ruby(ssh, "mastodon", "/srv/live", log) is True
+        assert not ssh.ran("rbenv install")
+
+    def test_installs_when_version_differs(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("cat /srv/live/.ruby-version", ("4.0.5\n", "", 0)),
+            ("ruby --version", ("ruby 3.4.1 (2025-01-01)\n", "", 0)),
+            ("rbenv install", ("installed", "", 0)),
+        ])
+        # After install, the verify read of `ruby --version` must report 4.0.5.
+        # FakeSSH returns the first matching substring, so override the verify
+        # by ordering a more specific match isn't possible here; use a counter.
+        calls = {"ruby": 0}
+
+        def exec_sudo(cmd, timeout=None):
+            ssh.calls.append(cmd)
+            if "cat /srv/live/.ruby-version" in cmd:
+                return ("4.0.5\n", "", 0)
+            if "rbenv install" in cmd:
+                return ("installed", "", 0)
+            if "ruby --version" in cmd:
+                calls["ruby"] += 1
+                return ("ruby 3.4.1 (2025)\n", "", 0) if calls["ruby"] == 1 else ("ruby 4.0.5 (2026)\n", "", 0)
+            return ("", "", 0)
+
+        ssh.execute_sudo = exec_sudo
+        assert _remediate_ruby(ssh, "mastodon", "/srv/live", log) is True
+        assert ssh.ran("rbenv global 4.0.5")
+
+    def test_fails_when_ruby_version_unreadable(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("cat /srv/live/.ruby-version", ("", "", 1))])
+        assert _remediate_ruby(ssh, "mastodon", "/srv/live", log) is False
+
+    def test_fails_when_install_nonzero(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("cat /srv/live/.ruby-version", ("4.0.5\n", "", 0)),
+            ("ruby --version", ("ruby 3.4.1 (2025)\n", "", 0)),
+            ("rbenv install", ("", "rbenv: command not found", 127)),
+        ])
+        assert _remediate_ruby(ssh, "mastodon", "/srv/live", log) is False

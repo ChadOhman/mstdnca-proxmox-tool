@@ -123,6 +123,60 @@ def _remediate_node(ssh, required_major, installed_node, log):
     return False
 
 
+def _remediate_ruby(ssh, user, app_dir, log):
+    """Ensure the Ruby version in .ruby-version is installed and global via rbenv.
+
+    Updates the ruby-build plugin first so it knows about newer versions, then
+    `rbenv install -s <ver>` and `rbenv global <ver>`. No-op when already
+    matched. Returns True on success/no-op, False on failure.
+    """
+    out, _, code = ssh.execute_sudo(
+        f"su - {user} -c 'cat {app_dir}/.ruby-version 2>/dev/null'", timeout=10
+    )
+    required = (out or "").strip()
+    if not required:
+        log(f"ERROR: Could not read {app_dir}/.ruby-version — cannot verify Ruby version")
+        return False
+
+    installed = None
+    for cmd in (
+        f"su - {user} -c 'ruby --version 2>/dev/null'",
+        f"su - {user} -c '{_RBENV_PATH}; ruby --version 2>/dev/null'",
+    ):
+        rout, _, rcode = ssh.execute_sudo(cmd, timeout=10)
+        if rcode == 0 and rout.strip():
+            m = re.search(r'ruby\s+(\d+\.\d+\.\d+)', rout)
+            if m:
+                installed = m.group(1)
+                break
+
+    if installed == required:
+        log(f"  [OK] Ruby {installed} already installed")
+        return True
+
+    log(f"--- Upgrading Ruby {installed or '(none)'} → {required} (rbenv) ---")
+    install_cmd = (
+        f"su - {user} -c '{_RBENV_PATH}; "
+        f"(cd ~/.rbenv/plugins/ruby-build && git pull --quiet 2>/dev/null || true); "
+        f"rbenv install -s {required} && rbenv global {required}'"
+    )
+    stdout, stderr, code = ssh.execute_sudo(install_cmd, timeout=1800)
+    _log_cmd_output(log, stdout, stderr, code, max_chars=2000)
+    if code != 0:
+        log(f"ERROR: Ruby {required} install failed (exit {code})")
+        return False
+
+    vout, _, vcode = ssh.execute_sudo(
+        f"su - {user} -c '{_RBENV_PATH}; ruby --version 2>/dev/null'", timeout=10
+    )
+    m = re.search(r'ruby\s+(\d+\.\d+\.\d+)', vout or "")
+    if vcode == 0 and m and m.group(1) == required:
+        log(f"  [OK] Ruby {required} installed")
+        return True
+    log(f"ERROR: Ruby verification failed (got {(vout or '').strip() or 'nothing'})")
+    return False
+
+
 DEFAULT_MASTODON_REPO = "mastodon/mastodon"
 _REPO_RE = re.compile(r'^[\w.\-]+/[\w.\-]+$')
 
