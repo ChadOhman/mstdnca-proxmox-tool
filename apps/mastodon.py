@@ -65,6 +65,17 @@ def _node_major_from_range(node_range):
     return int(m.group(1)) if m else None
 
 
+_BUNDLED_WITH_RE = re.compile(r'BUNDLED WITH\s+([\d.]+)')
+
+
+def _bundler_from_lock(gemfile_lock):
+    """Return the version under 'BUNDLED WITH' in a Gemfile.lock, or None."""
+    if not gemfile_lock:
+        return None
+    m = _BUNDLED_WITH_RE.search(gemfile_lock)
+    return m.group(1).strip() if m else None
+
+
 DEFAULT_MASTODON_REPO = "mastodon/mastodon"
 _REPO_RE = re.compile(r'^[\w.\-]+/[\w.\-]+$')
 
