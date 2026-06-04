@@ -344,8 +344,9 @@ def check_mastodon_release():
 def _run_second_guest_sync(guest, user, app_dir, log, branch=""):
     """Sync code to a second Mastodon app guest via SSH (no DB migrations).
 
-    Runs: git stash, git pull, git stash pop, bundle install, yarn install,
-    asset precompile, restart mastodon services.
+    Runs: git stash, git pull, git stash pop, runtime remediation
+    (Ruby / Bundler / Node.js), bundle install, yarn install, asset precompile,
+    restart mastodon services.
     Returns True on success, False on failure.
     """
     from models import Credential
