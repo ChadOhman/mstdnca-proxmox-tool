@@ -481,7 +481,9 @@ def _check_env_compliance(ssh, user, app_dir, branch, log):
     Reads .ruby-version and package.json from the remote ref via a non-destructive
     git fetch (updates tracking refs only, does not touch the working tree).
 
-    Returns True if all checks pass or only warnings; False if any [FAIL].
+    Runtime mismatches (Node any version, Ruby major.minor) are reported as
+    [INFO] because the upgrade auto-remediates them; this read-only check does
+    not block on them. Returns True (kept for the caller's pass/fail accounting).
     """
     remote_ref = f"origin/{branch}" if branch else "origin/HEAD"
     all_pass = True
@@ -562,9 +564,9 @@ def _check_env_compliance(ssh, user, app_dir, branch, log):
 
     # Step 5: Compare and log
 
-    # Ruby — compare full version. A patch-level difference is a [WARN] (rbenv install handles
-    # it automatically during upgrade). A major.minor mismatch is a [FAIL] and requires
-    # manual intervention.
+    # Ruby — compare full version. A patch-level difference is a [WARN] and a major.minor
+    # mismatch is [INFO]: both are upgraded automatically during the upgrade (rbenv for the
+    # patch level, _remediate_ruby for the major.minor), so neither blocks this check.
     if required_ruby and installed_ruby:
         req_parts = [int(x) for x in re.findall(r'\d+', required_ruby.strip())][:3]
         ins_parts = [int(x) for x in re.findall(r'\d+', installed_ruby)][:3]
