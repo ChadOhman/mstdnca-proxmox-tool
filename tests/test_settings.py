@@ -803,3 +803,42 @@ class TestGithubTokenField:
         assert resp.status_code == 200
         assert b'name="github_token"' in resp.data
         assert b"ghp_TOPSECRET" not in resp.data  # plaintext never rendered
+
+
+class TestApplyUpdateTokenEnv:
+    def test_popen_env_includes_token(self, app, auth_client):
+        from unittest.mock import mock_open
+
+        from auth.credential_store import encrypt
+        from models import Setting
+        with app.app_context():
+            Setting.set("github_token", encrypt("ghp_run"))
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 4242
+        with patch("routes.settings.subprocess.Popen", return_value=fake_proc) as mpopen, \
+             patch("builtins.open", mock_open()):
+            auth_client.post("/settings/apply-update", follow_redirects=False)
+
+        assert mpopen.called
+        env = mpopen.call_args.kwargs.get("env")
+        assert env is not None
+        assert env.get("GITHUB_TOKEN") == "ghp_run"
+
+    def test_popen_env_omits_token_when_unset(self, app, auth_client):
+        from unittest.mock import mock_open
+
+        from models import Setting
+        with app.app_context():
+            Setting.set("github_token", "")
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 4243
+        with patch("routes.settings.subprocess.Popen", return_value=fake_proc) as mpopen, \
+             patch("builtins.open", mock_open()):
+            auth_client.post("/settings/apply-update", follow_redirects=False)
+
+        assert mpopen.called
+        env = mpopen.call_args.kwargs.get("env")
+        assert env is not None
+        assert "GITHUB_TOKEN" not in env

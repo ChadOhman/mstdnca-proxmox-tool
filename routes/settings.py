@@ -693,7 +693,13 @@ def apply_update():
                 return redirect(url_for("settings.index"))
             cmd += ["--branch", update_branch]
 
-        proc = subprocess.Popen(cmd, cwd=BASE_DIR)
+        env = os.environ.copy()
+        enc_token = Setting.get("github_token", "")
+        if enc_token:
+            token = decrypt(enc_token)
+            if token:
+                env["GITHUB_TOKEN"] = token
+        proc = subprocess.Popen(cmd, cwd=BASE_DIR, env=env)
 
         # Write PID marker so we can track the process
         pid_file = os.path.join(DATA_DIR, "update.pid")
