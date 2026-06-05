@@ -791,3 +791,15 @@ class TestGithubTokenSave:
                          follow_redirects=True)
         with app.app_context():
             assert decrypt(Setting.get("github_token", "")) == "ghp_existing"
+
+
+class TestGithubTokenField:
+    def test_field_present_and_secret_not_leaked(self, app, auth_client):
+        from auth.credential_store import encrypt
+        from models import Setting
+        with app.app_context():
+            Setting.set("github_token", encrypt("ghp_TOPSECRET"))
+        resp = auth_client.get("/settings/")
+        assert resp.status_code == 200
+        assert b'name="github_token"' in resp.data
+        assert b"ghp_TOPSECRET" not in resp.data  # plaintext never rendered
