@@ -99,7 +99,15 @@ if [ -d "$GIT_DIR/.git" ]; then
     echo "  Branch: $BRANCH"
 
     echo "  Fetching from origin..."
-    git fetch origin 2>&1 | sed 's/^/    /'
+    if [ -n "$GITHUB_TOKEN" ]; then
+        # Private repo: authenticate this fetch only via an ephemeral header.
+        # -c http.extraheader keeps the token out of .git/config; git does not
+        # echo header values, and this script does not run `set -x`, so the
+        # token never reaches the update log.
+        git -c http.extraheader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch origin 2>&1 | sed 's/^/    /'
+    else
+        git fetch origin 2>&1 | sed 's/^/    /'
+    fi
 
     # Show incoming commits before applying them
     AHEAD=$(git log --oneline HEAD..origin/"$BRANCH" 2>/dev/null | wc -l | tr -d ' ')
