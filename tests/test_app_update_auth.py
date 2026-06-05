@@ -27,7 +27,8 @@ class TestGithubTokenEnv:
             Setting.set("github_token", encrypt("ghp_env"))
             env = github_token_env()
             assert env.get("GITHUB_TOKEN") == "ghp_env"
-            assert "PATH" in env or len(env) > 0  # it's a real os.environ copy
+            # it's a real os.environ copy, not a bare {GITHUB_TOKEN: ...} dict
+            assert len(env) > 1
 
     def test_omits_token_when_unset(self, app):
         from core.app_update_auth import github_token_env
