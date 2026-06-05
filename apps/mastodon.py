@@ -911,7 +911,8 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
 
     log_callback: optional callable(str) invoked immediately after each log line,
     enabling real-time streaming to a polling endpoint.
-    skip_protection: if True, skip the snapshot/backup step (super-admin only).
+    skip_protection: if True, skip BOTH the snapshot/backup step and the pg_dump
+    step (super-admin only — use when protection is already in place).
 
     Returns (success, log_output).
     """
@@ -1043,7 +1044,10 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
                 return False, "\n".join(log_lines)
 
     # --- Step 2: pg_dump backup ---
-    if db_guest and db_guest.ip_address:
+    if skip_protection:
+        log("=== Step 2: Skipping pg_dump (requested by super-admin) ===")
+        log("")
+    elif db_guest and db_guest.ip_address:
         log("=== Step 2: PostgreSQL backup (pg_dump) ===")
         db_credential = db_guest.credential
         if not db_credential:

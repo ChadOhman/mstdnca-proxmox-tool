@@ -314,8 +314,8 @@
                             <input class="form-check-input" type="checkbox" id="skipProtection"
                                    name="skip_protection" value="1">
                             <label class="form-check-label text-warning small" for="skipProtection"
-                                   title="Skip the snapshot/backup step — only use if protection is already in place">
-                                <i class="bi bi-shield-slash"></i> Skip snapshot/backup
+                                   title="Skip the snapshot/backup AND pg_dump steps — only use if protection is already in place">
+                                <i class="bi bi-shield-slash"></i> Skip snapshot/backup + DB dump
                             </label>
                         </div>
                         {% endif %}
@@ -555,13 +555,13 @@ function startUpgrade(e) {
     const skipEl = document.getElementById('skipProtection');
     const skipProtection = skipEl && skipEl.checked;
     const protLine = skipProtection
-        ? '1. ⚠️  Snapshot/backup SKIPPED\n'
+        ? '1. ⚠️  Snapshot/backup + pg_dump SKIPPED\n'
         : '1. ' + (ptype === 'backup' ? 'Backup' : 'Snapshot') + ' ' + (hasGuest2 ? 'all' : 'both') + ' VMs/CTs\n';
     const msg = 'This will:\n'
         + protLine
         + '2. Run the full Mastodon upgrade\n'
         + (hasGuest2 ? '3. Sync code to second Mastodon guest\n4. ' : '3. ') + 'Restart all services\n\n'
-        + (skipProtection ? '⚠️  WARNING: No snapshot or backup will be taken. Continue?\n' : 'Continue?');
+        + (skipProtection ? '⚠️  WARNING: No snapshot, backup, or DB dump will be taken. Continue?\n' : 'Continue?');
     if (!confirm(msg)) return false;
 
     // Show live log panel immediately

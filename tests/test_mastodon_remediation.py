@@ -348,3 +348,69 @@ class TestSecondGuestWiring:
         assert ok is False
         assert rem.called
         assert any("[VM2] Runtime version remediation failed" in line for line in logs)
+
+
+class TestSkipProtectionSkipsPgDump:
+    """skip_protection=True skips BOTH the snapshot/backup step and the pg_dump step."""
+
+    def _run(self, skip_protection):
+        import apps.mastodon as m
+
+        cfg = {
+            "guest_id": "1", "db_guest_id": "2", "db_name": "mastodon_production",
+            "user": "mastodon", "app_dir": "/srv/live", "branch": "main",
+            "pgbouncer_host": "10.0.0.9", "pgbouncer_port": "6432",
+            "direct_db_host": "10.0.0.2", "direct_db_port": "5432",
+            "protection_type": "snapshot", "backup_storage": "", "backup_mode": "snapshot",
+            "guest_id_2": "", "current_version": "4.0.0", "latest_version": "4.1.0",
+            "auto_upgrade": False,
+        }
+
+        mastodon_guest = MagicMock()
+        mastodon_guest.ip_address = "10.0.0.5"
+        mastodon_guest.credential = MagicMock()
+        mastodon_guest.name = "mastodon-app"
+
+        # db_guest HAS an ip + credential, so pg_dump WOULD run unless skipped.
+        db_guest = MagicMock()
+        db_guest.ip_address = "10.0.0.2"
+        db_guest.credential = MagicMock()
+        db_guest.name = "mastodon-db"
+
+        fake_ssh = FakeSSH([
+            ("git ls-files --unmerged", ("", "", 0)),
+            ("git stash pop", ("No stash entries", "", 1)),
+            ("git stash", ("No local changes", "", 0)),
+            ("git pull", ("Already up to date.", "", 0)),
+        ])
+        ssh_ctx = MagicMock()
+        ssh_ctx.__enter__ = MagicMock(return_value=fake_ssh)
+        ssh_ctx.__exit__ = MagicMock(return_value=False)
+
+        models_stub = MagicMock()
+
+        with patch.object(m, "_get_mastodon_config", return_value=cfg), \
+             patch.object(m, "Guest") as mock_guest_cls, \
+             patch.object(m, "snapshot_guest", return_value=(True, "ok")) as snap, \
+             patch.object(m, "SSHClient") as mock_ssh_cls, \
+             patch.object(m, "_swap_env_db", return_value=(True, "swapped")), \
+             patch.object(m, "_remediate_environment", return_value=False), \
+             patch.dict(sys.modules, {"models": models_stub}):
+            mock_guest_cls.query.get.side_effect = lambda gid: mastodon_guest if gid == 1 else db_guest
+            mock_ssh_cls.from_credential.return_value = ssh_ctx
+            # remediation returns False so the upgrade aborts after Steps 1-2 (keeps the test short)
+            ok, log_out = m.run_mastodon_upgrade(skip_protection=skip_protection)
+
+        return log_out, fake_ssh, snap
+
+    def test_skip_protection_skips_pg_dump(self):
+        log_out, fake_ssh, snap = self._run(skip_protection=True)
+        assert "Skipping pg_dump (requested by super-admin)" in log_out
+        assert "Step 2: PostgreSQL backup (pg_dump)" not in log_out
+        assert not fake_ssh.ran("pg_dump")   # no dump command issued
+        assert not snap.called               # snapshot/backup also skipped
+
+    def test_pg_dump_runs_when_not_skipped(self):
+        log_out, fake_ssh, _snap = self._run(skip_protection=False)
+        assert "Step 2: PostgreSQL backup (pg_dump)" in log_out
+        assert fake_ssh.ran("pg_dump")       # dump command issued
