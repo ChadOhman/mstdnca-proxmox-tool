@@ -712,3 +712,20 @@ class TestSettingsIndexCache:
         """Settings page should load even with no cached storages."""
         resp = auth_client.get("/settings/")
         assert resp.status_code == 200
+
+
+class TestGithubAuthHeaders:
+    def test_returns_empty_when_no_token(self, app):
+        from routes.settings import _github_auth_headers
+        with app.app_context():
+            from models import Setting
+            Setting.set("github_token", "")
+            assert _github_auth_headers() == {}
+
+    def test_returns_bearer_when_token_set(self, app):
+        from auth.credential_store import encrypt
+        from models import Setting
+        from routes.settings import _github_auth_headers
+        with app.app_context():
+            Setting.set("github_token", encrypt("ghp_test123"))
+            assert _github_auth_headers() == {"Authorization": "Bearer ghp_test123"}

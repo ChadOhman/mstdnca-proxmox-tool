@@ -8,7 +8,7 @@ from flask import Blueprint, current_app, flash, jsonify, redirect, render_templ
 from flask_login import current_user, login_required
 
 from auth.audit import log_action
-from auth.credential_store import encrypt
+from auth.credential_store import decrypt, encrypt
 from config import BASE_DIR, DATA_DIR
 from models import Setting, db
 
@@ -87,6 +87,16 @@ def _get_settings_dict():
         "app_update_branch": Setting.get("app_update_branch", ""),
         # Global backup_storage/mode/compress removed; per-tag overrides only
     }
+
+
+def _github_auth_headers():
+    """Return an Authorization header dict for GitHub API calls, or {} if no
+    token is configured. Used so the self-update check can read a private repo."""
+    enc = Setting.get("github_token", "")
+    if not enc:
+        return {}
+    token = decrypt(enc)
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 def _get_backup_template_context():
