@@ -729,3 +729,40 @@ class TestGithubAuthHeaders:
         with app.app_context():
             Setting.set("github_token", encrypt("ghp_test123"))
             assert _github_auth_headers() == {"Authorization": "Bearer ghp_test123"}
+
+
+class TestCheckUpdateAuthHeader:
+    def _recorder(self):
+        """Return (capture_dict, fake_urlopen) that records the Request passed in."""
+        capture = {}
+
+        def fake_urlopen(req, timeout=None):
+            capture["auth"] = req.get_header("Authorization")
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({"tag_name": "v0.0.1"}).encode()
+            resp.__enter__ = MagicMock(return_value=resp)
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        return capture, fake_urlopen
+
+    def test_release_check_sends_bearer_when_token_set(self, app, auth_client):
+        from auth.credential_store import encrypt
+        from models import Setting
+        with app.app_context():
+            Setting.set("github_token", encrypt("ghp_abc"))
+        capture, fake = self._recorder()
+        with patch("urllib.request.urlopen", side_effect=fake):
+            auth_client.post("/settings/check-update", data={"app_update_branch": ""},
+                             follow_redirects=True)
+        assert capture["auth"] == "Bearer ghp_abc"
+
+    def test_release_check_no_header_when_no_token(self, app, auth_client):
+        from models import Setting
+        with app.app_context():
+            Setting.set("github_token", "")
+        capture, fake = self._recorder()
+        with patch("urllib.request.urlopen", side_effect=fake):
+            auth_client.post("/settings/check-update", data={"app_update_branch": ""},
+                             follow_redirects=True)
+        assert capture["auth"] is None

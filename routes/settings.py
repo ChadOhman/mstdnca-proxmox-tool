@@ -598,6 +598,17 @@ def save_app_update_mode():
     return redirect(url_for("settings.index"))
 
 
+def _update_check_hint(exc):
+    """Return a short, actionable hint to append to an update-check error flash."""
+    import urllib.error
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code in (401, 403):
+            return " — check the GitHub access token in Settings"
+        if exc.code == 404:
+            return " — for a private repo, set a GitHub access token in Settings"
+    return ""
+
+
 @bp.route("/check-update", methods=["POST"])
 def check_update():
     import json
@@ -616,7 +627,7 @@ def check_update():
     if update_branch:
         try:
             url = f"https://api.github.com/repos/{repo}/branches/{update_branch}"
-            req = urllib.request.Request(url, headers={"User-Agent": "MCAT"})
+            req = urllib.request.Request(url, headers={"User-Agent": "MCAT", **_github_auth_headers()})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
                 full_sha = data.get("commit", {}).get("sha", "")
@@ -635,12 +646,12 @@ def check_update():
                     **_get_backup_template_context(),
                 )
         except Exception as e:
-            flash(f"Could not check branch '{update_branch}': {e}", "error")
+            flash(f"Could not check branch '{update_branch}': {e}{_update_check_hint(e)}", "error")
             return redirect(url_for("settings.index"))
 
     try:
         url = f"https://api.github.com/repos/{repo}/releases/latest"
-        req = urllib.request.Request(url, headers={"User-Agent": "MCAT"})
+        req = urllib.request.Request(url, headers={"User-Agent": "MCAT", **_github_auth_headers()})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
             latest = data.get("tag_name", "").lstrip("v")
@@ -649,7 +660,7 @@ def check_update():
                 return render_template("settings.html", settings=settings, update_available=True, update_version=latest, latest_release=latest, **_get_backup_template_context())
             flash(f"You are running the latest version (v{current_version}).", "success")
     except Exception as e:
-        flash(f"Could not check for updates: {e}", "error")
+        flash(f"Could not check for updates: {e}{_update_check_hint(e)}", "error")
 
     return redirect(url_for("settings.index"))
 
