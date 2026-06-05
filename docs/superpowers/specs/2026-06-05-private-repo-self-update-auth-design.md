@@ -114,7 +114,9 @@ In `update.sh`, the fetch becomes token-aware:
 
 ```bash
 if [ -n "$GITHUB_TOKEN" ]; then
-    git -c http.extraheader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch origin 2>&1 | sed 's/^/    /'
+    # GitHub git-over-HTTPS needs Basic auth (token as password), NOT Bearer.
+    _gh_basic=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
+    git -c http.extraheader="Authorization: Basic $_gh_basic" fetch origin 2>&1 | sed 's/^/    /'
 else
     git fetch origin 2>&1 | sed 's/^/    /'
 fi

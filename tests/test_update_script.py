@@ -48,3 +48,14 @@ def test_fetch_uses_token_extraheader_when_present():
     assert 'http.extraheader=' in content
     # token is passed via -c extraheader, never embedded in a remote URL
     assert '@github.com' not in content
+
+
+def test_fetch_uses_basic_auth_not_bearer():
+    # GitHub git-over-HTTPS accepts Basic auth (token as password), not Bearer.
+    # Bearer authenticates the REST API only; using it for git transport 401s.
+    content = _read()
+    assert 'Authorization: Basic' in content
+    assert 'x-access-token' in content
+    # guard against the broken command form (Bearer in the actual fetch header),
+    # not prose: the comment may legitimately mention Bearer to explain the choice
+    assert 'extraheader="authorization: bearer' not in content.lower()
