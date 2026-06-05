@@ -85,6 +85,7 @@ def _get_settings_dict():
         "unpoller_site_name": Setting.get("unpoller_site_name", "default"),
         "app_auto_update": Setting.get("app_auto_update", "false"),
         "app_update_branch": Setting.get("app_update_branch", ""),
+        "github_token": Setting.get("github_token", ""),
         # Global backup_storage/mode/compress removed; per-tag overrides only
     }
 
@@ -591,11 +592,20 @@ def save_app_update_mode():
     update_branch = request.form.get("app_update_branch", "").strip()
     Setting.set("app_auto_update", "true" if auto_update else "false")
     Setting.set("app_update_branch", update_branch)
+    _save_github_token_from_form()
     log_action("settings_update_mode_save", "settings", resource_name="app_update",
                details={"auto_update": auto_update, "branch": update_branch or None})
     db.session.commit()
     flash("Application update settings saved.", "success")
     return redirect(url_for("settings.index"))
+
+
+def _save_github_token_from_form():
+    """Persist the GitHub token from the submitted form, encrypted. Only updates
+    when a non-blank value is supplied so a blank submit preserves the existing token."""
+    token = request.form.get("github_token", "").strip()
+    if token:
+        Setting.set("github_token", encrypt(token))
 
 
 def _update_check_hint(exc):
@@ -619,6 +629,7 @@ def check_update():
     update_branch = request.form.get("app_update_branch", "").strip()
     Setting.set("app_auto_update", "true" if auto_update else "false")
     Setting.set("app_update_branch", update_branch)
+    _save_github_token_from_form()
 
     repo = current_app.config.get("GITHUB_REPO", "")
     current_version = current_app.config.get("APP_VERSION", "0.0.0")

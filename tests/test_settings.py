@@ -766,3 +766,28 @@ class TestCheckUpdateAuthHeader:
             auth_client.post("/settings/check-update", data={"app_update_branch": ""},
                              follow_redirects=True)
         assert capture["auth"] is None
+
+
+class TestGithubTokenSave:
+    def test_app_update_mode_saves_encrypted_token(self, app, auth_client):
+        from auth.credential_store import decrypt
+        from models import Setting
+        auth_client.post("/settings/app-update-mode",
+                         data={"app_update_branch": "main", "github_token": "ghp_secret"},
+                         follow_redirects=True)
+        with app.app_context():
+            stored = Setting.get("github_token", "")
+            assert stored != ""
+            assert stored != "ghp_secret"          # encrypted at rest
+            assert decrypt(stored) == "ghp_secret"  # round-trips
+
+    def test_blank_token_keeps_existing(self, app, auth_client):
+        from auth.credential_store import decrypt, encrypt
+        from models import Setting
+        with app.app_context():
+            Setting.set("github_token", encrypt("ghp_existing"))
+        auth_client.post("/settings/app-update-mode",
+                         data={"app_update_branch": "main", "github_token": ""},
+                         follow_redirects=True)
+        with app.app_context():
+            assert decrypt(Setting.get("github_token", "")) == "ghp_existing"
