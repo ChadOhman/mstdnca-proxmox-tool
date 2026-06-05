@@ -559,6 +559,7 @@ def _check_app_update(app):
         import urllib.request
 
         from config import BASE_DIR
+        from core.app_update_auth import github_auth_headers, github_token_env
         from models import Setting
 
         repo = app.config.get("GITHUB_REPO", "")
@@ -573,7 +574,7 @@ def _check_app_update(app):
         # Always fetch the latest release and store it
         try:
             url = f"https://api.github.com/repos/{repo}/releases/latest"
-            req = urllib.request.Request(url, headers={"User-Agent": "MCAT"})
+            req = urllib.request.Request(url, headers={"User-Agent": "MCAT", **github_auth_headers()})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
                 latest = data.get("tag_name", "").lstrip("v")
@@ -605,7 +606,7 @@ def _check_app_update(app):
                 return
             logger.info(f"Auto-update from branch '{update_branch}'...")
             if os.path.exists(update_script):
-                subprocess.Popen(["bash", update_script, "--branch", update_branch], cwd=BASE_DIR)
+                subprocess.Popen(["bash", update_script, "--branch", update_branch], cwd=BASE_DIR, env=github_token_env())
             else:
                 logger.warning("update.sh not found, cannot auto-update")
             return
@@ -619,7 +620,7 @@ def _check_app_update(app):
         # Run update.sh
         if os.path.exists(update_script):
             logger.info("Auto-update enabled, running update.sh...")
-            subprocess.Popen(["bash", update_script], cwd=BASE_DIR)
+            subprocess.Popen(["bash", update_script], cwd=BASE_DIR, env=github_token_env())
         else:
             logger.warning("update.sh not found, cannot auto-update")
 

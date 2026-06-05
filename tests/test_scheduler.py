@@ -976,6 +976,39 @@ class TestCheckAppUpdate:
 
         mock_notifier.send_app_update_notification.assert_not_called()
 
+    def test_auto_update_branch_injects_token_env(self):
+        import json
+
+        from core.scheduler import _check_app_update
+
+        app = _make_app(config={"GITHUB_REPO": "org/repo", "APP_VERSION": "1.0.0"})
+
+        mock_setting = MagicMock()
+        mock_setting.get.side_effect = lambda k, d="": {
+            "app_update_branch": "main",
+            "app_auto_update": "true",
+            "latest_app_version": "",
+            "latest_app_check": "",
+            "app_last_notified_version": "",
+        }.get(k, d)
+
+        fake_resp = MagicMock()
+        fake_resp.__enter__ = MagicMock(return_value=fake_resp)
+        fake_resp.__exit__ = MagicMock(return_value=False)
+        fake_resp.read.return_value = json.dumps({"tag_name": "v1.1.0"}).encode()
+
+        mock_notifier = MagicMock()
+        mock_notifier.send_app_update_notification.return_value = (True, "ok")
+        mocks = {"models": MagicMock(Setting=mock_setting), "core.notifier": mock_notifier}
+        with _SysModulesPatch(mocks), \
+             patch("urllib.request.urlopen", return_value=fake_resp), \
+             patch("core.app_update_auth.github_token_env", return_value={"GITHUB_TOKEN": "ghp_sched", "PATH": "/usr/bin"}), \
+             patch("subprocess.Popen") as mock_popen:
+            _check_app_update(app)
+
+        assert mock_popen.called
+        assert mock_popen.call_args.kwargs.get("env", {}).get("GITHUB_TOKEN") == "ghp_sched"
+
 
 # ---------------------------------------------------------------------------
 # _check_mastodon_release

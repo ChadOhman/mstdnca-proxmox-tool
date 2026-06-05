@@ -8,8 +8,9 @@ from flask import Blueprint, current_app, flash, jsonify, redirect, render_templ
 from flask_login import current_user, login_required
 
 from auth.audit import log_action
-from auth.credential_store import decrypt, encrypt
+from auth.credential_store import encrypt
 from config import BASE_DIR, DATA_DIR
+from core.app_update_auth import github_auth_headers, github_token_env
 from models import Setting, db
 
 logger = logging.getLogger(__name__)
@@ -92,12 +93,8 @@ def _get_settings_dict():
 
 def _github_auth_headers():
     """Return an Authorization header dict for GitHub API calls, or {} if no
-    token is configured. Used so the self-update check can read a private repo."""
-    enc = Setting.get("github_token", "")
-    if not enc:
-        return {}
-    token = decrypt(enc)
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    token is configured. Delegates to the shared helper."""
+    return github_auth_headers()
 
 
 def _get_backup_template_context():
@@ -693,12 +690,7 @@ def apply_update():
                 return redirect(url_for("settings.index"))
             cmd += ["--branch", update_branch]
 
-        env = os.environ.copy()
-        enc_token = Setting.get("github_token", "")
-        if enc_token:
-            token = decrypt(enc_token)
-            if token:
-                env["GITHUB_TOKEN"] = token
+        env = github_token_env()
         proc = subprocess.Popen(cmd, cwd=BASE_DIR, env=env)
 
         # Write PID marker so we can track the process
