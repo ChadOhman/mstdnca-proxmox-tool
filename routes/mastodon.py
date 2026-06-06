@@ -16,6 +16,7 @@ from models import Guest, Setting, db
 # ---------------------------------------------------------------------------
 _upgrade_job = JobTracker()
 _preflight_job = JobTracker()
+_follow_job = JobTracker()
 
 logger = logging.getLogger(__name__)
 
@@ -436,59 +437,100 @@ def detect_versions():
     return redirect(url_for("mastodon.upgrade_page"))
 
 
+@bp.route("/follow-account/status")
+def follow_account_status():
+    return jsonify({
+        "running": _follow_job["running"],
+        "success": _follow_job["success"],
+        "log": "".join(_follow_job["log"]),
+    })
+
+
 @bp.route("/follow-account", methods=["POST"])
 def follow_account():
-    """Make every local account follow a given local account via tootctl.
+    """Start a background job that makes every local account follow <account>.
 
-    Runs, on the Mastodon app guest:
+    Streams the live output of, on the Mastodon app guest:
         sudo su - <user> -c '<rbenv PATH>; cd <app_dir> &&
             RAILS_ENV=production bin/tootctl accounts follow <account>'
-    The rbenv PATH + cd are required so ruby and bin/tootctl resolve in the
-    non-login `su -c` shell (same form the upgrade uses for `tootctl cache clear`).
+    into _follow_job.log so the frontend modal can poll /follow-account/status.
+    The rbenv PATH + cd let ruby and bin/tootctl resolve in the non-login
+    `su -c` shell (same form the upgrade uses for `tootctl cache clear`).
+    Returns JSON {"started": true} or an error.
     """
+    from flask import current_app
+
     from apps.mastodon import _RBENV_PATH, _validate_shell_param
-    from core.scanner import _execute_command
 
     account = (request.form.get("account") or "announcements").strip()
     if not re.match(r'^[A-Za-z0-9_]{1,30}$', account):
-        flash("Invalid account username — use letters, numbers, or underscore only.", "error")
-        return redirect(url_for("mastodon.upgrade_page"))
+        return jsonify({"error": "Invalid account — use letters, numbers, or underscore only."}), 400
+
+    if _follow_job["running"]:
+        return jsonify({"error": "A follow operation is already in progress."}), 409
 
     guest_id = Setting.get("mastodon_guest_id", "")
     user = Setting.get("mastodon_user", "mastodon")
     app_dir = Setting.get("mastodon_app_dir", "/home/mastodon/live")
 
     if not guest_id:
-        flash("Mastodon app guest not configured.", "warning")
-        return redirect(url_for("mastodon.upgrade_page"))
+        return jsonify({"error": "Mastodon app guest not configured."}), 400
 
     try:
         _validate_shell_param(user, "Mastodon user")
         _validate_shell_param(app_dir, "Mastodon app_dir")
     except ValueError as e:
-        flash(str(e), "error")
-        return redirect(url_for("mastodon.upgrade_page"))
-
-    mastodon_guest = Guest.query.get(int(guest_id))
-    if not mastodon_guest:
-        flash("Mastodon app guest not found.", "error")
-        return redirect(url_for("mastodon.upgrade_page"))
+        return jsonify({"error": str(e)}), 400
 
     command = (
         f"su - {user} -c '{_RBENV_PATH}; cd {app_dir} && "
         f"RAILS_ENV=production bin/tootctl accounts follow {account}'"
     )
-    stdout, error = _execute_command(mastodon_guest, command, timeout=300, sudo=True)
 
-    log_action("mastodon_follow_account", "settings", resource_name="mastodon",
-               details={"account": account, "ok": not error})
-    db.session.commit()
+    _follow_job.update({"running": True, "success": None, "log": []})
+    _follow_job["log"].append(f"$ tootctl accounts follow {account}\n")
+    _app = current_app._get_current_object()
 
-    if error:
-        flash(f"Failed to make accounts follow @{account}: {error}", "error")
-    else:
-        tail = (stdout or "").strip()
-        tail = tail[-500:] if len(tail) > 500 else tail
-        flash(f"All local accounts now follow @{account}." + (f"\n{tail}" if tail else ""), "success")
+    def _bg():
+        from clients.ssh_client import SSHClient
+        from models import Credential
 
-    return redirect(url_for("mastodon.upgrade_page"))
+        ok = False
+        try:
+            with _app.app_context():
+                guest = Guest.query.get(int(guest_id))
+                credential = None
+                if guest:
+                    credential = guest.credential or Credential.query.filter_by(is_default=True).first()
+                if not guest or not guest.ip_address or not credential:
+                    _follow_job["log"].append("ERROR: Mastodon guest has no IP or SSH credential configured.\n")
+                else:
+                    with SSHClient.from_credential(guest.ip_address, credential) as ssh:
+                        code = ssh.execute_sudo_streaming(
+                            command, lambda data: _follow_job["log"].append(data), timeout=600
+                        )
+                    if code == 0:
+                        _follow_job["log"].append(f"\n✓ Done — all local accounts now follow @{account}.\n")
+                        ok = True
+                    else:
+                        _follow_job["log"].append(f"\n✗ tootctl exited with code {code}.\n")
+        except Exception as e:
+            _follow_job["log"].append(f"\nFATAL ERROR: {e}\n")
+            ok = False
+        _follow_job["running"] = False
+        _follow_job["success"] = ok
+        try:
+            with _app.app_context():
+                log_action("mastodon_follow_account", "settings", resource_name="mastodon",
+                           details={"account": account, "ok": ok})
+                db.session.commit()
+        except Exception:
+            pass
+
+    try:
+        import gevent as _gevent
+        _gevent.spawn(_bg)
+    except ImportError:
+        _threading.Thread(target=_bg, daemon=True).start()
+
+    return jsonify({"started": True, "account": account})

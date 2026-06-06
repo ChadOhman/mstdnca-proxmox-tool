@@ -303,8 +303,8 @@
                         </button>
                     </form>
                     {% if settings.guest_id %}
-                    <form method="post" action="/mastodon/follow-account" class="d-flex gap-1 align-items-center"
-                          onsubmit="return confirm('Make EVERY local account follow @' + (this.account.value || 'announcements') + '? This runs tootctl accounts follow on the instance.');">
+                    <form method="post" action="/mastodon/follow-account" id="followForm"
+                          class="d-flex gap-1 align-items-center" onsubmit="return startFollow(event)">
                         <input type="text" class="form-control form-control-sm font-monospace" name="account"
                                value="announcements" style="max-width: 11rem;"
                                pattern="[A-Za-z0-9_]{1,30}" title="Local username (letters, numbers, underscore)">
@@ -413,6 +413,30 @@
             </div>
         </div>
     </div>
+</div>
+
+<!-- Live output modal for "Follow for all" -->
+<div class="modal fade" id="followModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">
+          <i class="bi bi-person-check"></i>
+          <span id="followModalTitle">Following…</span>
+          <span id="followModalBadge" class="ms-1"></span>
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <pre id="followLog" class="bg-dark text-light p-2 rounded small mb-0"
+             style="max-height:55vh; overflow:auto; white-space:pre-wrap;">Starting…</pre>
+      </div>
+      <div class="modal-footer">
+        <span id="followSpinner" class="spinner-border spinner-border-sm text-secondary me-auto" role="status"></span>
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
 </div>
 {% endblock %}
 
@@ -619,5 +643,78 @@ fetch('/mastodon/preflight/status')
             pollPreflightStatus();
         }
     });
+
+// ── "Follow for all" live modal ───────────────────────────────────────────
+let _followPoll = null;
+
+function _renderFollowLog(text) {
+    // Collapse carriage-return progress updates so a tootctl progress bar
+    // reads cleanly instead of as one long concatenated line.
+    return (text || '').split('\n').map(function(line) {
+        const i = line.lastIndexOf('\r');
+        return i >= 0 ? line.slice(i + 1) : line;
+    }).join('\n');
+}
+
+function _pollFollow() {
+    const logEl = document.getElementById('followLog');
+    const badgeEl = document.getElementById('followModalBadge');
+    const spinnerEl = document.getElementById('followSpinner');
+    if (_followPoll) clearInterval(_followPoll);
+    _followPoll = setInterval(function() {
+        fetch('/mastodon/follow-account/status')
+            .then(function(r) { return r.json(); })
+            .then(function(s) {
+                const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 24;
+                logEl.textContent = _renderFollowLog(s.log) || '(no output yet)';
+                if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+                if (!s.running) {
+                    clearInterval(_followPoll); _followPoll = null;
+                    spinnerEl.style.display = 'none';
+                    badgeEl.innerHTML = s.success
+                        ? '<span class="badge bg-success">Done</span>'
+                        : '<span class="badge bg-danger">Failed</span>';
+                }
+            })
+            .catch(function() {});
+    }, 1000);
+}
+
+function startFollow(e) {
+    e.preventDefault();
+    const form = e.target;
+    const account = (form.account.value || 'announcements').trim();
+    if (!confirm('Make EVERY local account follow @' + account +
+                 '? This runs tootctl accounts follow on the instance.')) {
+        return false;
+    }
+    const logEl = document.getElementById('followLog');
+    const badgeEl = document.getElementById('followModalBadge');
+    const spinnerEl = document.getElementById('followSpinner');
+    document.getElementById('followModalTitle').textContent = 'Following @' + account + '…';
+    badgeEl.innerHTML = '';
+    spinnerEl.style.display = '';
+    logEl.textContent = 'Starting…';
+    new bootstrap.Modal(document.getElementById('followModal')).show();
+
+    const fd = new FormData();
+    fd.append('account', account);
+    fetch('/mastodon/follow-account', { method: 'POST', body: fd })
+        .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, j: j }; }); })
+        .then(function(res) {
+            if (!res.ok || res.j.error) {
+                logEl.textContent = 'Error: ' + (res.j.error || 'failed to start');
+                spinnerEl.style.display = 'none';
+                badgeEl.innerHTML = '<span class="badge bg-danger">Failed</span>';
+                return;
+            }
+            _pollFollow();
+        })
+        .catch(function(err) {
+            logEl.textContent = 'Error: ' + err;
+            spinnerEl.style.display = 'none';
+        });
+    return false;
+}
 </script>
 {% endblock %}
