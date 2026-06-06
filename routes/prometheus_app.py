@@ -396,6 +396,8 @@ def upgrade():
     except ImportError:
         _threading.Thread(target=_bg, daemon=True).start()
 
+    return redirect(url_for("prometheus_app.manage"))
+
 
 # ---------------------------------------------------------------------------
 # Exporter management routes

@@ -584,3 +584,29 @@ class TestPrometheusManagementRoutes:
         data = json.loads(resp.data)
         assert resp.status_code != 400
         assert "ok" in data
+
+
+class TestPrometheusUpgradeRoute:
+    """The /prometheus/upgrade POST must return a redirect, not 500.
+
+    Regression: upgrade() spawned the background job but had no return statement,
+    so the Flask view returned None -> 'did not return a valid response' -> 500.
+    """
+
+    def test_upgrade_post_returns_redirect_not_500(self, app, auth_client):
+        import routes.prometheus_app as r
+
+        # Ensure no stale job-in-progress state from other tests.
+        for job in (r._install_job, r._upgrade_job, r._preflight_job):
+            job["running"] = False
+        try:
+            # Stub the background spawn so the job thread doesn't run during the
+            # test (it has no request/login context); we only assert the view's
+            # synchronous response — which is where the missing-return bug lived.
+            with patch("routes.prometheus_app._threading.Thread"), \
+                 patch("apps.prometheus_app.run_prometheus_upgrade", return_value=(True, "")):
+                resp = auth_client.post("/prometheus/upgrade", follow_redirects=False)
+            assert resp.status_code == 302
+            assert resp.headers.get("Location", "").endswith("/prometheus/manage")
+        finally:
+            r._upgrade_job["running"] = False
