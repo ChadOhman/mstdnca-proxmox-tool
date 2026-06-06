@@ -302,6 +302,18 @@
                             <i class="bi bi-arrow-repeat"></i> Check for Updates
                         </button>
                     </form>
+                    {% if settings.guest_id %}
+                    <form method="post" action="/mastodon/follow-account" class="d-flex gap-1 align-items-center"
+                          onsubmit="return confirm('Make EVERY local account follow @' + (this.account.value || 'announcements') + '? This runs tootctl accounts follow on the instance.');">
+                        <input type="text" class="form-control form-control-sm font-monospace" name="account"
+                               value="announcements" style="max-width: 11rem;"
+                               pattern="[A-Za-z0-9_]{1,30}" title="Local username (letters, numbers, underscore)">
+                        <button type="submit" class="btn btn-outline-primary"
+                                title="Run: RAILS_ENV=production bin/tootctl accounts follow &lt;account&gt; for all local accounts">
+                            <i class="bi bi-person-check"></i> Follow for all
+                        </button>
+                    </form>
+                    {% endif %}
                     {% if settings.guest_id and settings.db_guest_id %}
                     <button type="button" class="btn btn-outline-secondary" id="preflightBtn"
                             onclick="startPreflight()">

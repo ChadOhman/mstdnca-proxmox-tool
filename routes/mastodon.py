@@ -434,3 +434,61 @@ def detect_versions():
         flash(f"Detected: {', '.join(detected)}", "success")
 
     return redirect(url_for("mastodon.upgrade_page"))
+
+
+@bp.route("/follow-account", methods=["POST"])
+def follow_account():
+    """Make every local account follow a given local account via tootctl.
+
+    Runs, on the Mastodon app guest:
+        sudo su - <user> -c '<rbenv PATH>; cd <app_dir> &&
+            RAILS_ENV=production bin/tootctl accounts follow <account>'
+    The rbenv PATH + cd are required so ruby and bin/tootctl resolve in the
+    non-login `su -c` shell (same form the upgrade uses for `tootctl cache clear`).
+    """
+    from apps.mastodon import _RBENV_PATH, _validate_shell_param
+    from core.scanner import _execute_command
+
+    account = (request.form.get("account") or "announcements").strip()
+    if not re.match(r'^[A-Za-z0-9_]{1,30}$', account):
+        flash("Invalid account username — use letters, numbers, or underscore only.", "error")
+        return redirect(url_for("mastodon.upgrade_page"))
+
+    guest_id = Setting.get("mastodon_guest_id", "")
+    user = Setting.get("mastodon_user", "mastodon")
+    app_dir = Setting.get("mastodon_app_dir", "/home/mastodon/live")
+
+    if not guest_id:
+        flash("Mastodon app guest not configured.", "warning")
+        return redirect(url_for("mastodon.upgrade_page"))
+
+    try:
+        _validate_shell_param(user, "Mastodon user")
+        _validate_shell_param(app_dir, "Mastodon app_dir")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("mastodon.upgrade_page"))
+
+    mastodon_guest = Guest.query.get(int(guest_id))
+    if not mastodon_guest:
+        flash("Mastodon app guest not found.", "error")
+        return redirect(url_for("mastodon.upgrade_page"))
+
+    command = (
+        f"su - {user} -c '{_RBENV_PATH}; cd {app_dir} && "
+        f"RAILS_ENV=production bin/tootctl accounts follow {account}'"
+    )
+    stdout, error = _execute_command(mastodon_guest, command, timeout=300, sudo=True)
+
+    log_action("mastodon_follow_account", "settings", resource_name="mastodon",
+               details={"account": account, "ok": not error})
+    db.session.commit()
+
+    if error:
+        flash(f"Failed to make accounts follow @{account}: {error}", "error")
+    else:
+        tail = (stdout or "").strip()
+        tail = tail[-500:] if len(tail) > 500 else tail
+        flash(f"All local accounts now follow @{account}." + (f"\n{tail}" if tail else ""), "success")
+
+    return redirect(url_for("mastodon.upgrade_page"))
