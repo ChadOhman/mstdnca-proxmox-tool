@@ -7,7 +7,7 @@ proxmoxer==2.3.0
 requests==2.34.2
 # paramiko 4.0.0 is the latest release. Dependabot GHSA (low): rsakey.py permits
 # the SHA-1 algorithm. No patched version is available yet — revisit when upstream ships one.
-paramiko==4.0.0
+paramiko==5.0.0
 cryptography==46.0.7
 APScheduler==3.11.2
 Werkzeug==3.1.6
