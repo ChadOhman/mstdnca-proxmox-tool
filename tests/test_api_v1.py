@@ -508,6 +508,14 @@ class TestServices:
 
 
 class TestPushWebhooks:
+    @pytest.fixture(autouse=True)
+    def _allow_webhook_urls(self):
+        # These tests exercise registration/CRUD and field validation, not the
+        # SSRF guard (covered in test_push_notifier.py). Stub the URL validator
+        # so example.com hosts don't require live DNS resolution.
+        with patch("core.url_safety.validate_webhook_url", return_value=(True, None)):
+            yield
+
     def test_register_webhook(self, client):
         access, _ = _login(client)
         resp = client.post("/api/v1/push/register", json={

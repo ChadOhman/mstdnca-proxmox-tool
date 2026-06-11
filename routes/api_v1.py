@@ -576,6 +576,12 @@ def push_register():
     if not url or not device_token or not platform:
         return _error("BAD_REQUEST", "url, device_token, and platform are required.", 400)
 
+    # Reject URLs that point at internal/non-public addresses (SSRF guard).
+    from core.url_safety import validate_webhook_url
+    ok, reason = validate_webhook_url(url)
+    if not ok:
+        return _error("BAD_REQUEST", f"Invalid url: {reason}.", 400)
+
     if platform not in ("ios", "android"):
         return _error("BAD_REQUEST", "platform must be 'ios' or 'android'.", 400)
 
