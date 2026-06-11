@@ -75,24 +75,31 @@ def _build_pg_create_user_cmd(user, db_password):
 
     ``user`` is validated with ``_validate_shell_param`` by the caller, so it is
     safe to interpolate.  ``db_password`` is fully attacker-controlled (set via
-    the Settings UI) and must never reach a shell- or SQL-interpreted context
-    unescaped.  We transport it as base64 (decoded on the remote into psql's
-    ``-v`` argument) and let psql perform SQL-literal quoting via ``:'pw'`` —
-    so neither shell metacharacters (``$()``, backticks, ``;``) nor SQL quotes
-    can break out.  Mirrors the base64 pattern used in ``apps/jitsi.py``.
+    the Settings UI) and must never reach a shell-interpreted context.
+
+    We build the ``CREATE USER`` statement in Python with SQL single-quote
+    escaping, base64-encode the whole statement, and pipe it to ``psql`` on
+    *stdin* via ``su - postgres`` (the postgres-access idiom used throughout
+    this module and in ``apps/mastodon.py``).  The base64 blob is shell-safe
+    (``[A-Za-z0-9+/=]``) and psql reads clean SQL bytes from stdin, so neither
+    shell metacharacters (``$()``, backticks, ``;``) nor SQL quotes can break
+    out -- SQL-literal escaping alone is sufficient because no shell ever parses
+    the password.
     """
     exists_check = (
-        f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{user}'\""  # noqa: S608
+        f"su - postgres -c \"psql -tAc \\\"SELECT 1 FROM pg_roles WHERE rolname='{user}'\\\"\""  # noqa: S608
         f" | grep -q 1 && echo 'User exists'"
     )
     if db_password:
-        pw_b64 = base64.b64encode(db_password.encode("utf-8")).decode("ascii")
+        safe_pw = db_password.replace("'", "''")  # SQL single-quote escape
+        sql = f"CREATE USER {user} WITH PASSWORD '{safe_pw}';"  # noqa: S608
+        sql_b64 = base64.b64encode(sql.encode("utf-8")).decode("ascii")
         create = (
-            f"sudo -u postgres psql -v pw=\"$(printf '%s' '{pw_b64}' | base64 -d)\""
-            f" -c \"CREATE USER {user} WITH PASSWORD :'pw'\""
+            f"printf '%s' '{sql_b64}' | base64 -d"
+            f" | su - postgres -c 'psql -v ON_ERROR_STOP=1'"
         )
     else:
-        create = f"sudo -u postgres createuser {user}"
+        create = f"su - postgres -c \"createuser {user}\""
     return f"{exists_check} || {create}"
 
 
@@ -486,9 +493,9 @@ def run_peertube_install(log_callback=None):
 
         try:
             with SSHClient.from_credential(db_guest.ip_address, db_credential) as db_ssh:
-                # Create PostgreSQL user. The password is base64-transported and
-                # SQL-quoted by psql (:'pw') so it cannot break out of the shell
-                # or the SQL string -- see _build_pg_create_user_cmd.
+                # Create PostgreSQL user. The password is SQL-escaped, base64-
+                # transported, and piped to psql on stdin so it never reaches a
+                # shell-interpreted context -- see _build_pg_create_user_cmd.
                 create_user_cmd = _build_pg_create_user_cmd(user, db_password)
                 log(f"Creating PostgreSQL user '{user}'...")
                 stdout, stderr, code = db_ssh.execute_sudo(create_user_cmd, timeout=30)

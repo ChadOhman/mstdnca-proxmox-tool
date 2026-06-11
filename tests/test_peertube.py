@@ -548,18 +548,22 @@ class TestBuildPgCreateUserCmd:
         payload = "x$(id > /tmp/pwned)`whoami`;rm -rf /"
         cmd = _build_pg_create_user_cmd("peertube", payload)
 
-        # The raw injection string must never appear in the command.
+        # The raw injection string must never appear in the command, nor any
+        # shell-active fragment of it (base64 alphabet cannot contain these).
         assert payload not in cmd
         assert "$(id" not in cmd
         assert "`whoami`" not in cmd
         assert "rm -rf" not in cmd
+        assert "WITH PASSWORD" not in cmd  # SQL is base64'd, not in plaintext
 
-        # The password is transported as base64 and decoded on the remote into
-        # a psql variable that is SQL-quoted by psql itself.
-        pw_b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
-        assert pw_b64 in cmd
+        # The full CREATE USER statement is SQL-escaped, base64-encoded, and
+        # piped to psql on stdin via the `su - postgres` idiom.
+        expected_sql = f"CREATE USER peertube WITH PASSWORD '{payload}';"
+        sql_b64 = base64.b64encode(expected_sql.encode("utf-8")).decode("ascii")
+        assert sql_b64 in cmd
         assert "base64 -d" in cmd
-        assert "WITH PASSWORD :'pw'" in cmd
+        assert "su - postgres -c 'psql" in cmd
+        assert "sudo -u postgres" not in cmd  # use the module idiom
 
     def test_single_quote_password_does_not_break_sql(self):
         import base64
@@ -571,7 +575,9 @@ class TestBuildPgCreateUserCmd:
 
         assert payload not in cmd
         assert "DROP ROLE" not in cmd
-        assert base64.b64encode(payload.encode()).decode("ascii") in cmd
+        # Single quotes are SQL-escaped (doubled) inside the base64'd statement.
+        escaped_sql = f"CREATE USER peertube WITH PASSWORD '{payload.replace(chr(39), chr(39) * 2)}';"
+        assert base64.b64encode(escaped_sql.encode()).decode("ascii") in cmd
 
     def test_empty_password_uses_createuser(self):
         from apps.peertube import _build_pg_create_user_cmd
@@ -579,3 +585,12 @@ class TestBuildPgCreateUserCmd:
         cmd = _build_pg_create_user_cmd("peertube", "")
         assert "createuser peertube" in cmd
         assert "PASSWORD" not in cmd
+
+    def test_exists_check_uses_su_postgres_idiom(self):
+        from apps.peertube import _build_pg_create_user_cmd
+
+        cmd = _build_pg_create_user_cmd("peertube", "secret")
+        # Both the existence check and creation use `su - postgres`, matching
+        # the rest of apps/peertube.py and apps/mastodon.py.
+        assert "su - postgres -c" in cmd
+        assert "sudo -u postgres" not in cmd
