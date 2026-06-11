@@ -141,21 +141,26 @@ def _run_update_background(app, guest_id, dist_upgrade=False):
                                 guest.reboot_required = reboot_needed
                                 job.reboot_required = reboot_needed
                                 now = datetime.now(timezone.utc)
-                                for pkg in guest.pending_updates():
+                                # Count applied packages from the pending list BEFORE
+                                # commit: applied_at is a naive column, so a post-commit
+                                # `applied_at == now` (tz-aware) match always fails and
+                                # would report "0 update(s) applied".
+                                from core.notifier import (
+                                    send_updates_applied_notification,
+                                    summarize_applied_packages,
+                                )
+                                applied_pkgs = list(guest.pending_updates())
+                                applied_count, security_count = summarize_applied_packages(applied_pkgs)
+                                for pkg in applied_pkgs:
                                     pkg.status = "applied"
                                     pkg.applied_at = now
                                 guest.status = "up-to-date"
                                 db.session.commit()
                                 try:
-                                    from core.notifier import send_updates_applied_notification
-                                    applied_pkgs = [
-                                        p for p in guest.updates if p.status == "applied" and p.applied_at == now
-                                    ]
-                                    security_count = len([p for p in applied_pkgs if p.severity == "critical"])
                                     send_updates_applied_notification([{
                                         "name": guest.name,
                                         "type": guest.guest_type.upper(),
-                                        "applied": len(applied_pkgs),
+                                        "applied": applied_count,
                                         "security": security_count,
                                     }])
                                 except Exception:
@@ -200,21 +205,25 @@ def _run_update_background(app, guest_id, dist_upgrade=False):
                             check_reboot_required(guest)
                             job.reboot_required = guest.reboot_required
                             now = datetime.now(timezone.utc)
-                            for pkg in guest.pending_updates():
+                            # Count applied packages before commit (applied_at is a
+                            # naive column; a post-commit tz-aware equality match
+                            # always fails -> "0 update(s) applied").
+                            from core.notifier import (
+                                send_updates_applied_notification,
+                                summarize_applied_packages,
+                            )
+                            applied_pkgs = list(guest.pending_updates())
+                            applied_count, security_count = summarize_applied_packages(applied_pkgs)
+                            for pkg in applied_pkgs:
                                 pkg.status = "applied"
                                 pkg.applied_at = now
                             guest.status = "up-to-date"
                             db.session.commit()
                             try:
-                                from core.notifier import send_updates_applied_notification
-                                applied_pkgs = [
-                                    p for p in guest.updates if p.status == "applied" and p.applied_at == now
-                                ]
-                                security_count = len([p for p in applied_pkgs if p.severity == "critical"])
                                 send_updates_applied_notification([{
                                     "name": guest.name,
                                     "type": guest.guest_type.upper(),
-                                    "applied": len(applied_pkgs),
+                                    "applied": applied_count,
                                     "security": security_count,
                                 }])
                             except Exception:

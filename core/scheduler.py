@@ -39,8 +39,6 @@ def _run_auto_updates(app):
         current_day = calendar.day_name[now.weekday()].lower()
         current_time = now.strftime("%H:%M")
 
-        from datetime import timezone as _tz
-        batch_start = datetime.now(_tz.utc)
         apply_results = []
 
         guests = Guest.query.filter_by(enabled=True, auto_update=True).all()
@@ -65,18 +63,19 @@ def _run_auto_updates(app):
             dist_upgrade = window.update_type == "dist-upgrade"
             logger.info(f"Auto-updating {guest.name} (window: {window.name})")
 
+            # Capture counts BEFORE apply_updates commits: applied_at is a naive
+            # column, so comparing a reloaded applied_at against a tz-aware
+            # timestamp afterwards is unreliable (offset-naive vs offset-aware).
+            from core.notifier import summarize_applied_packages
+            applied_count, security_count = summarize_applied_packages(guest.pending_updates())
+
             ok, output = apply_updates(guest, dist_upgrade=dist_upgrade)
             if ok:
                 logger.info(f"Auto-update successful for {guest.name}")
-                applied_pkgs = [
-                    u for u in guest.updates
-                    if u.status == "applied" and u.applied_at and u.applied_at >= batch_start
-                ]
-                security_count = len([p for p in applied_pkgs if p.severity == "critical"])
                 apply_results.append({
                     "name": guest.name,
                     "type": guest.guest_type.upper(),
-                    "applied": len(applied_pkgs),
+                    "applied": applied_count,
                     "security": security_count,
                 })
             else:
