@@ -486,6 +486,21 @@ def send_app_update_notification(current_version, new_version):
     return ok, msg
 
 
+def summarize_applied_packages(packages):
+    """Return (applied_count, security_count) for the given update packages.
+
+    Callers MUST pass the packages captured *before* the apply/commit. The
+    ``applied_at`` column is timezone-naive, so after ``db.session.commit()``
+    a reloaded ``applied_at`` (naive) compared against a tz-aware ``now`` never
+    matches — which silently produced "0 update(s) applied" notifications.
+    Counting the in-memory pending list up front avoids that entirely.
+    """
+    packages = list(packages)
+    applied = len(packages)
+    security = sum(1 for p in packages if p.severity == "critical")
+    return applied, security
+
+
 def send_updates_applied_notification(results):
     """Send notification about updates that were just applied.
 

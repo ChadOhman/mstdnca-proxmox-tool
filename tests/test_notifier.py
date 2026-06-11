@@ -39,6 +39,7 @@ from core.notifier import (
     send_updates_applied_notification,
     send_upgrade_result_notification,
     send_upgrade_started_notification,
+    summarize_applied_packages,
 )
 from models import Setting, db
 
@@ -2034,3 +2035,69 @@ class TestSendServiceRecoveryNotification:
                 send_service_recovery_notification("web01", "nginx")
 
         mock_open.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# summarize_applied_packages — regression for "0 update(s) applied"
+# ---------------------------------------------------------------------------
+
+class TestSummarizeAppliedPackages:
+    """applied_at is a naive DateTime column. The old code counted applied
+    packages *after* commit via `applied_at == now` (tz-aware), which never
+    matched the reloaded naive value and reported 0. summarize_applied_packages
+    counts the pending list captured *before* commit instead."""
+
+    def test_counts_match_pending_before_commit(self, app):
+        from datetime import datetime, timezone
+
+        from models import Guest, UpdatePackage
+
+        with app.app_context():
+            guest = Guest(name="_apply-count-guest", guest_type="ct", enabled=True)
+            db.session.add(guest)
+            db.session.commit()
+
+            for i in range(3):
+                db.session.add(UpdatePackage(
+                    guest_id=guest.id, package_name=f"pkg{i}",
+                    current_version="1", available_version="2",
+                    severity="critical" if i == 0 else "normal",
+                    status="pending",
+                ))
+            db.session.commit()
+
+            # Capture the summary the way the fixed code does: BEFORE mutation/commit.
+            pending = list(guest.pending_updates())
+            applied_count, security_count = summarize_applied_packages(pending)
+            assert applied_count == 3
+            assert security_count == 1
+
+            # Apply them exactly as production does, then commit.
+            now = datetime.now(timezone.utc)
+            for pkg in pending:
+                pkg.status = "applied"
+                pkg.applied_at = now
+            guest.status = "up-to-date"
+            db.session.commit()
+
+            # The OLD approach: recompute from reloaded rows by tz-aware equality.
+            # applied_at is naive after reload, so this match fails -> 0 (the bug).
+            buggy = [
+                p for p in guest.updates
+                if p.status == "applied" and p.applied_at == now
+            ]
+            assert len(buggy) == 0, (
+                "expected the naive-vs-aware equality to fail, proving the old "
+                "code under-counted; if this passes the column became tz-aware"
+            )
+
+            # The captured counts remain correct regardless.
+            assert applied_count == 3
+            assert security_count == 1
+
+            UpdatePackage.query.filter_by(guest_id=guest.id).delete()
+            Guest.query.filter_by(id=guest.id).delete()
+            db.session.commit()
+
+    def test_empty_list_returns_zeroes(self, app):
+        assert summarize_applied_packages([]) == (0, 0)
