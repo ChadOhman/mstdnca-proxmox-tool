@@ -10,6 +10,7 @@ import logging
 
 import requests as http_requests
 
+from core.url_safety import validate_webhook_url
 from models import PushWebhook
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,17 @@ def dispatch_push_alerts(guest, event_type, details=None):
             user_tag_ids = {t.id for t in user.allowed_tags}
             if not (user_tag_ids & guest_tag_ids):
                 continue
+
+        # Re-validate the stored URL right before dispatch: blocks any webhook
+        # persisted before this guard existed and mitigates DNS rebinding
+        # between registration and now (SSRF).
+        ok, reason = validate_webhook_url(wh.url)
+        if not ok:
+            logger.warning(
+                "Skipping push webhook %d for user %s: unsafe url (%s)",
+                wh.id, user.username, reason,
+            )
+            continue
 
         payload = {
             "event": event_type,
