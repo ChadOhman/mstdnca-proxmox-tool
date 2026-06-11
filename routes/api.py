@@ -302,6 +302,13 @@ def apply(guest_id):
         flash("You don't have permission to update this guest.", "error")
         return redirect(url_for("guests.index"))
 
+    # Applying updates requires the "Apply Updates" permission, consistent with
+    # every app-upgrade blueprint (mastodon/ghost/peertube/... gate on
+    # can_update in before_request). can_access_guest alone is read-only access.
+    if not current_user.can_update:
+        flash("You don't have permission to apply updates.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest_id))
+
     # Snapshot gating for non-admin users
     if not current_user.is_admin:
         from routes.guests import auto_snapshot_if_needed, guest_requires_snapshot
