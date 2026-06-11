@@ -6,6 +6,7 @@ vzdump backup of the app and DB guests, creates a pg_dump backup, then runs
 the built-in upgrade.sh script via SSH.
 """
 
+import base64
 import json
 import logging
 import re
@@ -63,6 +64,36 @@ storage:
   plugins: '{peertube_dir}/storage/plugins/'
   client_overrides: '{peertube_dir}/storage/client-overrides/'
 """
+
+
+# ---------------------------------------------------------------------------
+# Shell-safe PostgreSQL role creation
+# ---------------------------------------------------------------------------
+
+def _build_pg_create_user_cmd(user, db_password):
+    """Build the shell command that creates the PeerTube PostgreSQL role.
+
+    ``user`` is validated with ``_validate_shell_param`` by the caller, so it is
+    safe to interpolate.  ``db_password`` is fully attacker-controlled (set via
+    the Settings UI) and must never reach a shell- or SQL-interpreted context
+    unescaped.  We transport it as base64 (decoded on the remote into psql's
+    ``-v`` argument) and let psql perform SQL-literal quoting via ``:'pw'`` —
+    so neither shell metacharacters (``$()``, backticks, ``;``) nor SQL quotes
+    can break out.  Mirrors the base64 pattern used in ``apps/jitsi.py``.
+    """
+    exists_check = (
+        f"sudo -u postgres psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='{user}'\""  # noqa: S608
+        f" | grep -q 1 && echo 'User exists'"
+    )
+    if db_password:
+        pw_b64 = base64.b64encode(db_password.encode("utf-8")).decode("ascii")
+        create = (
+            f"sudo -u postgres psql -v pw=\"$(printf '%s' '{pw_b64}' | base64 -d)\""
+            f" -c \"CREATE USER {user} WITH PASSWORD :'pw'\""
+        )
+    else:
+        create = f"sudo -u postgres createuser {user}"
+    return f"{exists_check} || {create}"
 
 
 # ---------------------------------------------------------------------------
@@ -455,20 +486,10 @@ def run_peertube_install(log_callback=None):
 
         try:
             with SSHClient.from_credential(db_guest.ip_address, db_credential) as db_ssh:
-                # Create PostgreSQL user
-                if db_password:
-                    safe_pw = db_password.replace("'", "''")  # SQL single-quote escape
-                    create_user_cmd = (
-                        f"su - postgres -c \"psql -tAc \\\"SELECT 1 FROM pg_roles WHERE rolname='{user}'\\\"\" "  # noqa: S608
-                        f"| grep -q 1 && echo 'User exists' "
-                        f"|| su - postgres -c \"psql -c \\\"CREATE USER {user} WITH PASSWORD '{safe_pw}'\\\"\""
-                    )
-                else:
-                    create_user_cmd = (
-                        f"su - postgres -c \"psql -tAc \\\"SELECT 1 FROM pg_roles WHERE rolname='{user}'\\\"\" "  # noqa: S608
-                        f"| grep -q 1 && echo 'User exists' "
-                        f"|| su - postgres -c \"createuser {user}\""
-                    )
+                # Create PostgreSQL user. The password is base64-transported and
+                # SQL-quoted by psql (:'pw') so it cannot break out of the shell
+                # or the SQL string -- see _build_pg_create_user_cmd.
+                create_user_cmd = _build_pg_create_user_cmd(user, db_password)
                 log(f"Creating PostgreSQL user '{user}'...")
                 stdout, stderr, code = db_ssh.execute_sudo(create_user_cmd, timeout=30)
                 _log_cmd_output(log, stdout, stderr, code, max_chars=500)
@@ -648,11 +669,15 @@ def run_peertube_install(log_callback=None):
             if not effective_db_host:
                 effective_db_host = "localhost"
 
+            # The password sits inside a single-quoted YAML scalar; escape any
+            # single quotes (YAML doubles them) so a crafted password cannot
+            # break out of the scalar and inject arbitrary YAML keys.
+            yaml_password = (db_password or "peertube").replace("'", "''")
             yaml_content = _PEERTUBE_PRODUCTION_YAML.format(
                 hostname=hostname,
                 db_host=effective_db_host,
                 db_user=user,
-                db_password=db_password or "peertube",
+                db_password=yaml_password,
                 peertube_dir=peertube_dir,
             )
 

@@ -534,3 +534,48 @@ class TestCheckPeerTubeReleaseUnit:
                 assert update is True
                 assert version == "6.3.1"
                 assert "v6.3.1" in url
+
+
+class TestBuildPgCreateUserCmd:
+    """The PostgreSQL role-creation command must be immune to shell/SQL
+    injection via the attacker-controlled DB password (issue #75)."""
+
+    def test_malicious_password_is_not_shell_interpolated(self):
+        import base64
+
+        from apps.peertube import _build_pg_create_user_cmd
+
+        payload = "x$(id > /tmp/pwned)`whoami`;rm -rf /"
+        cmd = _build_pg_create_user_cmd("peertube", payload)
+
+        # The raw injection string must never appear in the command.
+        assert payload not in cmd
+        assert "$(id" not in cmd
+        assert "`whoami`" not in cmd
+        assert "rm -rf" not in cmd
+
+        # The password is transported as base64 and decoded on the remote into
+        # a psql variable that is SQL-quoted by psql itself.
+        pw_b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        assert pw_b64 in cmd
+        assert "base64 -d" in cmd
+        assert "WITH PASSWORD :'pw'" in cmd
+
+    def test_single_quote_password_does_not_break_sql(self):
+        import base64
+
+        from apps.peertube import _build_pg_create_user_cmd
+
+        payload = "pa'ss'; DROP ROLE postgres;--"
+        cmd = _build_pg_create_user_cmd("peertube", payload)
+
+        assert payload not in cmd
+        assert "DROP ROLE" not in cmd
+        assert base64.b64encode(payload.encode()).decode("ascii") in cmd
+
+    def test_empty_password_uses_createuser(self):
+        from apps.peertube import _build_pg_create_user_cmd
+
+        cmd = _build_pg_create_user_cmd("peertube", "")
+        assert "createuser peertube" in cmd
+        assert "PASSWORD" not in cmd
