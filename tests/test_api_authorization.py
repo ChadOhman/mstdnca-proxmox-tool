@@ -1,5 +1,5 @@
 """Authorization tests for API status/cancel endpoints."""
-from models import Guest, Role, User, db
+from models import Guest, Role, Tag, User, db
 from routes.api import ProxmoxJob, UpdateJob, _proxmox_jobs, _update_jobs
 
 
@@ -179,3 +179,47 @@ class TestApiAuthorization:
         with app.app_context():
             Guest.query.filter_by(id=guest_id).delete()
             db.session.commit()
+
+
+class TestApplyUpdatePermission:
+    """POST /api/apply must require the can_update permission, not just
+    tag-based read access to the guest (issue #76)."""
+
+    def test_apply_denied_for_tagged_viewer_without_can_update(self, app, client):
+        with app.app_context():
+            viewer_role = Role.query.filter_by(name="viewer").first()
+            assert viewer_role.can_update is False  # guard: viewer is read-only
+            user = User(username="api_apply_viewer", display_name="Apply Viewer",
+                        role_id=viewer_role.id)
+            user.set_password("ViewerPass123!")
+            tag = Tag(name="_apply-authz-tag", color="#123456")
+            guest = Guest(name="_api-apply-authz", guest_type="ct", enabled=True)
+            guest.tags.append(tag)
+            user.allowed_tags.append(tag)
+            db.session.add_all([user, tag, guest])
+            db.session.commit()
+            guest_id = guest.id
+            # Sanity: the viewer DOES have read access, so only can_update blocks them.
+            assert user.can_access_guest(guest) is True
+
+        _login(client, "api_apply_viewer", "ViewerPass123!")
+
+        resp = client.post(f"/api/apply/{guest_id}", data={"dist_upgrade": "0"})
+        # Redirected away (not allowed to start the update)...
+        assert resp.status_code == 302
+        # ...and crucially no background update job was created.
+        assert guest_id not in _update_jobs
+
+        with app.app_context():
+            guest = Guest.query.get(guest_id)
+            for t in list(guest.tags):
+                guest.tags.remove(t)
+            u = User.query.filter_by(username="api_apply_viewer").first()
+            for t in list(u.allowed_tags):
+                u.allowed_tags.remove(t)
+            db.session.commit()
+            User.query.filter_by(username="api_apply_viewer").delete()
+            Guest.query.filter_by(id=guest_id).delete()
+            Tag.query.filter_by(name="_apply-authz-tag").delete()
+            db.session.commit()
+        _update_jobs.pop(guest_id, None)
