@@ -12,6 +12,14 @@
             </button>
         </form>
         {% endif %}
+        {% if hosts and current_user.can_manage_hosts %}
+        <form method="post" action="/hosts/updates/apply-all"
+              data-confirm="Apply OS updates (apt dist-upgrade) to ALL PVE hosts that have pending updates? Hosts are updated one at a time.">
+            <button type="submit" class="btn btn-outline-success">
+                <i class="bi bi-arrow-up-circle"></i> Update All Hosts
+            </button>
+        </form>
+        {% endif %}
         <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addHostModal">
             <i class="bi bi-plus-lg"></i> Add Host
         </button>

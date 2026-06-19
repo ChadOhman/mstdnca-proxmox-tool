@@ -14,6 +14,18 @@ from models import AuditLog, Credential, Guest, ProxmoxHost, Tag, db
 _apply_jobs = {}   # host_id -> {"log": [], "running": bool, "success": bool|None, "cancelled": bool}
 _apply_lock = _threading.Lock()
 
+# In-memory state for a single "update all hosts" run. One run at a time;
+# each host is applied sequentially by a single orchestrator thread that reuses
+# the per-host _run_apply worker (so the existing per-host /status keeps working).
+_bulk_apply = {
+    "running": False,
+    "started_at": None,
+    "total": 0,
+    "done": 0,
+    "items": [],   # list of {"host_id", "name", "state", "reason"}
+}
+_bulk_apply_lock = _threading.Lock()
+
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("hosts", __name__)
@@ -30,6 +42,7 @@ def _require_login():
         "hosts.index", "hosts.detail",
         "hosts.get_updates", "hosts.task_status", "hosts.task_log",
         "hosts.apply_progress", "hosts.apply_status",
+        "hosts.apply_all_progress", "hosts.apply_all_status",
     }
     discover_endpoints = {"hosts.discover", "hosts.discover_all"}
     if request.endpoint in read_only_endpoints:
@@ -726,6 +739,138 @@ def apply_cancel(host_id):
             job["cancelled"] = True
             return jsonify({"ok": True})
     return jsonify({"ok": False, "message": "No running job found."})
+
+
+# ---------------------------------------------------------------------------
+# Bulk update — apply pending updates to every PVE host, one at a time
+# ---------------------------------------------------------------------------
+
+def _run_bulk_apply(app_ctx):
+    """Orchestrator thread: apply updates to each host sequentially.
+
+    Reuses the per-host _run_apply worker so the existing per-host
+    /updates/apply/status endpoint keeps reflecting live output for the host
+    currently being updated.
+    """
+    with app_ctx.app_context():
+        with _bulk_apply_lock:
+            items = list(_bulk_apply["items"])
+
+        for item in items:
+            host_id = item["host_id"]
+            with _bulk_apply_lock:
+                item["state"] = "running"
+
+            host = ProxmoxHost.query.get(host_id)
+            if not host or not host.ssh_credential:
+                with _bulk_apply_lock:
+                    item["state"] = "skipped"
+                    item["reason"] = "No SSH credential configured"
+                    _bulk_apply["done"] += 1
+                continue
+
+            with _apply_lock:
+                _apply_jobs[host_id] = {"log": [], "running": True, "success": None, "cancelled": False}
+
+            try:
+                _run_apply(host_id, host.hostname, host.ssh_credential, app_ctx)
+                with _apply_lock:
+                    success = bool(_apply_jobs.get(host_id, {}).get("success"))
+            except Exception as e:
+                logger.error("Bulk host apply error for host %s: %s", host_id, e)
+                success = False
+                with _apply_lock:
+                    job = _apply_jobs.get(host_id)
+                    if job:
+                        job["running"] = False
+                        job["success"] = False
+
+            with _bulk_apply_lock:
+                item["state"] = "success" if success else "failed"
+                _bulk_apply["done"] += 1
+
+        with _bulk_apply_lock:
+            _bulk_apply["running"] = False
+
+
+@bp.route("/updates/apply-all", methods=["POST"])
+def apply_all_updates():
+    """Start a sequential bulk update across all PVE hosts with pending updates."""
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from models import HostUpdatePackage
+
+    with _bulk_apply_lock:
+        if _bulk_apply.get("running"):
+            flash("A bulk host update is already running.", "warning")
+            return redirect(url_for("hosts.apply_all_progress"))
+
+    # Only PVE hosts (PBS excluded by design) that have pending package updates.
+    hosts = (ProxmoxHost.query
+             .filter(ProxmoxHost.host_update_packages.any(HostUpdatePackage.status == "pending"))
+             .order_by(ProxmoxHost.name)
+             .all())
+    targets = [h for h in hosts if not h.is_pbs]
+
+    if not targets:
+        flash("No PVE hosts have pending updates.", "info")
+        return redirect(url_for("hosts.index"))
+
+    items = [{"host_id": h.id, "name": h.name, "state": "pending", "reason": None} for h in targets]
+    with _bulk_apply_lock:
+        _bulk_apply["running"] = True
+        _bulk_apply["started_at"] = _dt.now(_tz.utc).isoformat()
+        _bulk_apply["total"] = len(items)
+        _bulk_apply["done"] = 0
+        _bulk_apply["items"] = items
+
+    from flask import current_app
+    t = _threading.Thread(
+        target=_run_bulk_apply,
+        args=(current_app._get_current_object(),),
+        daemon=True,
+    )
+    t.start()
+
+    log_action("host_update_all", "system", resource_name="all hosts",
+               details={"targets": len(items)})
+    db.session.commit()
+    flash(f"Started updates on {len(items)} host(s).", "info")
+    return redirect(url_for("hosts.apply_all_progress"))
+
+
+@bp.route("/updates/apply-all/progress")
+def apply_all_progress():
+    """Render the aggregate bulk-update progress page for hosts."""
+    return render_template(
+        "bulk_update_progress.html",
+        page_title="Updating All Hosts",
+        heading="Updating All Hosts",
+        status_url=url_for("hosts.apply_all_status"),
+        back_url=url_for("hosts.index"),
+        back_label="Back to Hosts",
+    )
+
+
+@bp.route("/updates/apply-all/status")
+def apply_all_status():
+    """JSON: aggregate state of the bulk host update, with live log per host."""
+    with _bulk_apply_lock:
+        running = _bulk_apply.get("running", False)
+        total = _bulk_apply.get("total", 0)
+        done = _bulk_apply.get("done", 0)
+        snapshot = [(i["host_id"], i["name"], i["state"], i.get("reason")) for i in _bulk_apply["items"]]
+
+    items_out = []
+    for host_id, name, state, reason in snapshot:
+        log = ""
+        if state in ("running", "success", "failed"):
+            with _apply_lock:
+                log = "".join(_apply_jobs.get(host_id, {}).get("log", []))
+        items_out.append({"id": host_id, "name": name, "state": state, "reason": reason, "log": log})
+
+    return jsonify({"running": running, "total": total, "done": done, "items": items_out})
 
 
 @bp.route("/<int:host_id>/ssh-credential", methods=["POST"])
