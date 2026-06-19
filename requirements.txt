@@ -13,7 +13,7 @@ paramiko==5.0.0
 # 46.0.7). paramiko 5.0.0 and PyJWT[crypto] 2.13.0 both accept cryptography 48.x.
 cryptography==48.0.1
 APScheduler==3.11.2
-Werkzeug==3.1.6
+Werkzeug==3.1.8
 PyJWT[crypto]==2.13.0
 gunicorn==26.0.0
 geoip2==5.2.0
