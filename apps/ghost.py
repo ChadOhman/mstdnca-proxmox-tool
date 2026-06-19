@@ -78,6 +78,128 @@ def _get_ghost_config():
 
 
 # ---------------------------------------------------------------------------
+# Permission remediation
+# ---------------------------------------------------------------------------
+
+def _fix_ghost_permissions(ssh, ghost_dir, user, log):
+    """Re-assert Ghost file ownership and modes over an SSH connection.
+
+    Files outside ``versions/`` are normalised to 664, directories to 775, and
+    the whole tree is chowned to *user*.  The ``versions/`` trees are excluded
+    from chmod so executable bits under ``node_modules/.bin`` survive.
+
+    Run this both *before* ``ghost update`` (ghost-cli's check-permissions step
+    rejects files with wrong modes) and *after* it: the update unpacks a new
+    ``versions/<v>`` tree and runs migrations, which can leave ``content/``
+    files owned by root and make Ghost hit ``EACCES`` at runtime.
+
+    Returns True on success.  On a non-zero exit it logs a warning and returns
+    False — the failure is non-fatal, so the caller decides whether to proceed.
+    """
+    perms_cmds = (
+        f"find {ghost_dir} ! -path '*/versions/*' -type f -exec chmod 664 {{}} + "
+        f"&& find {ghost_dir} ! -path '*/versions/*' -type d -exec chmod 775 {{}} + "
+        f"&& chown -R {user}: {ghost_dir}"
+    )
+    stdout, stderr, code = ssh.execute_sudo(perms_cmds, timeout=120)
+    if code == 0:
+        log("File permissions fixed")
+        return True
+    log(f"WARNING: Permission fix returned exit {code}: "
+        f"{(stderr or stdout or '').strip()[:200]}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Database privilege remediation (FM4)
+# ---------------------------------------------------------------------------
+
+# Ghost's DB name and user are read from config at runtime, never assumed.  They
+# are interpolated into SQL only after matching this pattern, so a plain
+# (un-backticked) identifier is safe to use directly — no shell metacharacters
+# and no SQL-quote-breaking characters are possible.
+_DB_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _resolve_ghost_db(ssh, ghost_dir):
+    """Read (database, user) from ``config.production.json`` on the guest.
+
+    Parsed with python3 rather than Node to avoid PATH issues (same approach as
+    detect_ghost_version).  Returns (db, user), or (None, None) if the config
+    cannot be read or parsed.
+    """
+    cfg = f"{ghost_dir}/config.production.json"
+    py_cmd = (
+        f"python3 -c \"import json; "
+        f"c = json.load(open('{cfg}'))['database']['connection']; "
+        f"print(json.dumps([c.get('database', ''), c.get('user', '')]))\" 2>/dev/null"
+    )
+    stdout, _, code = ssh.execute_sudo(py_cmd, timeout=10)
+    if code != 0 or not stdout.strip():
+        return None, None
+    try:
+        db, user = json.loads(stdout.strip())
+    except (ValueError, TypeError):
+        return None, None
+    return (db or None), (user or None)
+
+
+def _ensure_ghost_db_privileges(ssh, ghost_dir, log):
+    """Make sure the Ghost MySQL user can run migration DDL before an update.
+
+    Ghost's app user is sometimes created with a CRUD-only grant; a version bump
+    can add a migration needing DDL (CREATE VIEW, ALTER, index creation, ...)
+    the user lacks, so the upgrade fails only on update with errno 1142 (FM4).
+    This asserts, *before* 'ghost update', that 'user'@'localhost' already holds
+    ALL PRIVILEGES on its own database — the grant Ghost's own docs recommend,
+    scoped to the single DB rather than ``*.*``.
+
+    Check-first, so it is idempotent and never auto-creates a missing account (a
+    bare GRANT would, with no password).  Best-effort: any problem logs a
+    warning and returns False without aborting the upgrade.  Runs as root over
+    SSH, which authenticates to MariaDB via the unix socket.
+    """
+    db, user = _resolve_ghost_db(ssh, ghost_dir)
+    if not db or not user:
+        log("WARNING: could not resolve database/user from config.production.json "
+            "— skipping DB privilege check")
+        return False
+    if not _DB_IDENT_RE.match(db) or not _DB_IDENT_RE.match(user):
+        log(f"WARNING: resolved DB name/user has unexpected characters "
+            f"(db={db!r}, user={user!r}) — skipping DB privilege check")
+        return False
+
+    show_sql = f"SHOW GRANTS FOR '{user}'@'localhost'"  # noqa: S608
+    grants_out, grants_err, grants_code = ssh.execute_sudo(
+        f'mysql -u root -e "{show_sql}"', timeout=15
+    )
+    if grants_code != 0:
+        log(f"WARNING: could not read MySQL grants for '{user}'@'localhost' "
+            f"(account may not exist) — skipping DB privilege check: "
+            f"{(grants_err or '').strip()[:200]}")
+        return False
+
+    has_all = any(
+        ("ALL PRIVILEGES ON *.*" in ln) or (f"ALL PRIVILEGES ON `{db}`.*" in ln)
+        for ln in grants_out.splitlines()
+    )
+    if has_all:
+        log(f"MySQL user '{user}' already holds ALL PRIVILEGES on `{db}` — no change needed")
+        return True
+
+    log(f"Granting ALL PRIVILEGES on `{db}` to '{user}'@'localhost' "
+        f"(prevents migration DDL failures)...")
+    grant_sql = f"GRANT ALL PRIVILEGES ON {db}.* TO '{user}'@'localhost'; FLUSH PRIVILEGES;"  # noqa: S608
+    g_out, g_err, g_code = ssh.execute_sudo(f'mysql -u root -e "{grant_sql}"', timeout=15)
+    if g_code != 0:
+        log(f"WARNING: GRANT failed (exit {g_code}) — proceeding anyway: "
+            f"{(g_err or g_out or '').strip()[:200]}")
+        return False
+    log(f"MySQL privileges granted for '{user}'@'localhost' on `{db}`")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Version detection
 # ---------------------------------------------------------------------------
 
@@ -540,21 +662,18 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
 
             # Fix file/directory permissions before update.  ghost-cli's
             # check-permissions step rejects files with wrong modes (e.g. yarn
-            # cache files with executable bits).  Run the same remediation that
-            # ghost-cli suggests on failure — but proactively, so the update
-            # doesn't abort.
+            # cache files with executable bits), so do it proactively to keep
+            # the update from aborting.
             log("Fixing file permissions...")
-            perms_cmds = (
-                f"find {ghost_dir} ! -path '*/versions/*' -type f -exec chmod 664 {{}} + "
-                f"&& find {ghost_dir} ! -path '*/versions/*' -type d -exec chmod 775 {{}} + "
-                f"&& chown -R {user}: {ghost_dir}"
-            )
-            stdout, stderr, code = ssh.execute_sudo(perms_cmds, timeout=120)
-            if code == 0:
-                log("File permissions fixed")
-            else:
-                log(f"WARNING: Permission fix returned exit {code}: "
-                    f"{(stderr or stdout or '').strip()[:200]}")
+            _fix_ghost_permissions(ssh, ghost_dir, user, log)
+            log("")
+
+            # Ensure the Ghost DB user can run migration DDL *before* the update
+            # touches the schema.  A CRUD-only grant makes version-bump
+            # migrations fail with errno 1142 (FM4); this asserts the
+            # ALL-PRIVILEGES grant (scoped to the Ghost DB) up front.  Non-fatal.
+            log("Checking MySQL privileges for the Ghost database user...")
+            _ensure_ghost_db_privileges(ssh, ghost_dir, log)
             log("")
 
             # Run ghost update as the Ghost system user.  su - creates a full login
@@ -570,6 +689,24 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
                 return False, "\n".join(log_lines)
 
             log("ghost update completed successfully")
+            log("")
+
+            # --- Step 2b: Re-assert permissions after the update ---
+            # 'ghost update' unpacks a new versions/<v> tree and runs
+            # migrations, which can leave content/ files owned by root — Ghost
+            # then hits EACCES on the next content read/write.  Re-run the same
+            # remediation, then restart so the service comes up against the
+            # corrected tree ('ghost update' already started it, possibly
+            # against root-owned content).
+            log("=== Step 2b: Re-asserting file permissions ===")
+            _fix_ghost_permissions(ssh, ghost_dir, user, log)
+            log(f"Restarting {service_name} to apply permission fix...")
+            r_out, r_err, r_code = ssh.execute_sudo(
+                f"systemctl restart {service_name} 2>&1", timeout=30
+            )
+            if r_code != 0:
+                log(f"WARNING: restart returned exit {r_code}: "
+                    f"{(r_err or r_out or '').strip()[:200]}")
             log("")
 
             # --- Step 3: Verify service ---
