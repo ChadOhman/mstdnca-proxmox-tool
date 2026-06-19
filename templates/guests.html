@@ -39,6 +39,14 @@
                 <i class="bi bi-arrow-clockwise"></i> Scan All
             </button>
         </form>
+        {% if current_user.can_update %}
+        <form method="post" action="/api/apply-all" class="d-inline"
+              data-confirm="Apply OS updates to ALL guests that have updates available? Guests are updated one at a time.">
+            <button type="submit" class="btn btn-outline-warning">
+                <i class="bi bi-cloud-download"></i> Update All Guests
+            </button>
+        </form>
+        {% endif %}
         <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addGuestModal">
             <i class="bi bi-plus-lg"></i> Add Guest
         </button>

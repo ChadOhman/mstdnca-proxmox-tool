@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+{% block title %}{{ page_title }}{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-lg-10">
+        <div class="card bg-dark">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">
+                    <i class="bi bi-arrow-repeat" id="spinIcon"></i>
+                    {{ heading }}
+                </h5>
+                <span id="statusBadge" class="badge bg-info">Starting&hellip;</span>
+            </div>
+            <div class="card-body">
+                <div class="d-flex justify-content-between align-items-center mb-1">
+                    <small class="text-muted" id="progressText">Preparing&hellip;</small>
+                </div>
+                <div class="progress mb-3" role="progressbar" aria-label="Overall progress"
+                     aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                    <div id="progressBar" class="progress-bar progress-bar-striped progress-bar-animated"
+                         style="width: 0%;"></div>
+                </div>
+                <div id="itemList" class="vstack gap-2"></div>
+            </div>
+            <div class="card-footer d-flex justify-content-end">
+                <a href="{{ back_url }}" id="backBtn" class="btn btn-secondary btn-sm disabled" aria-disabled="true">
+                    <i class="bi bi-arrow-left"></i> {{ back_label }}
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+    const statusUrl = {{ status_url | tojson }};
+    const badge = document.getElementById('statusBadge');
+    const progressBar = document.getElementById('progressBar');
+    const progressText = document.getElementById('progressText');
+    const itemList = document.getElementById('itemList');
+    const backBtn = document.getElementById('backBtn');
+    const spinIcon = document.getElementById('spinIcon');
+
+    const pollInterval = 1500;
+    let complete = false;
+
+    const STATE_BADGE = {
+        pending: { cls: 'bg-secondary', label: 'Pending' },
+        running: { cls: 'bg-info', label: 'Updating…' },
+        success: { cls: 'bg-success', label: 'Done' },
+        failed:  { cls: 'bg-danger', label: 'Failed' },
+        skipped: { cls: 'bg-warning text-dark', label: 'Skipped' },
+    };
+
+    function escapeHtml(s) {
+        return (s || '').replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    }
+
+    function renderItems(items) {
+        // Build once, then update in place to preserve <details> open state and scroll.
+        items.forEach(item => {
+            const id = 'item-' + item.id;
+            let row = document.getElementById(id);
+            const meta = STATE_BADGE[item.state] || STATE_BADGE.pending;
+            const hasLog = item.log && item.log.length;
+
+            if (!row) {
+                row = document.createElement('div');
+                row.id = id;
+                row.className = 'border border-secondary rounded';
+                row.innerHTML =
+                    '<details>' +
+                    '<summary class="d-flex justify-content-between align-items-center px-3 py-2" style="cursor:pointer;list-style:none;">' +
+                    '<span class="fw-semibold name"></span>' +
+                    '<span class="d-flex align-items-center gap-2">' +
+                    '<span class="reason text-muted small"></span>' +
+                    '<span class="badge state-badge"></span>' +
+                    '</span></summary>' +
+                    '<pre class="log mb-0" style="background:#1a1a2e;color:#e0e0e0;padding:0.75rem;margin:0;max-height:300px;overflow-y:auto;font-size:0.8rem;white-space:pre-wrap;word-wrap:break-word;border-top:1px solid #444;"></pre>' +
+                    '</details>';
+                itemList.appendChild(row);
+            }
+
+            row.querySelector('.name').textContent = item.name;
+            const badgeEl = row.querySelector('.state-badge');
+            badgeEl.className = 'badge state-badge ' + meta.cls;
+            badgeEl.textContent = meta.label;
+
+            const reasonEl = row.querySelector('.reason');
+            reasonEl.textContent = item.reason || '';
+
+            const logEl = row.querySelector('.log');
+            if (hasLog && logEl.textContent !== item.log) {
+                const wasAtBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 50;
+                logEl.textContent = item.log;
+                if (wasAtBottom) logEl.scrollTop = logEl.scrollHeight;
+            } else if (!hasLog && item.state === 'skipped') {
+                logEl.textContent = item.reason || 'Skipped.';
+            }
+        });
+    }
+
+    function finish(items) {
+        complete = true;
+        spinIcon.classList.remove('spin-animation');
+        progressBar.classList.remove('progress-bar-animated', 'progress-bar-striped');
+        backBtn.classList.remove('disabled');
+        backBtn.removeAttribute('aria-disabled');
+
+        const failed = items.filter(i => i.state === 'failed').length;
+        const skipped = items.filter(i => i.state === 'skipped').length;
+        const ok = items.filter(i => i.state === 'success').length;
+        if (failed > 0) {
+            badge.className = 'badge bg-danger';
+            badge.textContent = 'Completed with errors';
+        } else {
+            badge.className = 'badge bg-success';
+            badge.textContent = 'Complete';
+        }
+        progressText.textContent = `${ok} succeeded, ${failed} failed, ${skipped} skipped of ${items.length}.`;
+    }
+
+    async function poll() {
+        if (complete) return;
+        try {
+            const resp = await fetch(statusUrl, { cache: 'no-store' });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const data = await resp.json();
+            const items = data.items || [];
+
+            renderItems(items);
+
+            const total = data.total || items.length;
+            const done = data.done || 0;
+            const pct = total ? Math.round(done / total * 100) : 0;
+            progressBar.style.width = pct + '%';
+            progressBar.parentElement.setAttribute('aria-valuenow', pct);
+
+            if (data.running) {
+                progressText.textContent = `${done} of ${total} processed…`;
+                badge.className = 'badge bg-info';
+                badge.textContent = 'Updating…';
+            } else {
+                finish(items);
+                return;
+            }
+        } catch (e) {
+            // Transient error — keep polling.
+        }
+        setTimeout(poll, pollInterval);
+    }
+
+    const style = document.createElement('style');
+    style.textContent = '.spin-animation { animation: spin 1s linear infinite; } @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } } #itemList summary::-webkit-details-marker { display:none; }';
+    document.head.appendChild(style);
+    spinIcon.classList.add('spin-animation');
+
+    setTimeout(poll, 400);
+})();
+</script>
+{% endblock %}

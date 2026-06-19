@@ -31,6 +31,18 @@ bp = Blueprint("api", __name__)
 _update_jobs = {}
 _jobs_lock = threading.Lock()
 
+# In-memory state for a single "update all guests" run. One run at a time;
+# each guest is updated sequentially by a single orchestrator thread that
+# reuses the per-guest _run_update_background worker.
+_bulk_update = {
+    "running": False,
+    "started_at": None,
+    "total": 0,
+    "done": 0,
+    "items": [],   # list of {"guest_id", "name", "state", "reason"}
+}
+_bulk_update_lock = threading.Lock()
+
 
 class UpdateJob:
     """Tracks a background guest update."""
@@ -404,6 +416,188 @@ def update_cancel(guest_id):
         return jsonify({"ok": False, "error": "No active job"})
     job.cancel_requested = True
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Bulk update — apply pending updates to every eligible guest, one at a time
+# ---------------------------------------------------------------------------
+
+def _run_bulk_update(app, guest_ids, dist_upgrade, enforce_snapshot):
+    """Orchestrator thread: update each guest sequentially.
+
+    Reuses the per-guest _run_update_background worker so the existing per-guest
+    /apply/<id>/status endpoint keeps reflecting live output for the guest
+    currently being updated. One guest failing does not abort the batch.
+    """
+    with app.app_context():
+        from routes.guests import auto_snapshot_if_needed, guest_requires_snapshot
+
+        for guest_id in guest_ids:
+            with _bulk_update_lock:
+                item = next((i for i in _bulk_update["items"] if i["guest_id"] == guest_id), None)
+                if item:
+                    item["state"] = "running"
+
+            guest = Guest.query.get(guest_id)
+            if not guest:
+                with _bulk_update_lock:
+                    if item:
+                        item["state"] = "skipped"
+                        item["reason"] = "Guest not found"
+                    _bulk_update["done"] += 1
+                continue
+
+            # Snapshot gating for non-admins, mirroring the single-guest apply().
+            if enforce_snapshot and guest_requires_snapshot(guest):
+                try:
+                    ok, msg = auto_snapshot_if_needed(guest)
+                except Exception as e:
+                    ok, msg = False, str(e)
+                if not ok:
+                    with _bulk_update_lock:
+                        if item:
+                            item["state"] = "skipped"
+                            item["reason"] = f"Snapshot required but failed: {msg}"
+                        _bulk_update["done"] += 1
+                    continue
+
+            # Dedupe against any in-flight single-guest job.
+            with _jobs_lock:
+                existing = _update_jobs.get(guest_id)
+                if existing and existing.running:
+                    with _bulk_update_lock:
+                        if item:
+                            item["state"] = "skipped"
+                            item["reason"] = "An update is already running for this guest"
+                        _bulk_update["done"] += 1
+                    continue
+                _update_jobs[guest_id] = UpdateJob(guest_id, guest.name)
+
+            try:
+                _run_update_background(app, guest_id, dist_upgrade)
+                job = _update_jobs.get(guest_id)
+                success = bool(job.success) if job else False
+            except Exception as e:
+                logger.error("Bulk guest update error for guest %s: %s", guest_id, e)
+                success = False
+                job = _update_jobs.get(guest_id)
+                if job and job.running:
+                    job.finish(False)
+
+            with _bulk_update_lock:
+                if item:
+                    item["state"] = "success" if success else "failed"
+                _bulk_update["done"] += 1
+
+        with _bulk_update_lock:
+            _bulk_update["running"] = False
+
+
+@bp.route("/apply-all", methods=["POST"])
+@login_required
+def apply_all():
+    """Start a sequential bulk update across all guests with updates available."""
+    if not current_user.can_update:
+        flash("You don't have permission to apply updates.", "error")
+        return redirect(url_for("dashboard.index"))
+
+    with _bulk_update_lock:
+        if _bulk_update.get("running"):
+            flash("A bulk guest update is already running.", "warning")
+            return redirect(url_for("api.apply_all_progress"))
+
+    dist_upgrade = request.form.get("dist_upgrade") == "1"
+
+    # Only enabled, running guests flagged with updates available.
+    candidates = (Guest.query
+                  .filter_by(enabled=True, status="updates-available", power_state="running")
+                  .order_by(Guest.name)
+                  .all())
+
+    targets = []
+    for guest in candidates:
+        # Tag scoping: non-admins only act on guests they can access.
+        if not current_user.is_admin and not current_user.can_access_guest(guest):
+            continue
+        if not guest.pending_updates():
+            continue
+        targets.append(guest)
+
+    if not targets:
+        flash("No guests with pending updates are available to update.", "info")
+        return redirect(url_for("guests.index"))
+
+    # Per-guest audit rows (parity with single apply) plus one bulk summary row.
+    for guest in targets:
+        log_action("guest_update", "guest", resource_id=guest.id, resource_name=guest.name,
+                   details={"dist_upgrade": dist_upgrade, "bulk": True})
+    log_action("guest_update_all", "system", resource_name="all guests",
+               details={"targets": len(targets), "dist_upgrade": dist_upgrade})
+    db.session.commit()
+
+    items = [{"guest_id": g.id, "name": g.name, "state": "pending", "reason": None} for g in targets]
+    guest_ids = [g.id for g in targets]
+    with _bulk_update_lock:
+        _bulk_update["running"] = True
+        _bulk_update["started_at"] = datetime.now(timezone.utc).isoformat()
+        _bulk_update["total"] = len(items)
+        _bulk_update["done"] = 0
+        _bulk_update["items"] = items
+
+    from flask import current_app
+    app = current_app._get_current_object()
+    enforce_snapshot = not current_user.is_admin
+    thread = threading.Thread(
+        target=_run_bulk_update,
+        args=(app, guest_ids, dist_upgrade, enforce_snapshot),
+        daemon=True,
+    )
+    thread.start()
+
+    flash(f"Started updates on {len(targets)} guest(s).", "info")
+    return redirect(url_for("api.apply_all_progress"))
+
+
+@bp.route("/apply-all/progress")
+@login_required
+def apply_all_progress():
+    """Render the aggregate bulk-update progress page for guests."""
+    if not current_user.can_update:
+        flash("You don't have permission to view this page.", "error")
+        return redirect(url_for("guests.index"))
+    return render_template(
+        "bulk_update_progress.html",
+        page_title="Updating All Guests",
+        heading="Updating All Guests",
+        status_url=url_for("api.apply_all_status"),
+        back_url=url_for("guests.index"),
+        back_label="Back to Guests",
+    )
+
+
+@bp.route("/apply-all/status")
+@login_required
+def apply_all_status():
+    """JSON: aggregate state of the bulk guest update, with live log per guest."""
+    if not current_user.can_update:
+        return jsonify({"error": "forbidden"}), 403
+
+    with _bulk_update_lock:
+        running = _bulk_update.get("running", False)
+        total = _bulk_update.get("total", 0)
+        done = _bulk_update.get("done", 0)
+        snapshot = [(i["guest_id"], i["name"], i["state"], i.get("reason")) for i in _bulk_update["items"]]
+
+    items_out = []
+    for guest_id, name, state, reason in snapshot:
+        log = ""
+        if state in ("running", "success", "failed"):
+            job = _update_jobs.get(guest_id)
+            if job:
+                log = job.to_dict().get("log", "")
+        items_out.append({"id": guest_id, "name": name, "state": state, "reason": reason, "log": log})
+
+    return jsonify({"running": running, "total": total, "done": done, "items": items_out})
 
 
 # ---------------------------------------------------------------------------
