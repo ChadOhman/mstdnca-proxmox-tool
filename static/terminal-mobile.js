@@ -50,7 +50,7 @@
     function injectStyles() {
         if (document.getElementById('term-mobile-styles')) return;
         var css = [
-            '.term-mobile-keys{display:flex;gap:6px;overflow-x:auto;',
+            '.term-mobile-keys{display:flex;flex:0 0 auto;gap:6px;overflow-x:auto;',
             '-webkit-overflow-scrolling:touch;padding:6px 4px;margin-bottom:4px;',
             'scrollbar-width:none;}',
             '.term-mobile-keys::-webkit-scrollbar{display:none;}',

@@ -19,6 +19,12 @@
             overflow: hidden;
             background: var(--bs-body-bg, #09090b);
         }
+        /* Flex column so the (mobile-only) key bar slots between the toolbar and
+           the terminal. On desktop there's no bar, so it's just toolbar + terminal. */
+        body {
+            display: flex;
+            flex-direction: column;
+        }
         /* Disable scanlines and grid background on terminal popout */
         body::before, body::after {
             display: none;
@@ -31,6 +37,7 @@
             background: var(--crt-surface, #111111);
             border-bottom: 1px solid var(--crt-border, #1a9a1a);
             height: 36px;
+            flex: 0 0 auto;
             font-family: var(--bs-font-monospace);
             -webkit-app-region: drag;
         }
@@ -38,11 +45,8 @@
             -webkit-app-region: no-drag;
         }
         #terminal-container {
-            position: absolute;
-            top: 36px;
-            left: 0;
-            right: 0;
-            bottom: 0;
+            flex: 1 1 auto;
+            min-height: 0;
             padding: 2px;
         }
         #terminal-container .xterm {
@@ -76,6 +80,7 @@
     <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+    <script src="{{ url_for('static', filename='terminal-mobile.js') }}"></script>
     <script>
     (function() {
         const term = new Terminal({
@@ -160,6 +165,26 @@
                 ws.send(JSON.stringify({type: 'input', data: data}));
             }
         });
+
+        // Mobile ergonomics: on-screen Esc/Tab/Ctrl/arrow keys plus soft-keyboard
+        // viewport handling so the prompt stays visible. No-op on desktop.
+        if (window.TerminalMobile) {
+            TerminalMobile.init({
+                term: term,
+                container: document.getElementById('terminal-container'),
+                fit: function() {
+                    fitAddon.fit();
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({type: 'resize', cols: term.cols, rows: term.rows}));
+                    }
+                },
+                sendInput: function(data) {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({type: 'input', data: data}));
+                    }
+                }
+            });
+        }
 
         window.addEventListener('resize', function() {
             fitAddon.fit();
