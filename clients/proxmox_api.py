@@ -455,6 +455,53 @@ class ProxmoxClient:
             logger.error(f"Failed to list backups for VMID {vmid} on {storage}: {e}")
             return []
 
+    def list_all_backups(self, node, vmid):
+        """List backup archives for a VMID across all backup-capable storages on a node.
+
+        Enumerates every storage that advertises 'backup' content and aggregates
+        the matching archives. Each returned dict is annotated with the source
+        ``storage`` so callers can restore/delete without re-deriving it.
+        Returns a list sorted newest-first by ctime.
+        """
+        results = []
+        for st in self.list_node_storages(node, content_type="backup"):
+            storage = st.get("storage", "")
+            if not storage:
+                continue
+            for vol in self.list_backups(node, vmid, storage):
+                vol.setdefault("storage", storage)
+                results.append(vol)
+        results.sort(key=lambda x: x.get("ctime", 0), reverse=True)
+        return results
+
+    def restore_backup(self, node, vmid, guest_type, archive, storage=None):
+        """Restore a guest from a backup archive, overwriting the existing VMID.
+
+        DESTRUCTIVE: this replaces the current guest with the archive contents.
+
+        - QEMU: POST /nodes/{node}/qemu with vmid + archive + force=1
+        - LXC:  POST /nodes/{node}/lxc  with vmid + ostemplate + restore=1 + force=1
+
+        ``archive`` is the backup volid (e.g. "pbs-store:backup/vm/100/...").
+        Returns (success, upid_or_error). The UPID plugs into the same task
+        tracking used by create_backup / power ops.
+        """
+        try:
+            if guest_type == "vm":
+                kwargs = {"vmid": vmid, "archive": archive, "force": 1}
+                if storage:
+                    kwargs["storage"] = storage
+                upid = self.api.nodes(node).qemu.post(**kwargs)
+            else:
+                kwargs = {"vmid": vmid, "ostemplate": archive, "restore": 1, "force": 1}
+                if storage:
+                    kwargs["storage"] = storage
+                upid = self.api.nodes(node).lxc.post(**kwargs)
+            return True, upid
+        except Exception as e:
+            logger.error(f"Failed to restore {guest_type}/{vmid} from '{archive}': {e}")
+            return False, str(e)
+
     def list_node_storages(self, node, content_type="backup"):
         """List storages available on a node, optionally filtered by content type."""
         try:

@@ -256,11 +256,12 @@ def detail(guest_id):
                 default_storage = guest.backup_storage or tag_cfg.get("storage") or Setting.get("backup_storage", "")
                 if default_storage:
                     backups = client.list_backups(node, guest.vmid, default_storage)
+                    # Annotate with the source storage so restore/delete can resolve it
+                    for vol in backups:
+                        vol.setdefault("storage", default_storage)
                 else:
-                    # Try each backup-capable storage
-                    for st in backup_storages:
-                        backups.extend(client.list_backups(node, guest.vmid, st.get("storage", "")))
-                    backups.sort(key=lambda x: x.get("ctime", 0), reverse=True)
+                    # Aggregate across every backup-capable storage
+                    backups = client.list_all_backups(node, guest.vmid)
         except Exception as e:
             logger.warning(f"Could not fetch Proxmox detail data for guest {guest.name}: {e}")
 
@@ -916,6 +917,70 @@ def update_backup_notes(guest_id, volid):
         flash("Backup notes updated.", "success")
     else:
         flash(f"Failed to update notes: {msg}", "error")
+
+    return redirect(url_for("guests.detail", guest_id=guest.id))
+
+
+@bp.route("/<int:guest_id>/backup/<path:volid>/restore", methods=["GET"])
+@login_required
+def restore_backup_confirm(guest_id, volid):
+    """Render the type-to-confirm page for a destructive restore."""
+    guest = Guest.query.get_or_404(guest_id)
+
+    if not current_user.can_manage_guests:
+        flash("Permission denied.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    if not guest.proxmox_host or not guest.vmid:
+        flash("Guest must be linked to a Proxmox host with a VMID.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    return render_template("guest_restore_confirm.html", guest=guest, volid=volid)
+
+
+@bp.route("/<int:guest_id>/backup/<path:volid>/restore", methods=["POST"])
+@login_required
+def restore_backup(guest_id, volid):
+    """Restore a guest from a backup archive. DESTRUCTIVE — overwrites the guest.
+
+    Requires the user to type the guest's exact name to confirm.
+    """
+    guest = Guest.query.get_or_404(guest_id)
+
+    if not current_user.can_manage_guests:
+        flash("Permission denied.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    if not guest.proxmox_host or not guest.vmid:
+        flash("Guest must be linked to a Proxmox host with a VMID.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    # Destructive-action gate: user must type the guest's exact name.
+    confirm_name = request.form.get("confirm_name", "").strip()
+    if confirm_name != guest.name:
+        flash("Confirmation text did not match the guest name. Restore cancelled.", "error")
+        return redirect(url_for("guests.restore_backup_confirm", guest_id=guest.id, volid=volid))
+
+    storage = volid.split(":")[0] if ":" in volid else (
+        guest.backup_storage or _get_tag_backup_defaults(guest).get("storage") or Setting.get("backup_storage", "")
+    )
+
+    client = ProxmoxClient(guest.proxmox_host)
+    node = client.find_guest_node(guest.vmid)
+    if not node:
+        flash(f"Could not find {guest.guest_type}/{guest.vmid} on any node.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    ok, upid = client.restore_backup(node, guest.vmid, guest.guest_type, volid, storage=storage)
+    if ok:
+        log_action("guest_backup_restore", "guest", resource_id=guest.id, resource_name=guest.name,
+                   details={"volid": volid, "storage": storage})
+        db.session.commit()
+        from routes.api import start_proxmox_job
+        start_proxmox_job(guest, "restore", upid, node)
+        return redirect(url_for("api.task_progress", guest_id=guest.id, job_type="restore"))
+    else:
+        flash(f"Failed to restore backup: {upid}", "error")
 
     return redirect(url_for("guests.detail", guest_id=guest.id))
 

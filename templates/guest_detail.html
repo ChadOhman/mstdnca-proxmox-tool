@@ -775,6 +775,7 @@
                         {% if current_user.can_manage_guests %}
                         <td>
                             <div class="btn-group btn-group-sm">
+                                <a href="/guests/{{ guest.id }}/backup/{{ backup.volid }}/restore" class="btn btn-outline-warning" title="Restore from this backup" aria-label="Restore from this backup"><i class="bi bi-arrow-counterclockwise" aria-hidden="true"></i></a>
                                 {% if backup.protected | default(false) %}
                                 <form method="post" action="/guests/{{ guest.id }}/backup/{{ backup.volid }}/protect" class="d-inline">
                                     <input type="hidden" name="protected" value="0">

@@ -614,6 +614,7 @@ JOB_TYPE_LABELS = {
     "rollback": "Rolling Back",
     "clone": "Cloning Guest",
     "migrate": "Migrating Guest",
+    "restore": "Restoring Backup",
 }
 
 
