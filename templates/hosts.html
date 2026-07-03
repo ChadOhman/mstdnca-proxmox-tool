@@ -3,16 +3,24 @@
 
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-4">
-    <h2><i class="bi bi-server"></i> Proxmox Hosts</h2>
+    <h2>
+        <i class="bi bi-server"></i> Proxmox Hosts
+        {% if current_filter %}
+        <span class="badge bg-secondary ms-2 fs-6 fw-normal align-middle">
+            {{ filter_label }}
+            <a href="/hosts/?filter=&q={{ current_search|urlencode }}" class="text-white ms-1" title="Clear filter" aria-label="Clear filter">&times;</a>
+        </span>
+        {% endif %}
+    </h2>
     <div class="d-flex gap-2">
-        {% if hosts and current_user.is_super_admin %}
+        {% if has_any_hosts and current_user.is_super_admin %}
         <form method="post" action="/hosts/discover-all">
             <button type="submit" class="btn btn-outline-primary">
                 <i class="bi bi-search"></i> Discover All
             </button>
         </form>
         {% endif %}
-        {% if hosts and current_user.can_manage_hosts %}
+        {% if has_any_hosts and current_user.can_manage_hosts %}
         <form method="post" action="/hosts/updates/apply-all"
               data-confirm="Apply OS updates (apt dist-upgrade) to ALL PVE hosts that have pending updates? Hosts are updated one at a time.">
             <button type="submit" class="btn btn-outline-success">
@@ -25,6 +33,38 @@
         </button>
     </div>
 </div>
+
+<form method="get" action="/hosts/" class="d-flex flex-wrap align-items-center gap-2 mb-4">
+    <div class="input-group" style="max-width: 320px;">
+        <span class="input-group-text bg-dark text-light border-secondary"><i class="bi bi-search"></i></span>
+        <input type="search" name="q" value="{{ current_search }}" class="form-control"
+               placeholder="Search name or hostname..." aria-label="Search hosts">
+        {% if current_search %}
+        <a href="/hosts/?q=&filter={{ current_filter }}" class="btn btn-outline-secondary" title="Clear search" aria-label="Clear search">&times;</a>
+        {% endif %}
+    </div>
+    <input type="hidden" name="filter" value="{{ current_filter }}">
+    <button type="submit" class="btn btn-outline-secondary">Search</button>
+
+    <div class="dropdown ms-auto">
+        <button class="btn btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown">
+            <i class="bi bi-funnel"></i>
+            {%- if current_filter %} {{ filter_label }}
+            {%- else %} All Statuses
+            {%- endif %}
+        </button>
+        <ul class="dropdown-menu dropdown-menu-dark dropdown-menu-end">
+            <li><a class="dropdown-item {% if not current_filter %}active{% endif %}" href="/hosts/?filter=&q={{ current_search|urlencode }}">All Statuses</a></li>
+            <li><hr class="dropdown-divider"></li>
+            <li><a class="dropdown-item {% if current_filter == 'pve' %}active{% endif %}" href="/hosts/?filter=pve&q={{ current_search|urlencode }}">Proxmox VE</a></li>
+            <li><a class="dropdown-item {% if current_filter == 'pbs' %}active{% endif %}" href="/hosts/?filter=pbs&q={{ current_search|urlencode }}">Proxmox Backup Server</a></li>
+            <li><hr class="dropdown-divider"></li>
+            <li><a class="dropdown-item {% if current_filter == 'updates' %}active{% endif %}" href="/hosts/?filter=updates&q={{ current_search|urlencode }}">Pending Updates</a></li>
+            <li><a class="dropdown-item {% if current_filter == 'security' %}active{% endif %}" href="/hosts/?filter=security&q={{ current_search|urlencode }}">Security Updates</a></li>
+            <li><a class="dropdown-item {% if current_filter == 'no_ssh' %}active{% endif %}" href="/hosts/?filter=no_ssh&q={{ current_search|urlencode }}">No SSH Credential</a></li>
+        </ul>
+    </div>
+</form>
 
 <div class="row g-4">
     {% for host in hosts %}
@@ -88,12 +128,21 @@
     <div class="col-12">
         <div class="card bg-dark">
             <div class="card-body text-center py-5">
+                {% if has_any_hosts %}
+                <i class="bi bi-search" style="font-size: 3rem;"></i>
+                <h4 class="mt-3">No Hosts Match Your Search</h4>
+                <p class="text-muted">Try a different search term or clear the active filter.</p>
+                <a href="/hosts/?q=&filter=" class="btn btn-outline-secondary">
+                    <i class="bi bi-x-circle"></i> Clear Search &amp; Filters
+                </a>
+                {% else %}
                 <i class="bi bi-server" style="font-size: 3rem;"></i>
                 <h4 class="mt-3">No Proxmox Hosts Configured</h4>
                 <p class="text-muted">Add your first Proxmox host to start managing updates across your datacenter.</p>
                 <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addHostModal">
                     <i class="bi bi-plus-lg"></i> Add Host
                 </button>
+                {% endif %}
             </div>
         </div>
     </div>
