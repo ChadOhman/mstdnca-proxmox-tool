@@ -8,7 +8,7 @@ A datacenter-wide administration tool for Proxmox environments. Runs as an LXC c
 - **Web SSH terminal** — Browser-based SSH sessions to any managed guest
 - **UniFi network visibility** — View all UniFi devices and clients with subnet filtering and device restart support
 - **Mastodon (glitch-soc) upgrade automation** — One-click upgrades with PGBouncer swap, git stash/pop, Proxmox snapshots, and auto-upgrade support
-- **Gmail notifications** — Email alerts when updates are available, with severity breakdown
+- **Discord notifications** — Webhook alerts for available updates, upgrade results, and service failures, with severity breakdown
 - **Scheduled scans & auto-updates** — Configurable scan intervals and maintenance windows
 - **4-tier role-based access control** — Super Admin, Admin, Operator, and Viewer roles with tag-based guest filtering
 - **Encrypted credential storage** — SSH passwords and API tokens encrypted at rest with Fernet
@@ -103,12 +103,14 @@ Guests not managed by Proxmox (e.g. bare-metal servers) can be added manually un
 
 Under **Credentials** (super admin only), add SSH credentials (password or private key) that will be used to connect to your guests. You can assign a specific credential to each guest, or set one as the default.
 
-### Gmail Notifications
+### Discord Notifications
 
-1. Go to **Settings > Gmail Notifications**
-2. Enter your Gmail address and an [App Password](https://myaccount.google.com/apppasswords) (requires 2FA enabled)
-3. Add recipient email addresses (comma-separated)
-4. Enable notifications and click **Send Test Email** to verify
+1. In Discord, create a webhook for the channel you want alerts in: **Channel Settings > Integrations > Webhooks > New Webhook**, then copy the webhook URL
+2. In MCAT, go to **Settings > Discord Notifications** and paste the **Webhook URL**
+3. Check **Enable Discord notifications** and pick which events to notify on — guest & host package updates (optionally security updates only), app version updates and upgrade started/result for Mastodon, Ghost, PeerTube, Elk, and Jitsi Meet, Prometheus exporter changes, and MCAT application updates
+4. Click **Send Test Notification** to verify, then **Save Discord Settings**
+
+Notifications arrive as rich embeds with per-guest update counts and severity colouring. Repeat scans that find the same set of pending updates are deduplicated, so you're only notified when something changes.
 
 ### Scan Settings
 
@@ -259,13 +261,13 @@ Flask Web UI (:5000)
 ├── Credentials ─ encrypted SSH key/password storage
 ├── Schedules ─── maintenance windows for auto-updates
 ├── Users ─────── 4-tier RBAC with tag-based filtering
-└── Settings ──── email, scan, UniFi, CF Access, local bypass
+└── Settings ──── Discord, scan, UniFi, CF Access, local bypass
 
 Background Services (APScheduler)
 ├── Update scanner ─── periodic APT check across all guests
 ├── Mastodon checker ─ polls GitHub for new releases
 ├── Auto-updater ───── applies updates during maintenance windows
-└── Email notifier ─── Gmail SMTP alerts
+└── Discord notifier ─ webhook alerts for updates & upgrades
 ```
 
 ## Requirements
