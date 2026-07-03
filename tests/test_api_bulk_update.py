@@ -134,7 +134,7 @@ class TestApplyAllTargetSelection:
         _reset_bulk()
         captured = {}
 
-        def fake_orch(app_, guest_ids, dist_upgrade, enforce_snapshot):
+        def fake_orch(app_, guest_ids, dist_upgrade, enforce_snapshot, **kwargs):
             captured["dist_upgrade"] = dist_upgrade
             captured["guest_ids"] = list(guest_ids)
         monkeypatch.setattr(api_mod, "_run_bulk_update", fake_orch)
@@ -163,7 +163,7 @@ class TestBulkUpdateOrchestrator:
         g1 = _make_guest(app, "_bulk-orch-g1", pending=1)
         g2 = _make_guest(app, "_bulk-orch-g2", pending=1)
 
-        def fake_bg(app_, gid, dist):
+        def fake_bg(app_, gid, dist, **kwargs):
             job = _update_jobs.get(gid)
             if job:
                 job.finish(True)
@@ -190,7 +190,7 @@ class TestBulkUpdateOrchestrator:
         g1 = _make_guest(app, "_bulk-orch-gf1", pending=1)
         g2 = _make_guest(app, "_bulk-orch-gf2", pending=1)
 
-        def fake_bg(app_, gid, dist):
+        def fake_bg(app_, gid, dist, **kwargs):
             if gid == g1:
                 raise RuntimeError("boom")
             job = _update_jobs.get(gid)

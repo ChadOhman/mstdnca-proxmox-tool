@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% block title %}Update History - Mastodon Canada Administration Tool{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2><i class="bi bi-graph-up-arrow"></i> Update History</h2>
+    <a href="{{ url_for('guests.index') }}" class="btn btn-outline-light btn-sm">
+        <i class="bi bi-arrow-left"></i> Back to Guests
+    </a>
+</div>
+
+<!-- Weekly apply activity chart -->
+<div class="card bg-dark mb-4">
+    <div class="card-header py-2">
+        <h6 class="mb-0 text-muted"><i class="bi bi-bar-chart-line"></i> Updates Applied Per Week (Last {{ trend_days }} Days)</h6>
+    </div>
+    <div class="card-body" style="height:280px">
+        {% if series and series|selectattr('total', 'gt', 0)|list %}
+        <canvas id="chartWeekly" role="img" aria-label="Updates applied per week, total and security"></canvas>
+        {% else %}
+        <div class="text-center py-5">
+            <i class="bi bi-bar-chart display-4 text-muted"></i>
+            <p class="text-muted mt-2">No update history recorded yet in this window.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="row g-4 mb-4">
+    <!-- Chronically behind ranking -->
+    <div class="col-lg-7">
+        <div class="card bg-dark h-100">
+            <div class="card-header py-2">
+                <h6 class="mb-0 text-muted"><i class="bi bi-hourglass-split"></i> Chronically Behind</h6>
+            </div>
+            <div class="card-body p-0">
+                {% if behind %}
+                <div class="table-responsive">
+                    <table class="table table-dark table-hover mb-0" aria-label="Guests ranked by outstanding pending updates">
+                        <thead>
+                            <tr>
+                                <th scope="col">Guest</th>
+                                <th scope="col" class="text-end">Pending</th>
+                                <th scope="col" class="text-end">Security</th>
+                                <th scope="col" class="text-end">Waiting</th>
+                                <th scope="col" class="text-end">Last Update</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in behind %}
+                            <tr>
+                                <td>
+                                    <a href="{{ url_for('guests.detail', guest_id=row.guest.id) }}">{{ row.guest.name }}</a>
+                                    <a href="{{ url_for('trends.index', guest_id=row.guest.id) }}" class="text-muted ms-1" title="View history">
+                                        <i class="bi bi-clock-history"></i>
+                                    </a>
+                                </td>
+                                <td class="text-end">{{ row.pending_count }}</td>
+                                <td class="text-end">
+                                    {% if row.pending_security_count %}
+                                    <span class="badge bg-danger">{{ row.pending_security_count }}</span>
+                                    {% else %}
+                                    <span class="text-muted">0</span>
+                                    {% endif %}
+                                </td>
+                                <td class="text-end">
+                                    {% if row.oldest_pending_days >= 30 %}
+                                    <span class="badge bg-danger">{{ row.oldest_pending_days }}d</span>
+                                    {% elif row.oldest_pending_days >= 14 %}
+                                    <span class="badge bg-warning text-dark">{{ row.oldest_pending_days }}d</span>
+                                    {% else %}
+                                    {{ row.oldest_pending_days }}d
+                                    {% endif %}
+                                </td>
+                                <td class="text-end">
+                                    {% if row.days_since_last_update is not none %}
+                                    {{ row.days_since_last_update }}d ago
+                                    {% else %}
+                                    <span class="text-muted">never</span>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="text-center py-4">
+                    <i class="bi bi-check-circle display-4 text-success"></i>
+                    <p class="text-muted mt-2">No guests with pending updates. Everything is caught up.</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Per-guest filter -->
+    <div class="col-lg-5">
+        <div class="card bg-dark h-100">
+            <div class="card-header py-2">
+                <h6 class="mb-0 text-muted"><i class="bi bi-pc-display"></i> Per-Guest History</h6>
+            </div>
+            <div class="card-body">
+                <form method="get" action="{{ url_for('trends.index') }}" class="mb-3">
+                    <label for="guestSelect" class="form-label text-muted small">Select a guest</label>
+                    <select id="guestSelect" name="guest_id" class="form-select form-select-sm" onchange="this.form.submit()">
+                        <option value="">— Choose a guest —</option>
+                        {% for g in guests|sort(attribute='name') %}
+                        <option value="{{ g.id }}" {% if selected_guest and selected_guest.id == g.id %}selected{% endif %}>{{ g.name }}</option>
+                        {% endfor %}
+                    </select>
+                    <noscript><button type="submit" class="btn btn-sm btn-outline-light mt-2">Go</button></noscript>
+                </form>
+
+                {% if selected_guest %}
+                <h6 class="mb-2">{{ selected_guest.name }}
+                    <a href="{{ url_for('guests.detail', guest_id=selected_guest.id) }}" class="small">
+                        <i class="bi bi-box-arrow-up-right"></i>
+                    </a>
+                </h6>
+                {% if history %}
+                <ul class="list-group list-group-flush" aria-label="Applied update timeline for {{ selected_guest.name }}">
+                    {% for entry in history %}
+                    <li class="list-group-item bg-dark text-light border-secondary d-flex justify-content-between align-items-start">
+                        <div>
+                            <div>{{ entry.applied_at | local_dt }}</div>
+                            {% if entry.packages_summary %}
+                            <small class="text-muted">{{ entry.packages_summary }}</small>
+                            {% endif %}
+                            {% if entry.initiated_by %}
+                            <div><small class="text-muted"><i class="bi bi-person"></i> {{ entry.initiated_by }}</small></div>
+                            {% endif %}
+                        </div>
+                        <div class="text-end flex-shrink-0 ms-2">
+                            <span class="badge bg-secondary">{{ entry.package_count }} pkg{{ 's' if entry.package_count != 1 }}</span>
+                            {% if entry.security_count %}
+                            <span class="badge bg-danger">{{ entry.security_count }} sec</span>
+                            {% endif %}
+                        </div>
+                    </li>
+                    {% endfor %}
+                </ul>
+                {% else %}
+                <p class="text-muted">No recorded updates for this guest yet.</p>
+                {% endif %}
+                {% else %}
+                <p class="text-muted">Choose a guest above to see its applied-update timeline.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function () {
+    {% if series and series|selectattr('total', 'gt', 0)|list %}
+    const seriesData = {{ series | tojson }};
+    const labels = seriesData.map(function (d) {
+        const dt = new Date(d.week_start);
+        return dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    });
+    new Chart(document.getElementById('chartWeekly'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [
+                { label: 'Total Applied', data: seriesData.map(function (d) { return d.total; }), backgroundColor: '#0dcaf0' },
+                { label: 'Security', data: seriesData.map(function (d) { return d.security; }), backgroundColor: '#dc3545' },
+            ]
+        },
+        options: {
+            plugins: { legend: { labels: { color: '#adb5bd' } } },
+            scales: {
+                x: { ticks: { color: '#adb5bd', font: { size: 11 } }, grid: { color: '#2d3035' } },
+                y: { ticks: { color: '#adb5bd', font: { size: 11 } }, grid: { color: '#2d3035' }, beginAtZero: true },
+            },
+            responsive: true,
+            maintainAspectRatio: false,
+        },
+    });
+    {% endif %}
+})();
+</script>
+{% endblock %}

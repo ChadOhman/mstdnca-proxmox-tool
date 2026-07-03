@@ -84,7 +84,7 @@ class UpdateJob:
             }
 
 
-def _run_update_background(app, guest_id, dist_upgrade=False):
+def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None):
     """Run apt upgrade in a background thread with streaming output."""
     from clients.proxmox_api import ProxmoxClient
     from clients.ssh_client import SSHClient
@@ -161,8 +161,10 @@ def _run_update_background(app, guest_id, dist_upgrade=False):
                                     send_updates_applied_notification,
                                     summarize_applied_packages,
                                 )
+                                from core.update_history import record_update_history
                                 applied_pkgs = list(guest.pending_updates())
                                 applied_count, security_count = summarize_applied_packages(applied_pkgs)
+                                record_update_history(guest, applied_pkgs, initiated_by=initiated_by)
                                 for pkg in applied_pkgs:
                                     pkg.status = "applied"
                                     pkg.applied_at = now
@@ -224,8 +226,10 @@ def _run_update_background(app, guest_id, dist_upgrade=False):
                                 send_updates_applied_notification,
                                 summarize_applied_packages,
                             )
+                            from core.update_history import record_update_history
                             applied_pkgs = list(guest.pending_updates())
                             applied_count, security_count = summarize_applied_packages(applied_pkgs)
+                            record_update_history(guest, applied_pkgs, initiated_by=initiated_by)
                             for pkg in applied_pkgs:
                                 pkg.status = "applied"
                                 pkg.applied_at = now
@@ -363,9 +367,12 @@ def apply(guest_id):
     with _jobs_lock:
         _update_jobs[guest_id] = job
 
+    initiated_by = current_user.username
+
     thread = threading.Thread(
         target=_run_update_background,
         args=(app, guest_id, dist_upgrade),
+        kwargs={"initiated_by": initiated_by},
         daemon=True,
     )
     thread.start()
@@ -422,7 +429,7 @@ def update_cancel(guest_id):
 # Bulk update — apply pending updates to every eligible guest, one at a time
 # ---------------------------------------------------------------------------
 
-def _run_bulk_update(app, guest_ids, dist_upgrade, enforce_snapshot):
+def _run_bulk_update(app, guest_ids, dist_upgrade, enforce_snapshot, initiated_by=None):
     """Orchestrator thread: update each guest sequentially.
 
     Reuses the per-guest _run_update_background worker so the existing per-guest
@@ -474,7 +481,7 @@ def _run_bulk_update(app, guest_ids, dist_upgrade, enforce_snapshot):
                 _update_jobs[guest_id] = UpdateJob(guest_id, guest.name)
 
             try:
-                _run_update_background(app, guest_id, dist_upgrade)
+                _run_update_background(app, guest_id, dist_upgrade, initiated_by=initiated_by)
                 job = _update_jobs.get(guest_id)
                 success = bool(job.success) if job else False
             except Exception as e:
@@ -547,9 +554,11 @@ def apply_all():
     from flask import current_app
     app = current_app._get_current_object()
     enforce_snapshot = not current_user.is_admin
+    initiated_by = current_user.username
     thread = threading.Thread(
         target=_run_bulk_update,
         args=(app, guest_ids, dist_upgrade, enforce_snapshot),
+        kwargs={"initiated_by": initiated_by},
         daemon=True,
     )
     thread.start()

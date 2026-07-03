@@ -543,6 +543,37 @@ class ScanResult(db.Model):
         return f"<ScanResult guest={self.guest_id} total={self.total_updates}>"
 
 
+class UpdateHistory(db.Model):
+    """Record of an update-apply event on a guest, for trends/history reporting.
+
+    Written once per successful apply (interactive, bulk, or scheduled
+    auto-update) — see core/update_history.py::record_update_history(), which
+    is the single call site used by every apply code path so history stays
+    consistent regardless of how the update was triggered.
+    """
+
+    __tablename__ = "update_history"
+
+    id = db.Column(db.Integer, primary_key=True)
+    guest_id = db.Column(db.Integer, db.ForeignKey("guests.id", ondelete="CASCADE"), nullable=False, index=True)
+    applied_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    package_count = db.Column(db.Integer, default=0)
+    security_count = db.Column(db.Integer, default=0)
+    packages_summary = db.Column(db.Text, nullable=True)  # comma-separated package names (truncated)
+    # Who/what triggered the apply: a username string, or "scheduler" for
+    # unattended maintenance-window auto-updates. Nullable for parity with
+    # AuditLog.user_id, which is nullable for the same reason.
+    initiated_by = db.Column(db.String(128), nullable=True)
+
+    guest = db.relationship("Guest", backref=db.backref("update_history", lazy=True, cascade="all, delete-orphan"))
+
+    def __repr__(self):
+        return f"<UpdateHistory guest={self.guest_id} packages={self.package_count} at={self.applied_at}>"
+
+
+db.Index("ix_update_history_guest_applied", UpdateHistory.guest_id, UpdateHistory.applied_at)
+
+
 class GuestService(db.Model):
     __tablename__ = "guest_services"
 
