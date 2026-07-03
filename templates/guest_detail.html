@@ -215,6 +215,75 @@
 </div>
 {% endif %}
 
+{% if current_user.can_manage_guests and guest.proxmox_host and guest.vmid %}
+<div class="card bg-dark mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-files"></i> Clone &amp; Migrate</h5>
+        <div class="d-flex gap-2">
+            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="collapse" data-bs-target="#cloneForm">
+                <i class="bi bi-files"></i> Clone
+            </button>
+            {% if cluster_nodes|length > 1 %}
+            <button class="btn btn-sm btn-outline-info" data-bs-toggle="collapse" data-bs-target="#migrateForm">
+                <i class="bi bi-arrow-left-right"></i> Migrate
+            </button>
+            {% endif %}
+        </div>
+    </div>
+    <div class="card-body">
+        <div class="collapse mb-3" id="cloneForm">
+            <form method="post" action="/guests/{{ guest.id }}/clone" class="row g-2 align-items-end"
+                  data-confirm="Clone {{ guest.name }} (VMID {{ guest.vmid }}) to a new guest?">
+                <div class="col-md-3">
+                    <label class="form-label form-label-sm">New VMID</label>
+                    <input type="number" min="1" class="form-control form-control-sm" name="newid"
+                           value="{{ suggested_vmid or '' }}" required>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label form-label-sm">Name <small class="text-muted">(optional)</small></label>
+                    <input type="text" class="form-control form-control-sm" name="name"
+                           placeholder="{{ guest.name }}-clone">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label form-label-sm">Clone Type</label>
+                    <select class="form-select form-select-sm" name="clone_type">
+                        <option value="full">Full clone</option>
+                        <option value="linked">Linked clone</option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <button type="submit" class="btn btn-sm btn-primary w-100"><i class="bi bi-files"></i> Clone</button>
+                </div>
+            </form>
+        </div>
+
+        {% if cluster_nodes|length > 1 %}
+        <div class="collapse mb-3" id="migrateForm">
+            <form method="post" action="/guests/{{ guest.id }}/migrate" class="row g-2 align-items-end"
+                  data-confirm="Migrate {{ guest.name }} to another node? Running guests use {% if guest.guest_type == 'vm' %}live{% else %}restart{% endif %} migration.">
+                <div class="col-md-6">
+                    <label class="form-label form-label-sm">Target Node</label>
+                    <select class="form-select form-select-sm" name="target_node" required>
+                        {% for n in cluster_nodes %}
+                        <option value="{{ n }}">{{ n }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-6">
+                    <button type="submit" class="btn btn-sm btn-info w-100"><i class="bi bi-arrow-left-right"></i> Migrate</button>
+                </div>
+            </form>
+        </div>
+        {% endif %}
+
+        <p class="text-muted small mb-0">
+            Clone creates a copy under a new VMID (it appears here after the next host scan).
+            Migrate moves this guest to another cluster node.
+        </p>
+    </div>
+</div>
+{% endif %}
+
 {% if guest.proxmox_host and guest.vmid %}
 <div class="card bg-dark mb-4">
     <div class="card-header d-flex justify-content-between align-items-center">

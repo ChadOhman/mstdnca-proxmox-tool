@@ -239,6 +239,7 @@ def detail(guest_id):
     backups = []
     backup_storages = []
     hardware = None
+    suggested_vmid = None
     if guest.proxmox_host and guest.vmid:
         try:
             client = ProxmoxClient(guest.proxmox_host)
@@ -246,6 +247,7 @@ def detail(guest_id):
             if node:
                 repl_jobs = client.get_replication_jobs(guest.vmid)
                 cluster_nodes = [n["node"] for n in client.get_nodes()]
+                suggested_vmid = client.get_next_vmid()
                 snapshots = client.list_snapshots(node, guest.vmid, guest.guest_type)
                 backup_storages = client.list_node_storages(node, content_type="backup")
                 hardware = client.get_guest_config(node, guest.vmid, guest.guest_type)
@@ -285,6 +287,7 @@ def detail(guest_id):
                            snapshots=snapshots, backups=backups,
                            backup_storages=backup_storages,
                            hardware=hardware,
+                           suggested_vmid=suggested_vmid,
                            unifi_client=unifi_client,
                            unifi_last_polled=unifi_last_polled,
                            known_services=GuestService.KNOWN_SERVICES,
@@ -540,6 +543,106 @@ def power_action(guest_id, action):
         flash(f"{action.capitalize()} command sent to {guest.name}.", "success")
     else:
         flash(f"Power {action} failed: {msg}", "error")
+
+    return redirect(url_for("guests.detail", guest_id=guest.id))
+
+
+@bp.route("/<int:guest_id>/clone", methods=["POST"])
+@login_required
+def clone_guest(guest_id):
+    if not current_user.can_manage_guests:
+        flash("Permission denied.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest_id))
+
+    guest = Guest.query.get_or_404(guest_id)
+    if not guest.proxmox_host or not guest.vmid:
+        flash("Guest must be linked to a Proxmox host with a VMID.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    newid_raw = request.form.get("newid", "").strip()
+    try:
+        newid = int(newid_raw)
+    except (TypeError, ValueError):
+        flash("New VMID must be a number.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+    if newid <= 0:
+        flash("New VMID must be a positive number.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+    if newid == guest.vmid:
+        flash("New VMID must differ from the source VMID.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    name = request.form.get("name", "").strip() or None
+    full = request.form.get("clone_type", "full") != "linked"
+    target_storage = request.form.get("target_storage", "").strip() or None
+
+    client = ProxmoxClient(guest.proxmox_host)
+    node = client.find_guest_node(guest.vmid)
+    if not node:
+        flash(f"Could not find {guest.guest_type}/{guest.vmid} on any node.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    ok, upid = client.clone_guest(node, guest.vmid, guest.guest_type, newid,
+                                  name=name, full=full, target_storage=target_storage)
+    if ok:
+        # The clone appears as a new guest on the next host scan/discovery — no row is
+        # hand-inserted here (matches how created guests are picked up).
+        log_action("guest_clone", "guest", resource_id=guest.id, resource_name=guest.name,
+                   details={"source_vmid": guest.vmid, "new_vmid": newid, "name": name,
+                            "full": full, "node": node})
+        db.session.commit()
+        from routes.api import start_proxmox_job
+        start_proxmox_job(guest, "clone", upid, node)
+        return redirect(url_for("api.task_progress", guest_id=guest.id, job_type="clone"))
+    else:
+        flash(f"Failed to clone: {upid}", "error")
+
+    return redirect(url_for("guests.detail", guest_id=guest.id))
+
+
+@bp.route("/<int:guest_id>/migrate", methods=["POST"])
+@login_required
+def migrate_guest(guest_id):
+    if not current_user.can_manage_guests:
+        flash("Permission denied.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest_id))
+
+    guest = Guest.query.get_or_404(guest_id)
+    if not guest.proxmox_host or not guest.vmid:
+        flash("Guest must be linked to a Proxmox host with a VMID.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    target_node = request.form.get("target_node", "").strip()
+    if not target_node:
+        flash("Target node is required.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    client = ProxmoxClient(guest.proxmox_host)
+    node = client.find_guest_node(guest.vmid)
+    if not node:
+        flash(f"Could not find {guest.guest_type}/{guest.vmid} on any node.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    if target_node == node:
+        flash("Target node must differ from the current node.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    valid_nodes = client.list_cluster_nodes()
+    if valid_nodes and target_node not in valid_nodes:
+        flash(f"Unknown target node '{target_node}'.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    # online=None lets the client decide (online=1 for running QEMU, restart=1 for running LXC).
+    ok, upid = client.migrate_guest(node, guest.vmid, guest.guest_type, target_node)
+    if ok:
+        log_action("guest_migrate", "guest", resource_id=guest.id, resource_name=guest.name,
+                   details={"source_node": node, "target_node": target_node})
+        db.session.commit()
+        from routes.api import start_proxmox_job
+        start_proxmox_job(guest, "migrate", upid, node)
+        return redirect(url_for("api.task_progress", guest_id=guest.id, job_type="migrate"))
+    else:
+        flash(f"Failed to migrate: {upid}", "error")
 
     return redirect(url_for("guests.detail", guest_id=guest.id))
 

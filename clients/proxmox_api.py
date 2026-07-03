@@ -505,6 +505,79 @@ class ProxmoxClient:
         return None
 
     # ------------------------------------------------------------------
+    # Clone / migrate
+    # ------------------------------------------------------------------
+
+    def list_cluster_nodes(self):
+        """List cluster node names (for migrate target dropdowns). Returns a list of strings."""
+        try:
+            return sorted(n["node"] for n in self.get_nodes())
+        except Exception as e:
+            logger.error(f"Failed to list cluster nodes: {e}")
+            return []
+
+    def get_next_vmid(self):
+        """Ask Proxmox for the next free VMID via /cluster/nextid. Returns int or None."""
+        try:
+            return int(self.api.cluster.nextid.get())
+        except Exception as e:
+            logger.error(f"Failed to get next VMID: {e}")
+            return None
+
+    def clone_guest(self, node, vmid, guest_type, newid, name=None, full=True, target_storage=None):
+        """Clone a VM or CT to a new VMID. Returns (success, upid_or_error).
+
+        POST /nodes/{node}/{qemu|lxc}/{vmid}/clone
+          newid    — the new guest's VMID
+          name     — hostname/name of the clone (optional)
+          full     — 1 for a full clone, 0 for a linked clone
+          storage  — optional target storage for a full clone
+        """
+        try:
+            kwargs = {"newid": newid, "full": 1 if full else 0}
+            if name:
+                kwargs["name"] = name
+            if full and target_storage:
+                kwargs["storage"] = target_storage
+            if guest_type == "vm":
+                upid = self.api.nodes(node).qemu(vmid).clone.post(**kwargs)
+            else:
+                upid = self.api.nodes(node).lxc(vmid).clone.post(**kwargs)
+            return True, upid
+        except Exception as e:
+            logger.error(f"Failed to clone {guest_type}/{vmid} -> {newid}: {e}")
+            return False, str(e)
+
+    def migrate_guest(self, node, vmid, guest_type, target_node, online=None):
+        """Migrate a VM or CT to another node. Returns (success, upid_or_error).
+
+        POST /nodes/{node}/{qemu|lxc}/{vmid}/migrate
+        For a running QEMU VM, pass online=True to add online=1 (live migration).
+        For a running LXC, pass online=True to add restart=1 (restart migration),
+        since LXC does not support live migration.
+
+        If ``online`` is None, the current power state is queried and live/restart
+        migration is enabled automatically when the guest is running.
+        """
+        try:
+            if online is None:
+                online = self.get_guest_status(node, vmid, guest_type) == "running"
+            kwargs = {"target": target_node}
+            if online:
+                if guest_type == "vm":
+                    kwargs["online"] = 1
+                else:
+                    kwargs["restart"] = 1
+            if guest_type == "vm":
+                upid = self.api.nodes(node).qemu(vmid).migrate.post(**kwargs)
+            else:
+                upid = self.api.nodes(node).lxc(vmid).migrate.post(**kwargs)
+            return True, upid
+        except Exception as e:
+            logger.error(f"Failed to migrate {guest_type}/{vmid} to {target_node}: {e}")
+            return False, str(e)
+
+    # ------------------------------------------------------------------
     # Node-level statistics
     # ------------------------------------------------------------------
 
