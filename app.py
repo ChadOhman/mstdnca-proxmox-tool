@@ -103,6 +103,7 @@ def create_app(test_config=None):
     from routes.jibri import bp as jibri_bp
     from routes.jitsi import bp as jitsi_bp
     from routes.mastodon import bp as mastodon_bp
+    from routes.moderation import bp as moderation_bp
     from routes.peertube import bp as peertube_bp
     from routes.prometheus_app import bp as prometheus_app_bp
     from routes.prometheus_metrics import bp as prometheus_metrics_bp
@@ -113,7 +114,6 @@ def create_app(test_config=None):
     from routes.terminal import bp as terminal_bp
     from routes.trends import bp as trends_bp
     from routes.unifi import bp as unifi_bp
-    from routes.moderation import bp as moderation_bp
     from routes.unpoller import bp as unpoller_bp
 
     app.register_blueprint(auth_bp)

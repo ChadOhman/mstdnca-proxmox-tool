@@ -4,17 +4,26 @@ import json
 import logging
 import threading as _threading
 from datetime import datetime
-from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify
-from flask_login import login_required, current_user
-from models import db, Setting
+
+from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
+from flask_login import current_user, login_required
+
 from auth.audit import log_action
+from models import Setting, db
 
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("moderation", __name__)
 
-# In-memory job state — mirrors the pattern from routes/peertube.py
-_moderation_job = {"running": False, "success": None, "log": []}
+# In-memory job state — mirrors the pattern from routes/peertube.py.
+# ``result`` holds the full (email-bearing) result of the most recent run so the
+# live admin view can render emails that are deliberately NOT persisted to the
+# Setting store (see core.moderation._scrub_result_for_storage).
+_moderation_job = {"running": False, "success": None, "log": [], "result": None}
+
+# Guards the check-then-set on _moderation_job["running"] (TOCTOU): without it,
+# two concurrent /run requests could both observe running=False and start.
+_moderation_job_lock = _threading.Lock()
 
 
 def _parse_iso(value):
@@ -30,7 +39,11 @@ def _parse_iso(value):
 @bp.before_request
 @login_required
 def _require_login():
-    if not current_user.can_moderate:
+    # Moderation exposes user PII (emails) and an auto-ban surface, so it is
+    # gated at the admin tier in addition to the grantable can_moderate flag —
+    # can_moderate alone must not unlock this feature for a non-admin (H2).
+    # current_user.is_admin is role_level >= 3 (admin / super_admin).
+    if not (current_user.is_admin and current_user.can_moderate):
         flash("You don't have permission to access moderation.", "error")
         return redirect(url_for("dashboard.index"))
 
@@ -50,9 +63,11 @@ def _get_moderation_settings():
 def index():
     settings = _get_moderation_settings()
 
-    # Parse the last check result JSON if available
-    last_result = None
-    if settings["last_check_result"]:
+    # Prefer the transient in-memory result from the most recent run: it carries
+    # emails for the live admin view. The persisted Setting is PII-scrubbed
+    # (no emails) and is only used as a fallback after a process restart.
+    last_result = _moderation_job.get("result")
+    if last_result is None and settings["last_check_result"]:
         try:
             last_result = json.loads(settings["last_check_result"])
         except (json.JSONDecodeError, TypeError):
@@ -88,25 +103,29 @@ def save():
 
 @bp.route("/run", methods=["POST"])
 def run():
-    if _moderation_job["running"]:
-        flash("A moderation check is already running.", "warning")
-        return redirect(url_for("moderation.index"))
-
     from flask import current_app
     app = current_app._get_current_object()
 
-    _moderation_job["running"] = True
-    _moderation_job["success"] = None
-    _moderation_job["log"] = []
+    # Atomically claim the running slot: check-then-set under a lock so two
+    # concurrent /run requests can't both start a job (TOCTOU).
+    with _moderation_job_lock:
+        if _moderation_job["running"]:
+            flash("A moderation check is already running.", "warning")
+            return redirect(url_for("moderation.index"))
+        _moderation_job["running"] = True
+        _moderation_job["success"] = None
+        _moderation_job["log"] = []
 
     def _worker():
         with app.app_context():
             try:
                 from core.moderation import run_moderation_check
-                ok, _result = run_moderation_check(
+                ok, result = run_moderation_check(
                     log_callback=lambda msg: _moderation_job["log"].append(msg)
                 )
                 _moderation_job["success"] = ok
+                # Retain the full (email-bearing) result in memory only.
+                _moderation_job["result"] = result if ok else None
             except Exception as exc:
                 logger.exception("Moderation check failed")
                 _moderation_job["log"].append(f"ERROR: {exc}")

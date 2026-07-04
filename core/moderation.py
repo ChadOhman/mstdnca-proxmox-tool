@@ -1,12 +1,38 @@
 """Moderation business logic: cross-check PeerTube users against Mastodon emails."""
 
+import base64
 import json
 import logging
-import urllib.request
 import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
+from apps.utils import _validate_shell_param
+
 logger = logging.getLogger(__name__)
+
+# Hard cap on PeerTube pagination pages to avoid an unbounded loop if the API
+# ever returns a bad ``total`` or a non-shrinking page (100 users/page → 100k).
+_MAX_PEERTUBE_PAGES = 1000
+
+
+def _build_mastodon_email_query_cmd(db_name, query):
+    """Build a shell-safe command that runs ``query`` against ``db_name`` via psql.
+
+    ``db_name`` must be validated with ``_validate_shell_param`` by the caller so
+    it is safe to interpolate as the ``-d`` argument. The SQL statement itself is
+    never interpolated into a nested-quoted ``-c`` argument (which reintroduces
+    the command-injection class hardened out of ``apps/peertube.py``). Instead we
+    base64-encode the query and pipe it to ``psql`` on *stdin* via ``su - postgres``
+    — the postgres-access idiom used in ``apps/peertube.py`` and ``apps/mastodon.py``.
+    The base64 blob is shell-safe (``[A-Za-z0-9+/=]``) and psql reads clean SQL
+    bytes from stdin, so no shell metacharacter in the query can break out.
+    """
+    query_b64 = base64.b64encode(query.encode("utf-8")).decode("ascii")
+    return (
+        f"printf '%s' '{query_b64}' | base64 -d"
+        f" | su - postgres -c 'psql -d {db_name} -t -A -v ON_ERROR_STOP=1 -f -'"
+    )
 
 
 def fetch_mastodon_emails():
@@ -14,7 +40,7 @@ def fetch_mastodon_emails():
 
     Returns (set_of_emails, None) on success or (None, error_message) on failure.
     """
-    from models import Setting, Guest
+    from models import Guest, Setting
 
     db_guest_id = Setting.get("mastodon_db_guest_id", "")
     if not db_guest_id:
@@ -32,13 +58,20 @@ def fetch_mastodon_emails():
 
     db_name = Setting.get("mastodon_db_name", "mastodon_production")
 
+    # Validate the database name before it reaches a shell context. This rejects
+    # any value carrying shell metacharacters (e.g. `x"; rm -rf / #`) outright.
+    try:
+        _validate_shell_param(db_name, "Database name")
+    except ValueError as exc:
+        return None, str(exc)
+
     query = (
-        "SELECT email FROM users "
+        "SELECT email FROM users "  # noqa: S608 — static SQL, no interpolation
         "WHERE confirmed_at IS NOT NULL "
         "AND disabled = false "
         "AND suspended_at IS NULL"
     )
-    cmd = f"su - postgres -c \"psql -d {db_name} -t -A -c \\\"{query}\\\"\""
+    cmd = _build_mastodon_email_query_cmd(db_name, query)
 
     try:
         from clients.ssh_client import SSHClient
@@ -63,7 +96,7 @@ def fetch_peertube_users(api_url, api_token):
     count = 100
     api_url = api_url.rstrip("/")
 
-    while True:
+    for _page in range(_MAX_PEERTUBE_PAGES):
         url = f"{api_url}/api/v1/users?start={start}&count={count}&sort=createdAt"
         req = urllib.request.Request(url)
         req.add_header("Authorization", f"Bearer {api_token}")
@@ -90,6 +123,11 @@ def fetch_peertube_users(api_url, api_token):
         start += count
         if start >= total or not page_data:
             break
+    else:
+        logger.warning(
+            "PeerTube pagination hit the %d-page cap; results may be truncated",
+            _MAX_PEERTUBE_PAGES,
+        )
 
     return users, None
 
@@ -100,6 +138,12 @@ def ban_peertube_user(api_url, api_token, user_id, reason=""):
     Returns (True, None) on success or (False, error_message) on failure.
     """
     api_url = api_url.rstrip("/")
+    # Coerce the user id to an int so it cannot carry path/query metacharacters
+    # into the request URL, regardless of what the PeerTube API returned.
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return False, f"Invalid PeerTube user id: {user_id!r}"
     url = f"{api_url}/api/v1/users/{user_id}/block"
     body = json.dumps({"reason": reason}).encode()
     req = urllib.request.Request(url, data=body, method="POST")
@@ -125,8 +169,8 @@ def run_moderation_check(log_callback=None):
 
     Returns (success_bool, result_dict).
     """
-    from models import Setting, db
     from auth.audit import log_action
+    from models import Setting, db
 
     def log(msg):
         logger.info(msg)
@@ -199,7 +243,9 @@ def run_moderation_check(log_callback=None):
                 "banned": False,
             }
             if auto_ban:
-                log(f"Banning PeerTube user '{user['username']}' ({user['email']}) - not in Mastodon DB")
+                # Log by username/id only — the job log is surfaced via /status,
+                # so it must not carry email PII (H1).
+                log(f"Banning PeerTube user '{user['username']}' (id={user['id']}) - not in Mastodon DB")
                 ok, ban_err = ban_peertube_user(
                     api_url, decrypted_token, user["id"],
                     reason="Email not registered on Mastodon instance"
@@ -210,15 +256,19 @@ def run_moderation_check(log_callback=None):
                     log(f"  WARNING: Ban failed: {ban_err}")
                     result["errors"].append(f"Failed to ban {user['username']}: {ban_err}")
             else:
-                log(f"Unmatched PeerTube user: '{user['username']}' ({user['email']})")
+                log(f"Unmatched PeerTube user: '{user['username']}' (id={user['id']})")
             result["unmatched"].append(entry)
 
     log(f"Check complete: {result['matched']} matched, {len(result['unmatched'])} unmatched, "
         f"{result['skipped_admins']} admin(s) skipped")
 
-    # Store results
+    # Persist a PII-scrubbed summary only. The general Setting KV store has no
+    # field-level access control and is exposed by the config export/import
+    # feature, so raw emails must never be written to it. Emails stay in the
+    # transient in-memory result returned to the caller (rendered live in the
+    # admin view) but are dropped from the persisted copy.
     Setting.set("moderation_last_check_at", datetime.now(timezone.utc).isoformat())
-    Setting.set("moderation_last_check_result", json.dumps(result))
+    Setting.set("moderation_last_check_result", json.dumps(_scrub_result_for_storage(result)))
     log_action("moderation_check", "moderation", details={
         "matched": result["matched"],
         "unmatched": len(result["unmatched"]),
@@ -227,3 +277,17 @@ def run_moderation_check(log_callback=None):
     db.session.commit()
 
     return True, result
+
+
+def _scrub_result_for_storage(result):
+    """Return a copy of the moderation result with email PII removed.
+
+    Persisted to the general Setting store, so it must carry no raw email
+    addresses. Keeps counts and non-PII per-user fields (id, username, banned).
+    """
+    scrubbed = dict(result)
+    scrubbed["unmatched"] = [
+        {"id": entry.get("id"), "username": entry.get("username"), "banned": entry.get("banned", False)}
+        for entry in result.get("unmatched", [])
+    ]
+    return scrubbed
