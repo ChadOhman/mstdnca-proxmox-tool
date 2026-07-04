@@ -23,8 +23,11 @@ def build_system_prompt(user, page_context=None):
         "Always use the appropriate tool when the user asks about guests, services, updates, or hosts. "
         "Do not make up information — use tools to look up real data.",
         "",
-        "When performing actions (restarting services, controlling guests), confirm the action with "
-        "the user before executing unless they explicitly asked you to do it.",
+        "State-changing tools (such as control_service) are protected by a server-side two-phase "
+        "confirmation: your first call returns a 'confirmation_required' result and does NOT perform "
+        "the action. Relay that proposed action to the user in plain language and wait for their "
+        "explicit approval. Only after the user approves should you call the tool again with "
+        "\"confirm\": true. Never set confirm=true on your own initiative.",
         "",
         "Keep responses concise and actionable. Use markdown formatting for readability.",
     ]
