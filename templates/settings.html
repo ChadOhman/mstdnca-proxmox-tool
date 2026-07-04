@@ -137,6 +137,16 @@
                             <label class="form-check-label" for="discordNotifyApp">MCAT application updates</label>
                         </div>
                     </fieldset>
+                    {% set selected_notify_tags = (settings.discord_notify_tags or '').split(',') %}
+                    <div class="mb-3">
+                        <label class="form-label" for="discordNotifyTags">Limit guest notifications to tags</label>
+                        <select class="form-select" name="discord_notify_tags" id="discordNotifyTags" multiple size="4">
+                            {% for tag in tags %}
+                            <option value="{{ tag.id }}" {{ 'selected' if tag.id|string in selected_notify_tags }}>{{ tag.name }}</option>
+                            {% endfor %}
+                        </select>
+                        <div class="form-text">Leave empty to notify for all guests. Select one or more tags to only notify about guests carrying those tags.</div>
+                    </div>
                     <div class="d-flex gap-2">
                         <button type="submit" class="btn btn-primary">Save Discord Settings</button>
                         <button type="submit" formaction="/settings/discord/test" class="btn btn-outline-secondary">
