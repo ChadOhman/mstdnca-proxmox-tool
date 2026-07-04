@@ -748,6 +748,65 @@
             </div>
         </div>
     </div>
+
+    {% if current_user.is_super_admin %}
+    <div class="col-lg-12">
+        <div class="card bg-dark">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-box-arrow-down"></i> Configuration Backup &amp; Restore</h5>
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Back up this tool's <em>own</em> configuration and database. Export produces a
+                    JSON snapshot of hosts, guests, tags, roles, and application settings.
+                    <strong>Secrets are never included</strong> in the JSON export — SSH passwords/keys,
+                    API tokens, IPMI passwords, the UniFi password, the GitHub token, and the Discord
+                    webhook URL are excluded or redacted. After restoring, re-enter any credentials.
+                </p>
+
+                <div class="row g-4">
+                    <div class="col-md-4">
+                        <h6><i class="bi bi-download"></i> Export configuration</h6>
+                        <p class="text-muted small mb-2">Download a secrets-free JSON snapshot.</p>
+                        <a class="btn btn-outline-info btn-sm" href="{{ url_for('settings.export_config') }}">
+                            <i class="bi bi-file-earmark-arrow-down"></i> Download config JSON
+                        </a>
+                    </div>
+
+                    <div class="col-md-4">
+                        <h6><i class="bi bi-upload"></i> Import configuration</h6>
+                        <p class="text-muted small mb-2">
+                            Upload a previously exported JSON. Existing hosts/guests/tags are matched by
+                            name and updated; new ones are created. Credentials are not restored.
+                        </p>
+                        <form method="post" action="{{ url_for('settings.import_config') }}"
+                              enctype="multipart/form-data" class="d-flex gap-2 align-items-center flex-wrap">
+                            <input type="file" name="config_file" accept="application/json,.json"
+                                   class="form-control form-control-sm" style="max-width: 260px;" required>
+                            <button type="submit" class="btn btn-outline-warning btn-sm"
+                                    onclick="return confirm('Import will create or update hosts, guests, tags, roles, and settings from this file. Continue?')">
+                                <i class="bi bi-file-earmark-arrow-up"></i> Import
+                            </button>
+                        </form>
+                    </div>
+
+                    <div class="col-md-4">
+                        <h6><i class="bi bi-database"></i> Download database backup</h6>
+                        <p class="text-muted small mb-2">
+                            Streams a consistent copy of the app's SQLite database.
+                            <strong>Note:</strong> this backup <em>does</em> contain encrypted credential
+                            blobs (protected by the Fernet key at <code>/etc/mstdnca/secret.key</code>).
+                            Store it securely.
+                        </p>
+                        <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('settings.backup_database') }}">
+                            <i class="bi bi-hdd"></i> Download DB backup
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endif %}
 </div>
 {% endblock %}
 

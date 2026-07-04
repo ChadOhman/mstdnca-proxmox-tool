@@ -4,7 +4,19 @@ import os
 import subprocess
 from datetime import datetime, timezone
 
-from flask import Blueprint, current_app, flash, jsonify, redirect, render_template, request, url_for
+from flask import (
+    Blueprint,
+    Response,
+    abort,
+    current_app,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    url_for,
+)
 from flask_login import current_user, login_required
 
 from auth.audit import log_action
@@ -744,3 +756,127 @@ def update_status():
         "running": running,
         "line_count": log_text.count("\n"),
     })
+
+
+# --- Config export / import & database backup (super_admin only) ---
+
+def _require_super_admin():
+    """Strictest gate: only super admins may export/import config or download the DB."""
+    if not current_user.is_super_admin:
+        abort(403, description="Super admin access required.")
+
+
+@bp.route("/config/export")
+def export_config():
+    """Download a JSON snapshot of hosts, guests, tags, roles, and settings.
+
+    Never includes decrypted secrets — see core.config_backup.build_export.
+    """
+    _require_super_admin()
+    from core.config_backup import build_export
+
+    doc = build_export()
+    log_action("settings_config_export", "settings", resource_name="config_export",
+               details={"hosts": len(doc["hosts"]), "guests": len(doc["guests"]),
+                        "tags": len(doc["tags"])})
+    db.session.commit()
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    payload = json.dumps(doc, indent=2, default=str)
+    resp = Response(payload, mimetype="application/json")
+    resp.headers["Content-Disposition"] = f'attachment; filename="mstdnca-config-{ts}.json"'
+    return resp
+
+
+@bp.route("/config/import", methods=["POST"])
+def import_config():
+    """Upload a config JSON and upsert hosts/guests/tags/roles/settings.
+
+    Secrets are never imported.  Malformed input is rejected with a clear
+    error; the endpoint never returns a 500 for bad user input.
+    """
+    _require_super_admin()
+    from core.config_backup import ImportError_, apply_import
+
+    _MAX_BYTES = 10 * 1024 * 1024  # 10 MB is far more than any real config
+
+    if "config_file" not in request.files:
+        flash("No file selected.", "error")
+        return redirect(url_for("settings.index"))
+
+    f = request.files["config_file"]
+    if not f or not f.filename:
+        flash("No file selected.", "error")
+        return redirect(url_for("settings.index"))
+
+    raw = f.read(_MAX_BYTES + 1)
+    if len(raw) > _MAX_BYTES:
+        flash("Config file too large (max 10 MB).", "error")
+        return redirect(url_for("settings.index"))
+
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        flash(f"Invalid JSON: {e}", "error")
+        return redirect(url_for("settings.index"))
+
+    try:
+        counts = apply_import(doc)
+    except ImportError_ as e:
+        db.session.rollback()
+        flash(f"Import rejected: {e}", "error")
+        return redirect(url_for("settings.index"))
+    except Exception:
+        db.session.rollback()
+        logger.warning("Config import failed", exc_info=True)
+        flash("Import failed due to an unexpected error. No changes were applied.", "error")
+        return redirect(url_for("settings.index"))
+
+    log_action("settings_config_import", "settings", resource_name="config_import",
+               details=counts)
+    db.session.commit()
+    flash(
+        f"Config imported: {counts['hosts']} host(s), {counts['guests']} guest(s), "
+        f"{counts['tags']} tag(s), {counts['roles']} role(s), {counts['settings']} setting(s). "
+        "Secrets were not imported — re-enter any credentials.",
+        "success",
+    )
+    return redirect(url_for("settings.index"))
+
+
+@bp.route("/config/backup-db")
+def backup_database():
+    """Stream a consistent SQLite backup of the app's own database."""
+    _require_super_admin()
+    from core.config_backup import make_backup_tempfile
+
+    try:
+        tmp_path = make_backup_tempfile()
+    except Exception:
+        logger.warning("Database backup failed", exc_info=True)
+        flash("Database backup failed.", "error")
+        return redirect(url_for("settings.index"))
+
+    if tmp_path is None:
+        flash("Database backup is unavailable (no file-backed SQLite database).", "error")
+        return redirect(url_for("settings.index"))
+
+    log_action("settings_db_backup", "settings", resource_name="database_backup")
+    db.session.commit()
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    resp = send_file(
+        tmp_path,
+        mimetype="application/x-sqlite3",
+        as_attachment=True,
+        download_name=f"mstdnca-db-{ts}.sqlite3",
+    )
+
+    @resp.call_on_close
+    def _cleanup():
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    return resp
