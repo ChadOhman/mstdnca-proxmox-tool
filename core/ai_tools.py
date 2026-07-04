@@ -114,6 +114,26 @@ def _handle_restart_service(tool_input, user):
     if action not in ("start", "stop", "restart"):
         return json.dumps({"error": f"Invalid action: {action}"})
 
+    # M2: two-phase propose-then-confirm. State-changing service control must be
+    # explicitly confirmed by the caller before it actually runs. This is a
+    # server-side gate — it does not rely on the model honoring the system prompt.
+    if not tool_input.get("confirm"):
+        return json.dumps({
+            "status": "confirmation_required",
+            "message": (
+                f"This will {action} '{svc.service_name}' on '{guest.name}'. "
+                "No action has been taken. To proceed, call control_service again "
+                "with the same service_id and action plus \"confirm\": true."
+            ),
+            "pending_action": {
+                "tool": "control_service",
+                "service_id": svc.id,
+                "service_name": svc.service_name,
+                "guest": guest.name,
+                "action": action,
+            },
+        })
+
     try:
         from core.scanner import service_action
         ok, msg = service_action(guest, svc, action)
@@ -123,9 +143,11 @@ def _handle_restart_service(tool_input, user):
                        details={"service": svc.service_name, "action": action, "via": "ai_assistant"})
             db.session.commit()
         return json.dumps({"success": ok, "message": msg})
-    except Exception as e:
-        logger.error("AI service control error: %s", e)
-        return json.dumps({"error": str(e)})
+    except Exception:
+        # M3: log the full exception server-side; never leak str(e) to the model/client.
+        logger.exception("AI service control error (service_id=%s, action=%s)",
+                         tool_input.get("service_id"), action)
+        return json.dumps({"error": "Service control failed due to an internal error."})
 
 
 def _handle_list_audit_logs(tool_input, user):
@@ -224,7 +246,11 @@ TOOL_REGISTRY = {
         "handler": _handle_list_services,
     },
     "control_service": {
-        "description": "Start, stop, or restart a service on a guest.",
+        "description": (
+            "Start, stop, or restart a service on a guest. This is a state-changing "
+            "action. The first call returns a confirmation-required result without "
+            "doing anything; call again with \"confirm\": true to actually perform it."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -234,10 +260,19 @@ TOOL_REGISTRY = {
                     "enum": ["start", "stop", "restart"],
                     "description": "The action to perform",
                 },
+                "confirm": {
+                    "type": "boolean",
+                    "description": (
+                        "Set to true only after the user has explicitly confirmed the action. "
+                        "Omit or set false to preview the action without executing it."
+                    ),
+                },
             },
             "required": ["service_id", "action"],
         },
-        "required_permission": "can_edit_services",
+        # H1: mirror the human services.control route, which requires BOTH
+        # can_view_services (services blueprint before_request) AND can_edit_services.
+        "required_permission": ["can_view_services", "can_edit_services"],
         "handler": _handle_restart_service,
     },
     "list_audit_logs": {
@@ -268,12 +303,31 @@ TOOL_REGISTRY = {
 }
 
 
+def _required_permissions(defn):
+    """Normalize a tool's required_permission into a list of permission names.
+
+    Supports None (no permission), a single string, or a list of strings so that
+    a tool can require ALL of several permissions (e.g. control_service mirrors the
+    human route by requiring both can_view_services and can_edit_services).
+    """
+    perm = defn["required_permission"]
+    if perm is None:
+        return []
+    if isinstance(perm, str):
+        return [perm]
+    return list(perm)
+
+
+def _user_has_permissions(user, perms):
+    """Return True only if the user has every permission in perms."""
+    return all(getattr(user, p, False) for p in perms)
+
+
 def get_tools_for_user(user):
     """Return Claude API tool definitions for tools the user has permission to use."""
     tools = []
     for name, defn in TOOL_REGISTRY.items():
-        perm = defn["required_permission"]
-        if perm is None or getattr(user, perm, False):
+        if _user_has_permissions(user, _required_permissions(defn)):
             tools.append({
                 "name": name,
                 "description": defn["description"],
@@ -287,11 +341,14 @@ def execute_tool(tool_name, tool_input, user):
     defn = TOOL_REGISTRY.get(tool_name)
     if not defn:
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
-    perm = defn["required_permission"]
-    if perm and not getattr(user, perm, False):
-        return json.dumps({"error": f"Permission denied: {perm} required"})
+    perms = _required_permissions(defn)
+    if not _user_has_permissions(user, perms):
+        missing = [p for p in perms if not getattr(user, p, False)]
+        return json.dumps({"error": f"Permission denied: {', '.join(missing)} required"})
     try:
         return defn["handler"](tool_input, user)
-    except Exception as e:
-        logger.error("Tool execution error (%s): %s", tool_name, e)
-        return json.dumps({"error": f"Tool execution failed: {e}"})
+    except Exception:
+        # M3: log the full exception with traceback server-side; return a generic
+        # message so internal details never reach the model or client.
+        logger.exception("Tool execution error (%s)", tool_name)
+        return json.dumps({"error": "Tool execution failed due to an internal error."})

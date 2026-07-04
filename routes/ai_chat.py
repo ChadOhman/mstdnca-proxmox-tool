@@ -1,6 +1,7 @@
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from flask import Blueprint, Response, flash, jsonify, redirect, request, stream_with_context, url_for
 from flask_login import current_user, login_required
@@ -13,9 +14,37 @@ logger = logging.getLogger(__name__)
 bp = Blueprint("ai_chat", __name__)
 
 
+def _strict_same_origin_check():
+    """Strict CSRF defense for state-changing /ai/* requests.
+
+    H2: the app-wide _csrf_origin_check in app.py ALLOWS unsafe requests that
+    carry no Origin/Referer header (to accommodate non-browser API clients).
+    The AI endpoints are only ever driven by the browser fetch() in
+    static/ai-chat.js, which always sends an Origin/Referer on same-origin POSTs.
+    So for /ai/* we REQUIRE the header to be present AND same-origin, closing the
+    header-absent bypass. Returns a 403 JSON response on failure, else None.
+    """
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    source = request.headers.get("Origin") or request.headers.get("Referer")
+    if not source:
+        logger.warning("AI CSRF: missing Origin/Referer on %s %s", request.method, request.path)
+        return jsonify({"error": "Missing Origin/Referer header"}), 403
+    src = urlparse(source)
+    req = urlparse(request.host_url)
+    if (src.scheme, src.netloc) != (req.scheme, req.netloc):
+        logger.warning("AI CSRF origin mismatch: source=%s expected=%s path=%s",
+                       source, request.host_url, request.path)
+        return jsonify({"error": "Cross-site request blocked"}), 403
+    return None
+
+
 @bp.before_request
 @login_required
 def _require_ai_access():
+    csrf_resp = _strict_same_origin_check()
+    if csrf_resp is not None:
+        return csrf_resp
     if not current_user.can_use_ai:
         if request.is_json or request.headers.get("Accept") == "text/event-stream":
             return jsonify({"error": "AI assistant access denied"}), 403
@@ -98,6 +127,12 @@ def chat():
 
         for _iteration in range(max_iterations):
             tool_calls_in_round = []
+            # B1: cache each tool's result keyed by its tool_use id so it is
+            # executed EXACTLY ONCE per request. The same cached result is reused
+            # when building the tool_result blocks sent back to Claude — executing
+            # a state-changing tool (e.g. control_service) a second time would
+            # issue a duplicate action and a duplicate audit entry.
+            tool_results_by_id = {}
             round_text = ""
 
             try:
@@ -111,8 +146,9 @@ def chat():
                         tool_calls_in_round.append(event)
                         yield f"data: {json.dumps({'type': 'tool_call', 'name': event['name'], 'input': event['input']})}\n\n"
 
-                        # Execute the tool
+                        # Execute the tool exactly once and cache the result.
                         result = execute_tool(event["name"], event["input"], current_user)
+                        tool_results_by_id[event["id"]] = result
                         yield f"data: {json.dumps({'type': 'tool_result', 'name': event['name'], 'result': result})}\n\n"
 
                     elif event["type"] == "done":
@@ -124,9 +160,11 @@ def chat():
                         yield f"data: {json.dumps({'type': 'done'})}\n\n"
                         return
 
-            except Exception as e:
-                logger.error("Chat stream error: %s", e)
-                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            except Exception:
+                # M3: log the full traceback server-side; return a generic message.
+                logger.exception("Chat stream error")
+                generic = "The AI assistant encountered an internal error."
+                yield f"data: {json.dumps({'type': 'error', 'message': generic})}\n\n"
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
@@ -147,14 +185,14 @@ def chat():
                     })
                 messages.append({"role": "assistant", "content": assistant_content})
 
-                # Add tool results
+                # Add tool results — reuse the cached result from the single
+                # execution above; do NOT execute the tool again.
                 tool_results = []
                 for tc in tool_calls_in_round:
-                    result = execute_tool(tc["name"], tc["input"], current_user)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tc["id"],
-                        "content": result,
+                        "content": tool_results_by_id[tc["id"]],
                     })
                 messages.append({"role": "user", "content": tool_results})
             else:
