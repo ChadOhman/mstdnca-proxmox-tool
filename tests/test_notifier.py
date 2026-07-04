@@ -21,9 +21,13 @@ import urllib.error
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from core.notifier import (
     _get_discord_config,
+    _get_notify_tag_ids,
     _send_discord,
+    guest_matches_notify_tags,
     send_app_update_notification,
     send_elk_update_notification,
     send_exporter_notification,
@@ -42,6 +46,18 @@ from core.notifier import (
     summarize_applied_packages,
 )
 from models import Setting, db
+
+
+@pytest.fixture(autouse=True)
+def _reset_notify_tags(app):
+    """Ensure the tag-scope filter never leaks between tests (session-scoped
+    in-memory DB is shared). Empty filter preserves prior behavior."""
+    with app.app_context():
+        Setting.set("discord_notify_tags", "")
+    yield
+    with app.app_context():
+        Setting.set("discord_notify_tags", "")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,17 +85,26 @@ def _make_http_error(code=400, reason="Bad Request", body=b""):
     return err
 
 
+def _make_tag(tag_id):
+    """A minimal tag stub exposing only the .id attribute the filter reads."""
+    tag = MagicMock()
+    tag.id = tag_id
+    return tag
+
+
 def _make_scan_result(
     guest_name="web01",
     guest_type="ct",
     total_updates=3,
     security_updates=0,
     status="success",
+    tag_ids=None,
 ):
     """Build a minimal scan-result-like object (plain namespace)."""
     guest = MagicMock()
     guest.name = guest_name
     guest.guest_type = guest_type
+    guest.tags = [_make_tag(tid) for tid in (tag_ids or [])]
 
     result = MagicMock()
     result.guest = guest
@@ -2101,3 +2126,280 @@ class TestSummarizeAppliedPackages:
 
     def test_empty_list_returns_zeroes(self, app):
         assert summarize_applied_packages([]) == (0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Tag-scoping: guest_matches_notify_tags / discord_notify_tags
+# ---------------------------------------------------------------------------
+
+class TestGuestMatchesNotifyTags:
+    def _set_tags(self, ids):
+        Setting.set("discord_notify_tags", ",".join(str(i) for i in ids))
+
+    def test_get_notify_tag_ids_empty(self, app):
+        with app.app_context():
+            Setting.set("discord_notify_tags", "")
+            assert _get_notify_tag_ids() == set()
+
+    def test_get_notify_tag_ids_parses_digits_only(self, app):
+        with app.app_context():
+            Setting.set("discord_notify_tags", "3, 7 ,x,")
+            assert _get_notify_tag_ids() == {3, 7}
+
+    def test_empty_filter_matches_any_guest(self, app):
+        with app.app_context():
+            Setting.set("discord_notify_tags", "")
+            guest_no_tags = MagicMock()
+            guest_no_tags.tags = []
+            guest_tagged = MagicMock()
+            guest_tagged.tags = [_make_tag(99)]
+            assert guest_matches_notify_tags(guest_no_tags) is True
+            assert guest_matches_notify_tags(guest_tagged) is True
+
+    def test_matching_tag_in_scope(self, app):
+        with app.app_context():
+            self._set_tags([3, 7])
+            guest = MagicMock()
+            guest.tags = [_make_tag(7)]
+            assert guest_matches_notify_tags(guest) is True
+
+    def test_non_matching_tag_out_of_scope(self, app):
+        with app.app_context():
+            self._set_tags([3, 7])
+            guest = MagicMock()
+            guest.tags = [_make_tag(5)]
+            assert guest_matches_notify_tags(guest) is False
+
+    def test_guest_with_no_tags_excluded_when_filter_set(self, app):
+        with app.app_context():
+            self._set_tags([3])
+            guest = MagicMock()
+            guest.tags = []
+            assert guest_matches_notify_tags(guest) is False
+
+
+class TestSendUpdateNotificationTagScoping:
+    def _enable_discord(self, app):
+        Setting.set("discord_enabled", "true")
+        Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+        Setting.set("discord_notify_updates", "true")
+        Setting.set("discord_notify_updates_security_only", "false")
+
+    def test_empty_filter_no_regression(self, app):
+        """Empty tag filter => behaves exactly as before (send happens)."""
+        with app.app_context():
+            self._enable_discord(app)
+            Setting.set("discord_notify_tags", "")
+
+        fake_resp = _make_urlopen_mock(status=204)
+        results = [_make_scan_result(guest_name="tag-noregress-guest", total_updates=5, tag_ids=[1])]
+        with patch("urllib.request.urlopen", return_value=fake_resp) as mock_open:
+            with app.app_context():
+                send_update_notification(results)
+
+        mock_open.assert_called_once()
+
+    def test_only_matching_guests_included(self, app):
+        with app.app_context():
+            self._enable_discord(app)
+            Setting.set("discord_notify_tags", "7")
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        results = [
+            _make_scan_result(guest_name="in-scope", total_updates=2, tag_ids=[7]),
+            _make_scan_result(guest_name="wrong-tag", total_updates=3, tag_ids=[5]),
+            _make_scan_result(guest_name="no-tags", total_updates=4, tag_ids=[]),
+        ]
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_update_notification(results)
+
+        assert len(captured) == 1
+        body = json.loads(captured[0].data.decode())
+        field_names = [f["name"] for f in body["embeds"][0]["fields"]]
+        assert len(field_names) == 1
+        assert any("in-scope" in n for n in field_names)
+        assert not any("wrong-tag" in n for n in field_names)
+        assert not any("no-tags" in n for n in field_names)
+
+    def test_no_matching_guests_sends_nothing(self, app):
+        with app.app_context():
+            self._enable_discord(app)
+            Setting.set("discord_notify_tags", "7")
+
+        results = [
+            _make_scan_result(guest_name="wrong-tag", total_updates=3, tag_ids=[5]),
+            _make_scan_result(guest_name="no-tags", total_updates=4, tag_ids=[]),
+        ]
+        with patch("urllib.request.urlopen") as mock_open:
+            with app.app_context():
+                send_update_notification(results)
+
+        mock_open.assert_not_called()
+
+    def test_fingerprint_computed_on_filtered_set(self, app):
+        """Changing which guests match the filter must re-trigger a send."""
+        with app.app_context():
+            self._enable_discord(app)
+            Setting.set("discord_notify_tags", "7")
+
+        fake_resp = _make_urlopen_mock(status=204)
+        results = [
+            _make_scan_result(guest_name="a", total_updates=2, tag_ids=[7]),
+            _make_scan_result(guest_name="b", total_updates=3, tag_ids=[5]),
+        ]
+
+        # First send with filter [7] — only 'a' is in scope.
+        with patch("urllib.request.urlopen", return_value=fake_resp):
+            with app.app_context():
+                send_update_notification(results)
+
+        # Broaden filter to include 'b'; the filtered set changes so a new
+        # notification must be sent (fingerprint reflects the filtered set).
+        with app.app_context():
+            Setting.set("discord_notify_tags", "5,7")
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_update_notification(results)
+
+        assert len(captured) == 1
+
+
+class TestServiceNotificationTagScoping:
+    """The scanner guards service notifications with guest_matches_notify_tags."""
+
+    def test_out_of_scope_guest_suppressed(self, app):
+        with app.app_context():
+            Setting.set("discord_notify_tags", "3")
+            guest = MagicMock()
+            guest.tags = [_make_tag(5)]
+            assert guest_matches_notify_tags(guest) is False
+
+    def test_in_scope_guest_allowed(self, app):
+        with app.app_context():
+            Setting.set("discord_notify_tags", "3")
+            guest = MagicMock()
+            guest.tags = [_make_tag(3)]
+            assert guest_matches_notify_tags(guest) is True
+
+
+class TestSaveDiscordTagScoping:
+    """save_discord persists selected tag ids; settings view round-trips them."""
+
+    def _make_tags(self):
+        from models import Tag
+        tags = []
+        for name in ("scope-a", "scope-b", "scope-c"):
+            t = Tag(name=f"{name}-{id(name)}")
+            db.session.add(t)
+            tags.append(t)
+        db.session.commit()
+        return tags
+
+    def test_persists_and_round_trips(self, auth_client, app):
+        with app.app_context():
+            tags = self._make_tags()
+            tag_ids = [t.id for t in tags]
+
+        resp = auth_client.post(
+            "/settings/discord",
+            data={
+                "discord_enabled": "on",
+                "discord_notify_updates": "on",
+                # select two of the three tags; include a bogus id to be ignored
+                "discord_notify_tags": [str(tag_ids[0]), str(tag_ids[2]), "999999"],
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code in (302, 303)
+
+        with app.app_context():
+            stored = Setting.get("discord_notify_tags", "")
+            stored_ids = {int(x) for x in stored.split(",") if x}
+            assert stored_ids == {tag_ids[0], tag_ids[2]}
+
+        # The settings GET view should reflect the stored selection.
+        page = auth_client.get("/settings/")
+        assert page.status_code == 200
+
+        # Cleanup
+        with app.app_context():
+            from models import Tag
+            for tid in tag_ids:
+                t = db.session.get(Tag, tid)
+                if t:
+                    db.session.delete(t)
+            Setting.set("discord_notify_tags", "")
+            db.session.commit()
+
+    def test_empty_selection_stores_empty_string(self, auth_client, app):
+        with app.app_context():
+            Setting.set("discord_notify_tags", "1,2")
+
+        resp = auth_client.post(
+            "/settings/discord",
+            data={"discord_enabled": "on", "discord_notify_updates": "on"},
+            follow_redirects=False,
+        )
+        assert resp.status_code in (302, 303)
+
+        with app.app_context():
+            assert Setting.get("discord_notify_tags", "SENTINEL") == ""
+
+
+class TestAutoUpdateTagScoping:
+    """Applied-updates notifications only include in-scope guests."""
+
+    def _enable(self, app):
+        Setting.set("discord_enabled", "true")
+        Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+        Setting.set("discord_notify_updates", "true")
+
+    def test_applied_notification_filtered_by_guard(self, app):
+        """The apply call sites append/send only when the guest matches. Here we
+        assert the guard the call sites use behaves per-guest."""
+        with app.app_context():
+            self._enable(app)
+            Setting.set("discord_notify_tags", "3")
+
+            in_scope = MagicMock()
+            in_scope.tags = [_make_tag(3)]
+            out_scope = MagicMock()
+            out_scope.tags = [_make_tag(9)]
+
+            # Simulate the call-site filtering used in scheduler/api apply paths.
+            apply_results = []
+            for guest, name in ((in_scope, "keep"), (out_scope, "drop")):
+                if guest_matches_notify_tags(guest):
+                    apply_results.append({"name": name, "type": "CT", "applied": 1, "security": 0})
+
+            assert [r["name"] for r in apply_results] == ["keep"]
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_updates_applied_notification(apply_results)
+
+        assert len(captured) == 1
+        body = json.loads(captured[0].data.decode())
+        field_names = [f["name"] for f in body["embeds"][0]["fields"]]
+        assert any("keep" in n for n in field_names)
+        assert not any("drop" in n for n in field_names)

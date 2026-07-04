@@ -79,12 +79,14 @@ def _run_auto_updates(app):
                 from models import db
                 record_update_history(guest, pending_pkgs, initiated_by="scheduler")
                 db.session.commit()
-                apply_results.append({
-                    "name": guest.name,
-                    "type": guest.guest_type.upper(),
-                    "applied": applied_count,
-                    "security": security_count,
-                })
+                from core.notifier import guest_matches_notify_tags
+                if guest_matches_notify_tags(guest):
+                    apply_results.append({
+                        "name": guest.name,
+                        "type": guest.guest_type.upper(),
+                        "applied": applied_count,
+                        "security": security_count,
+                    })
             else:
                 logger.error(f"Auto-update failed for {guest.name}: {output}")
 

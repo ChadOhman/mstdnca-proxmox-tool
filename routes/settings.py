@@ -74,6 +74,7 @@ def _get_settings_dict():
         "discord_notify_prometheus_upgrade_started": Setting.get("discord_notify_prometheus_upgrade_started", "true"),
         "discord_notify_prometheus_upgrade_result": Setting.get("discord_notify_prometheus_upgrade_result", "true"),
         "discord_notify_app": Setting.get("discord_notify_app", "true"),
+        "discord_notify_tags": Setting.get("discord_notify_tags", ""),
         "scan_interval": Setting.get("scan_interval", "6"),
         "scan_enabled": Setting.get("scan_enabled", "true"),
         "discovery_interval": Setting.get("discovery_interval", "4"),
@@ -172,7 +173,10 @@ def index():
         except OSError:
             geoip_db_info = {"path": geoip_db_path, "size_mb": None}
 
-    return render_template("settings.html", settings=settings, update_available=False, update_version=None, latest_release=latest_release, geoip_db_info=geoip_db_info, **backup_ctx)
+    from models import Tag
+    tags = Tag.query.order_by(Tag.name).all()
+
+    return render_template("settings.html", settings=settings, update_available=False, update_version=None, latest_release=latest_release, geoip_db_info=geoip_db_info, tags=tags, **backup_ctx)
 
 
 @bp.route("/discord", methods=["POST"])
@@ -201,6 +205,14 @@ def save_discord():
     notify_prometheus_upgrade_result = "discord_notify_prometheus_upgrade_result" in request.form
     notify_app = "discord_notify_app" in request.form
 
+    # Tag-scoping: only notify about guests carrying one of the selected tags.
+    # The multiselect submits zero or more values under discord_notify_tags.
+    # Empty selection => notify for all guests (backward-compatible default).
+    from models import Tag
+    raw_tag_ids = [t for t in request.form.getlist("discord_notify_tags") if t.strip().isdigit()]
+    valid_tag_ids = {str(tag.id) for tag in Tag.query.all()}
+    selected_tag_ids = [t for t in raw_tag_ids if t in valid_tag_ids]
+
     if webhook_url:
         Setting.set("discord_webhook_url", webhook_url)
     Setting.set("discord_enabled", "true" if enabled else "false")
@@ -225,6 +237,7 @@ def save_discord():
     Setting.set("discord_notify_prometheus_upgrade_started", "true" if notify_prometheus_upgrade_started else "false")
     Setting.set("discord_notify_prometheus_upgrade_result", "true" if notify_prometheus_upgrade_result else "false")
     Setting.set("discord_notify_app", "true" if notify_app else "false")
+    Setting.set("discord_notify_tags", ",".join(selected_tag_ids))
 
     log_action("settings_discord_save", "settings", resource_name="discord")
     db.session.commit()

@@ -21,6 +21,24 @@ def _get_discord_config():
     return {"webhook_url": webhook_url, "enabled": enabled}
 
 
+def _get_notify_tag_ids():
+    raw = Setting.get("discord_notify_tags", "") or ""
+    return {int(t) for t in raw.split(",") if t.strip().isdigit()}
+
+
+def guest_matches_notify_tags(guest):
+    """Return True if this guest should generate Discord notifications.
+
+    A guest is in scope if it carries at least one tag whose id is in the
+    configured ``discord_notify_tags`` set (OR semantics). An empty/unset
+    filter means every guest is in scope, preserving prior behavior.
+    """
+    wanted = _get_notify_tag_ids()
+    if not wanted:
+        return True
+    return any(tag.id in wanted for tag in guest.tags)
+
+
 def _send_discord(embeds):
     """POST embeds to the configured Discord webhook. Returns (ok, message)."""
     config = _get_discord_config()
@@ -83,6 +101,8 @@ def send_update_notification(scan_results):
     for result in scan_results:
         if result.status == "success" and result.total_updates > 0:
             if security_only and result.security_updates == 0:
+                continue
+            if not guest_matches_notify_tags(result.guest):
                 continue
             guests_with_updates.append(result)
             total_updates += result.total_updates

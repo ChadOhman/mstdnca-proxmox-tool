@@ -1241,8 +1241,9 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
             # Notifications on state transitions
             if status == "failed" and old_status != "failed":
                 try:
-                    from core.notifier import send_service_failed_notification
-                    send_service_failed_notification(guest.name, service_key)
+                    from core.notifier import guest_matches_notify_tags, send_service_failed_notification
+                    if guest_matches_notify_tags(guest):
+                        send_service_failed_notification(guest.name, service_key)
                 except Exception:
                     pass
                 try:
@@ -1252,8 +1253,9 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
                     pass
             elif status == "running" and old_status == "failed":
                 try:
-                    from core.notifier import send_service_recovery_notification
-                    send_service_recovery_notification(guest.name, service_key)
+                    from core.notifier import guest_matches_notify_tags, send_service_recovery_notification
+                    if guest_matches_notify_tags(guest):
+                        send_service_recovery_notification(guest.name, service_key)
                 except Exception:
                     pass
                 try:
@@ -1274,8 +1276,9 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
             db.session.add(svc)
             if status == "failed":
                 try:
-                    from core.notifier import send_service_failed_notification
-                    send_service_failed_notification(guest.name, service_key)
+                    from core.notifier import guest_matches_notify_tags, send_service_failed_notification
+                    if guest_matches_notify_tags(guest):
+                        send_service_failed_notification(guest.name, service_key)
                 except Exception:
                     pass
                 try:

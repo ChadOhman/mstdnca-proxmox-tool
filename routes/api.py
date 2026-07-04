@@ -158,6 +158,7 @@ def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None)
                                 # `applied_at == now` (tz-aware) match always fails and
                                 # would report "0 update(s) applied".
                                 from core.notifier import (
+                                    guest_matches_notify_tags,
                                     send_updates_applied_notification,
                                     summarize_applied_packages,
                                 )
@@ -171,12 +172,13 @@ def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None)
                                 guest.status = "up-to-date"
                                 db.session.commit()
                                 try:
-                                    send_updates_applied_notification([{
-                                        "name": guest.name,
-                                        "type": guest.guest_type.upper(),
-                                        "applied": applied_count,
-                                        "security": security_count,
-                                    }])
+                                    if guest_matches_notify_tags(guest):
+                                        send_updates_applied_notification([{
+                                            "name": guest.name,
+                                            "type": guest.guest_type.upper(),
+                                            "applied": applied_count,
+                                            "security": security_count,
+                                        }])
                                 except Exception:
                                     pass
                                 job.finish(True)
@@ -223,6 +225,7 @@ def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None)
                             # naive column; a post-commit tz-aware equality match
                             # always fails -> "0 update(s) applied").
                             from core.notifier import (
+                                guest_matches_notify_tags,
                                 send_updates_applied_notification,
                                 summarize_applied_packages,
                             )
@@ -236,12 +239,13 @@ def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None)
                             guest.status = "up-to-date"
                             db.session.commit()
                             try:
-                                send_updates_applied_notification([{
-                                    "name": guest.name,
-                                    "type": guest.guest_type.upper(),
-                                    "applied": applied_count,
-                                    "security": security_count,
-                                }])
+                                if guest_matches_notify_tags(guest):
+                                    send_updates_applied_notification([{
+                                        "name": guest.name,
+                                        "type": guest.guest_type.upper(),
+                                        "applied": applied_count,
+                                        "security": security_count,
+                                    }])
                             except Exception:
                                 pass
                             job.finish(True)
