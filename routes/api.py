@@ -612,6 +612,8 @@ JOB_TYPE_LABELS = {
     "snapshot": "Creating Snapshot",
     "snapshot_delete": "Deleting Snapshot",
     "rollback": "Rolling Back",
+    "clone": "Cloning Guest",
+    "migrate": "Migrating Guest",
 }
 
 
