@@ -110,6 +110,7 @@ def create_app(test_config=None):
     from routes.services import bp as services_bp
     from routes.settings import bp as settings_bp
     from routes.terminal import bp as terminal_bp
+    from routes.trends import bp as trends_bp
     from routes.unifi import bp as unifi_bp
     from routes.unpoller import bp as unpoller_bp
 
@@ -137,6 +138,7 @@ def create_app(test_config=None):
     app.register_blueprint(ipmi_bp, url_prefix="/ipmi")
     app.register_blueprint(unpoller_bp, url_prefix="/unpoller")
     app.register_blueprint(api_v1_bp, url_prefix="/api/v1")
+    app.register_blueprint(trends_bp, url_prefix="/trends")
 
     # Initialize WebSocket for terminal
     from routes.terminal import init_websocket

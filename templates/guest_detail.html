@@ -34,6 +34,9 @@
         <form method="post" action="/api/scan/{{ guest.id }}" class="d-inline">
             <button type="submit" class="btn btn-outline-primary"><i class="bi bi-arrow-clockwise"></i> Scan</button>
         </form>
+        <a href="{{ url_for('trends.index', guest_id=guest.id) }}" class="btn btn-outline-info">
+            <i class="bi bi-graph-up-arrow"></i> Update History
+        </a>
         {% if guest.pending_updates()|length > 0 %}
         <form method="post" action="/api/apply/{{ guest.id }}" class="d-inline" data-confirm="Apply all updates?">
             <button type="submit" class="btn btn-warning"><i class="bi bi-download"></i> Apply All Updates</button>

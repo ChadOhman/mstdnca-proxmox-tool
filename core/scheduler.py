@@ -63,15 +63,22 @@ def _run_auto_updates(app):
             dist_upgrade = window.update_type == "dist-upgrade"
             logger.info(f"Auto-updating {guest.name} (window: {window.name})")
 
-            # Capture counts BEFORE apply_updates commits: applied_at is a naive
-            # column, so comparing a reloaded applied_at against a tz-aware
-            # timestamp afterwards is unreliable (offset-naive vs offset-aware).
+            # Capture the pending packages (and counts) BEFORE apply_updates commits:
+            # applied_at is a naive column, so comparing a reloaded applied_at against
+            # a tz-aware timestamp afterwards is unreliable (offset-naive vs
+            # offset-aware), and apply_updates() marks these same rows "applied" as
+            # part of its own commit — so the list must be snapshotted up front.
             from core.notifier import summarize_applied_packages
-            applied_count, security_count = summarize_applied_packages(guest.pending_updates())
+            pending_pkgs = list(guest.pending_updates())
+            applied_count, security_count = summarize_applied_packages(pending_pkgs)
 
             ok, output = apply_updates(guest, dist_upgrade=dist_upgrade)
             if ok:
                 logger.info(f"Auto-update successful for {guest.name}")
+                from core.update_history import record_update_history
+                from models import db
+                record_update_history(guest, pending_pkgs, initiated_by="scheduler")
+                db.session.commit()
                 apply_results.append({
                     "name": guest.name,
                     "type": guest.guest_type.upper(),
