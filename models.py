@@ -751,6 +751,31 @@ class RevokedToken(db.Model):
         return f"<RevokedToken jti={self.jti}>"
 
 
+class UserSession(db.Model):
+    """A server-side record of a browser login session (Flask-Login cookie session).
+
+    Lets users and admins see and revoke active sessions.  Only a hash of the
+    opaque session id is stored; the plaintext id lives in the Flask session
+    cookie.  A session is considered active when ``revoked`` is False.
+    """
+    __tablename__ = "user_sessions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    # SHA-256 hex digest of the opaque session id (never store the raw id).
+    session_id_hash = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    ip_address = db.Column(db.String(45), nullable=True)
+    user_agent = db.Column(db.String(256), nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    last_seen_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    revoked = db.Column(db.Boolean, default=False, nullable=False, index=True)
+
+    user = db.relationship("User", backref=db.backref("sessions", cascade="all, delete-orphan"))
+
+    def __repr__(self):
+        return f"<UserSession user={self.user_id} revoked={self.revoked}>"
+
+
 class PushWebhook(db.Model):
     """Mobile push notification webhook registration."""
     __tablename__ = "push_webhooks"

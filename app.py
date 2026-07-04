@@ -166,6 +166,12 @@ def create_app(test_config=None):
     from auth.cloudflare_access import init_cf_access
     init_cf_access(app)
 
+    # Server-side session tracking (revocation + last-seen). Registered after the
+    # bypass/CF hooks so those may authenticate first; the hook ignores sessions
+    # they establish (no tracked session id) and never runs for /api/v1.
+    from auth.session_manager import init_session_tracking
+    init_session_tracking(app)
+
     # Custom Jinja filters
     import zoneinfo
     from datetime import datetime

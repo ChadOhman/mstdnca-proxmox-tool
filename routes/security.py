@@ -4,7 +4,7 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 
 from auth.audit import log_action
-from models import AuditLog, Credential, Role, ScanResult, Setting, Tag, TagUnifiNetwork, User, db
+from models import AuditLog, Credential, Role, ScanResult, Setting, Tag, TagUnifiNetwork, User, UserSession, db
 
 # Strict hex-color validation: #RRGGBB only
 _HEX_COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
@@ -94,10 +94,36 @@ def index():
         .all()
     )
 
+    # Active login sessions across all users (user-management permission is
+    # already enforced by _require_access for the users view).
+    active_sessions = (
+        UserSession.query
+        .options(db.joinedload(UserSession.user))
+        .filter_by(revoked=False)
+        .order_by(UserSession.last_seen_at.desc())
+        .all()
+    )
+
     return render_template("security.html", users=users, roles=roles, tags=tags,
                            settings=settings, audit_pagination=audit_pagination,
                            unifi_networks_available=unifi_networks_available,
-                           credentials=credentials, recent_scans=recent_scans)
+                           credentials=credentials, recent_scans=recent_scans,
+                           active_sessions=active_sessions)
+
+
+@bp.route("/sessions/<int:session_pk>/revoke", methods=["POST"])
+def revoke_user_session(session_pk):
+    """Admins with user-management permission may revoke any user's session."""
+    record = UserSession.query.get_or_404(session_pk)
+    target_user = record.user
+    if not record.revoked:
+        record.revoked = True
+        log_action("session_revoke", "user_session", resource_id=record.id,
+                   resource_name=target_user.username if target_user else None,
+                   details={"target_user_id": record.user_id})
+        db.session.commit()
+        flash("Session revoked.", "success")
+    return redirect(url_for("security.index"))
 
 
 # --- User management ---

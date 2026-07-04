@@ -9,7 +9,8 @@ from flask import Blueprint, flash, redirect, render_template, request, session,
 from flask_login import current_user, login_required, login_user, logout_user
 
 from auth.audit import log_action
-from models import User, db
+from auth.session_manager import revoke_current_session, start_session
+from models import User, UserSession, db
 
 bp = Blueprint("auth", __name__)
 
@@ -97,6 +98,7 @@ def login():
             session.clear()
             login_user(user, remember="remember" in request.form)
             user.last_login_at = datetime.now(timezone.utc)
+            start_session(user)
             log_action("login", "user", resource_id=user.id, resource_name=user.username)
             db.session.commit()
             next_page = request.args.get("next")
@@ -119,6 +121,7 @@ def login():
 @login_required
 def logout():
     log_action("logout", "user", resource_id=current_user.id, resource_name=current_user.username)
+    revoke_current_session()
     db.session.commit()
     is_cf_user = current_user.created_via == "cloudflare"
     logout_user()
@@ -171,4 +174,62 @@ def profile():
         db.session.commit()
         flash("Profile saved.", "success")
         return redirect(url_for("auth.profile"))
-    return render_template("profile.html")
+
+    from auth.session_manager import current_session_record
+
+    current_record = current_session_record()
+    current_session_id = current_record.id if current_record else None
+    sessions = (
+        UserSession.query
+        .filter_by(user_id=current_user.id, revoked=False)
+        .order_by(UserSession.last_seen_at.desc())
+        .all()
+    )
+    return render_template(
+        "profile.html",
+        sessions=sessions,
+        current_session_id=current_session_id,
+    )
+
+
+@bp.route("/sessions/<int:session_pk>/revoke", methods=["POST"])
+@login_required
+def revoke_session(session_pk):
+    """Revoke one of the current user's own sessions."""
+    record = UserSession.query.get_or_404(session_pk)
+    if record.user_id != current_user.id:
+        flash("You can only revoke your own sessions.", "error")
+        return redirect(url_for("auth.profile"))
+
+    if not record.revoked:
+        record.revoked = True
+        log_action("session_revoke", "user_session", resource_id=record.id,
+                   resource_name=current_user.username)
+        db.session.commit()
+        flash("Session revoked.", "success")
+    return redirect(url_for("auth.profile"))
+
+
+@bp.route("/sessions/revoke-others", methods=["POST"])
+@login_required
+def revoke_other_sessions():
+    """Revoke all of the current user's sessions except the current one."""
+    from auth.session_manager import current_session_record
+
+    current_record = current_session_record()
+    current_id = current_record.id if current_record else None
+
+    others = UserSession.query.filter_by(user_id=current_user.id, revoked=False)
+    if current_id is not None:
+        others = others.filter(UserSession.id != current_id)
+    count = 0
+    for record in others.all():
+        record.revoked = True
+        count += 1
+    if count:
+        log_action("session_revoke_others", "user_session",
+                   resource_id=current_user.id, resource_name=current_user.username,
+                   details={"count": count})
+        db.session.commit()
+    flash(f"Revoked {count} other session(s)." if count else "No other sessions to revoke.", "success")
+    return redirect(url_for("auth.profile"))
