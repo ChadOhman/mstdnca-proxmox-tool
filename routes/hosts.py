@@ -2,13 +2,13 @@ import logging
 import re
 import threading as _threading
 
-from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
+from flask import Blueprint, flash, jsonify, redirect, render_template, request, session, url_for
 from flask_login import current_user, login_required
 
 from auth.audit import log_action
 from auth.credential_store import encrypt
 from clients.proxmox_api import ProxmoxClient
-from models import AuditLog, Credential, Guest, ProxmoxHost, Tag, db
+from models import AuditLog, Credential, Guest, HostUpdatePackage, ProxmoxHost, Tag, db
 
 # In-memory state for SSH-based apt apply jobs
 _apply_jobs = {}   # host_id -> {"log": [], "running": bool, "success": bool|None, "cancelled": bool}
@@ -29,6 +29,16 @@ _bulk_apply_lock = _threading.Lock()
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("hosts", __name__)
+
+_VALID_HOST_FILTERS = {"pve", "pbs", "updates", "security", "no_ssh"}
+
+_HOST_FILTER_LABELS = {
+    "pve": "Proxmox VE",
+    "pbs": "Proxmox Backup Server",
+    "updates": "Pending Updates",
+    "security": "Security Updates",
+    "no_ssh": "No SSH Credential",
+}
 
 
 @bp.before_request
@@ -61,8 +71,61 @@ def _require_login():
 
 @bp.route("/")
 def index():
-    hosts = ProxmoxHost.query.all()
-    return render_template("hosts.html", hosts=hosts)
+    search = request.args.get("q", None)
+    if search is not None:
+        # User explicitly changed the search box — save it (even if now empty)
+        session["host_search"] = search
+    else:
+        search = session.get("host_search", "")
+
+    status_filter = request.args.get("filter", None)
+    if status_filter is not None:
+        if status_filter not in _VALID_HOST_FILTERS:
+            status_filter = ""
+        session["host_status_filter"] = status_filter
+    else:
+        status_filter = session.get("host_status_filter", "")
+        if status_filter not in _VALID_HOST_FILTERS:
+            status_filter = ""
+
+    query = ProxmoxHost.query
+
+    if search:
+        like = f"%{search}%"
+        query = query.filter(
+            db.or_(
+                ProxmoxHost.name.ilike(like),
+                ProxmoxHost.hostname.ilike(like),
+            )
+        )
+
+    if status_filter == "pve":
+        query = query.filter(ProxmoxHost.host_type == "pve")
+    elif status_filter == "pbs":
+        query = query.filter(ProxmoxHost.host_type == "pbs")
+    elif status_filter == "updates":
+        query = query.filter(ProxmoxHost.host_update_packages.any(HostUpdatePackage.status == "pending"))
+    elif status_filter == "security":
+        query = query.filter(
+            ProxmoxHost.host_update_packages.any(db.and_(
+                HostUpdatePackage.status == "pending",
+                HostUpdatePackage.severity == "critical",
+            ))
+        )
+    elif status_filter == "no_ssh":
+        query = query.filter(ProxmoxHost.ssh_credential_id.is_(None))
+
+    hosts = query.order_by(ProxmoxHost.name).all()
+    has_any_hosts = ProxmoxHost.query.first() is not None
+
+    return render_template(
+        "hosts.html",
+        hosts=hosts,
+        has_any_hosts=has_any_hosts,
+        current_search=search,
+        current_filter=status_filter,
+        filter_label=_HOST_FILTER_LABELS.get(status_filter),
+    )
 
 
 @bp.route("/<int:host_id>")
