@@ -100,6 +100,14 @@
                         </a>
                     </li>
                     {% endif %}
+                    {% if current_user.can_moderate %}
+                    <li class="nav-item">
+                        <a class="nav-link {% if request.blueprint == 'moderation' %}active{% endif %}" href="/moderation"
+                           {% if request.blueprint == 'moderation' %}aria-current="page"{% endif %}>
+                            <i class="bi bi-shield-exclamation"></i> Moderation
+                        </a>
+                    </li>
+                    {% endif %}
                     {% if current_user.can_manage_users %}
                     <li class="nav-item">
                         <a class="nav-link {% if request.blueprint == 'security' %}active{% endif %}" href="/security"

@@ -41,6 +41,7 @@ def create_app(test_config=None):
     with app.app_context():
         db.create_all()
         _migrate_ipmi_columns()
+        _migrate_moderation_columns()
         _migrate_smcipmi_to_ipmi_exporter()
         _seed_roles()
         _ensure_default_admin()
@@ -102,6 +103,7 @@ def create_app(test_config=None):
     from routes.jibri import bp as jibri_bp
     from routes.jitsi import bp as jitsi_bp
     from routes.mastodon import bp as mastodon_bp
+    from routes.moderation import bp as moderation_bp
     from routes.peertube import bp as peertube_bp
     from routes.prometheus_app import bp as prometheus_app_bp
     from routes.prometheus_metrics import bp as prometheus_metrics_bp
@@ -133,6 +135,7 @@ def create_app(test_config=None):
     app.register_blueprint(unifi_bp, url_prefix="/unifi")
     app.register_blueprint(api_bp, url_prefix="/api")
     app.register_blueprint(applications_bp, url_prefix="/applications")
+    app.register_blueprint(moderation_bp, url_prefix="/moderation")
     app.register_blueprint(prometheus_metrics_bp)
     app.register_blueprint(prometheus_app_bp, url_prefix="/prometheus")
     app.register_blueprint(ipmi_bp, url_prefix="/ipmi")
@@ -313,6 +316,24 @@ def _add_column_if_missing(table, column, col_type="BOOLEAN DEFAULT 0"):
     except Exception as e:
         db.session.rollback()
         logger.debug("Migration check for %s.%s: %s", table, column, e)
+
+
+def _migrate_moderation_columns():
+    """Add the moderation permission column to roles created before this feature.
+
+    Grants can_moderate to the admin-tier built-in roles (super_admin, admin) so
+    existing deployments match the DEFAULT_ROLES seed.
+    """
+    try:
+        existing = {row[1] for row in db.session.execute(db.text("PRAGMA table_info(roles)")).fetchall()}
+        if "can_moderate" not in existing:
+            logger.info("Adding column roles.can_moderate")
+            db.session.execute(db.text("ALTER TABLE roles ADD COLUMN can_moderate BOOLEAN DEFAULT 0"))
+            db.session.execute(db.text("UPDATE roles SET can_moderate = 1 WHERE name IN ('super_admin', 'admin')"))
+            db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        logger.debug("Migration check for roles.can_moderate: %s", e)
 
 
 def _migrate_ipmi_columns():
