@@ -18,3 +18,4 @@ PyJWT[crypto]==2.13.0
 gunicorn==26.0.0
 geoip2==5.2.0
 prometheus-client==0.25.0
+anthropic==0.85.0

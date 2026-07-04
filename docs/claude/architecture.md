@@ -2,7 +2,7 @@
 
 ## App Factory
 
-`app.py::create_app()` — initializes DB, runs schema migrations, registers 16 blueprints, starts APScheduler, sets up auth middleware (Cloudflare Access + local network bypass), CSRF origin check, and security headers.
+`app.py::create_app()` — initializes DB, runs schema migrations, registers 21+ blueprints, starts APScheduler, sets up auth middleware (Cloudflare Access + local network bypass), CSRF origin check, and security headers.
 
 **Single-worker constraint:** The collaboration system (`core/collaboration.py`) uses in-process state for presence tracking and terminal sharing. Must run with gunicorn `-w 1` or `--worker-class gthread`. Multi-worker deployments silently break collaboration features.
 
@@ -35,7 +35,8 @@
 │   ├── ghost.py            # Ghost CMS upgrades
 │   ├── peertube.py         # PeerTube upgrades
 │   ├── elk.py              # Elk (Mastodon web client) upgrades
-│   └── jitsi.py            # Jitsi Meet install/upgrades
+│   ├── jitsi.py            # Jitsi Meet install/upgrades
+│   └── jibri.py            # Jibri recording & streaming
 ├── routes/                 # Flask blueprints (one per feature)
 ├── templates/              # Jinja2 templates
 ├── static/                 # CSS (style.css)
@@ -52,7 +53,7 @@ One file per feature area in `routes/`:
 - `terminal.py` — WebSocket SSH terminal (Flask-Sock), 1800s idle timeout
 - `security.py` — user/role/tag management, `_safe_int()` helper
 - `services.py` — service monitoring (mastodon, sidekiq, postgres, redis)
-- `mastodon.py`, `ghost.py`, `peertube.py`, `elk.py`, `jitsi.py` — application upgrade routes
+- `mastodon.py`, `ghost.py`, `peertube.py`, `elk.py`, `jitsi.py`, `jibri.py` — application upgrade/management routes
 - `api.py` — REST API endpoints
 - `dashboard.py`, `credentials.py`, `settings.py`, `schedules.py`, `unifi.py`, `applications.py`
 

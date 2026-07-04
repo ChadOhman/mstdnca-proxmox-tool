@@ -57,6 +57,7 @@ class Role(db.Model):
         "can_view_ipmi",
         "can_manage_ipmi",
         "can_moderate",
+        "can_use_ai",
     ]
 
     PERMISSION_LABELS = {
@@ -76,6 +77,7 @@ class Role(db.Model):
         "can_view_ipmi": "View IPMI (Hardware Health)",
         "can_manage_ipmi": "Manage IPMI (Power Control)",
         "can_moderate": "Moderate Applications",
+        "can_use_ai": "Use AI Assistant",
     }
 
     BASE_TIER_LEVELS = {"viewer": 1, "operator": 2, "admin": 3}
@@ -104,6 +106,7 @@ class Role(db.Model):
     can_view_ipmi = db.Column(db.Boolean, default=False)
     can_manage_ipmi = db.Column(db.Boolean, default=False)
     can_moderate = db.Column(db.Boolean, default=False)
+    can_use_ai = db.Column(db.Boolean, default=False)
 
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -125,28 +128,28 @@ DEFAULT_ROLES = [
      "can_view_hosts": True, "can_manage_hosts": True, "can_manage_guests": True,
      "can_restart_unifi": True, "can_view_audit_log": True, "can_view_services": True, "can_edit_services": True,
      "can_view_unifi": True, "can_view_ipmi": True, "can_manage_ipmi": True,
-     "can_moderate": True},
+     "can_moderate": True, "can_use_ai": True},
     {"name": "admin", "display_name": "Admin", "level": 3, "is_builtin": True,
      "can_ssh": True, "can_update": True, "can_manage_users": True,
      "can_manage_settings": False, "can_manage_credentials": False,
      "can_view_hosts": True, "can_manage_hosts": True, "can_manage_guests": True,
      "can_restart_unifi": True, "can_view_audit_log": True, "can_view_services": True, "can_edit_services": True,
      "can_view_unifi": True, "can_view_ipmi": True, "can_manage_ipmi": True,
-     "can_moderate": True},
+     "can_moderate": True, "can_use_ai": True},
     {"name": "operator", "display_name": "Operator", "level": 2, "is_builtin": True,
      "can_ssh": True, "can_update": True, "can_manage_users": False,
      "can_manage_settings": False, "can_manage_credentials": False,
      "can_view_hosts": True, "can_manage_hosts": False, "can_manage_guests": False,
      "can_restart_unifi": False, "can_view_audit_log": False, "can_view_services": False, "can_edit_services": False,
      "can_view_unifi": False, "can_view_ipmi": True, "can_manage_ipmi": False,
-     "can_moderate": False},
+     "can_moderate": False, "can_use_ai": False},
     {"name": "viewer", "display_name": "Viewer", "level": 1, "is_builtin": True,
      "can_ssh": False, "can_update": False, "can_manage_users": False,
      "can_manage_settings": False, "can_manage_credentials": False,
      "can_view_hosts": False, "can_manage_hosts": False, "can_manage_guests": False,
      "can_restart_unifi": False, "can_view_audit_log": False, "can_view_services": False, "can_edit_services": False,
      "can_view_unifi": False, "can_view_ipmi": False, "can_manage_ipmi": False,
-     "can_moderate": False},
+     "can_moderate": False, "can_use_ai": False},
 ]
 
 
@@ -289,6 +292,12 @@ class User(UserMixin, db.Model):
         if self.is_super_admin:
             return True
         return self.role_obj.can_moderate if self.role_obj else False
+
+    @property
+    def can_use_ai(self):
+        if self.is_super_admin:
+            return True
+        return self.role_obj.can_use_ai if self.role_obj else False
 
     @property
     def role_display(self):
@@ -753,6 +762,56 @@ db.Index(
     HostMetricSnapshot.host_id,
     HostMetricSnapshot.captured_at,
 )
+
+
+class AIChatSession(db.Model):
+    __tablename__ = "ai_chat_sessions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    title = db.Column(db.String(256), nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
+                           onupdate=lambda: datetime.now(timezone.utc))
+
+    user = db.relationship("User", backref="ai_chat_sessions")
+    messages = db.relationship("AIChatMessage", backref="session", lazy=True,
+                               cascade="all, delete-orphan", order_by="AIChatMessage.created_at")
+
+    def __repr__(self):
+        return f"<AIChatSession {self.id} user={self.user_id}>"
+
+
+class AIChatMessage(db.Model):
+    __tablename__ = "ai_chat_messages"
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("ai_chat_sessions.id", ondelete="CASCADE"),
+                           nullable=False, index=True)
+    role = db.Column(db.String(16), nullable=False)  # user, assistant
+    content = db.Column(db.Text, nullable=False)
+    tool_use = db.Column(db.JSON, nullable=True)  # tool call/result data
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def __repr__(self):
+        return f"<AIChatMessage {self.role} session={self.session_id}>"
+
+
+db.Index("ix_ai_msg_session_created", AIChatMessage.session_id, AIChatMessage.created_at)
+
+
+class AIUsageLog(db.Model):
+    __tablename__ = "ai_usage_logs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("ai_chat_sessions.id"), nullable=True)
+    input_tokens = db.Column(db.Integer, default=0)
+    output_tokens = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+    def __repr__(self):
+        return f"<AIUsageLog user={self.user_id} in={self.input_tokens} out={self.output_tokens}>"
 
 
 class UnifiLogEntry(db.Model):

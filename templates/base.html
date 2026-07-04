@@ -195,6 +195,17 @@
     <!-- Activity toast container (bottom-right) -->
     <div id="collabToastStack" class="position-fixed bottom-0 end-0 p-3" style="z-index:1200; max-width:320px; pointer-events:none;" aria-live="polite" aria-relevant="additions" aria-atomic="false"></div>
 
+    {% if current_user.is_authenticated and current_user.can_use_ai %}
+    <!-- AI Assistant toggle button -->
+    <button class="btn btn-outline-info position-fixed rounded-circle d-flex align-items-center justify-content-center"
+            type="button" data-bs-toggle="offcanvas" data-bs-target="#aiChatSidebar"
+            aria-label="Open AI Assistant" title="AI Assistant"
+            style="bottom: 80px; right: 20px; z-index: 1100; width: 48px; height: 48px;">
+        <i class="bi bi-robot" style="font-size: 1.2rem;"></i>
+    </button>
+    {% include "ai_sidebar.html" %}
+    {% endif %}
+
     <!-- Accessible confirm modal (replaces browser confirm() dialogs) -->
     <div class="modal fade" id="confirmModal" tabindex="-1" aria-modal="true" role="dialog" aria-labelledby="confirmModalLabel">
         <div class="modal-dialog">
@@ -712,6 +723,9 @@
         });
     })();
     </script>
+    {% if current_user.is_authenticated and current_user.can_use_ai %}
+    <script src="{{ url_for('static', filename='ai-chat.js') }}"></script>
+    {% endif %}
     {% block scripts %}{% endblock %}
 </body>
 </html>

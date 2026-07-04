@@ -20,7 +20,7 @@ from flask import (
 from flask_login import current_user, login_required
 
 from auth.audit import log_action
-from auth.credential_store import encrypt
+from auth.credential_store import decrypt, encrypt
 from config import BASE_DIR, DATA_DIR
 from core.app_update_auth import github_auth_headers, github_token_env
 from models import Setting, db
@@ -96,6 +96,11 @@ def _get_settings_dict():
         "unpoller_enabled": Setting.get("unpoller_enabled", "false"),
         "unpoller_metric_prefix": Setting.get("unpoller_metric_prefix", "unpoller"),
         "unpoller_site_name": Setting.get("unpoller_site_name", "default"),
+        "ai_enabled": Setting.get("ai_enabled", "false"),
+        "ai_api_key": Setting.get("ai_api_key", ""),
+        "ai_model": Setting.get("ai_model", "claude-sonnet-4-20250514"),
+        "ai_max_tokens": Setting.get("ai_max_tokens", "4096"),
+        "ai_daily_request_limit": Setting.get("ai_daily_request_limit", "100"),
         "app_auto_update": Setting.get("app_auto_update", "false"),
         "app_update_branch": Setting.get("app_update_branch", ""),
         "github_token": Setting.get("github_token", ""),
@@ -880,3 +885,51 @@ def backup_database():
             pass
 
     return resp
+
+
+@bp.route("/ai", methods=["POST"])
+def save_ai():
+    enabled = "ai_enabled" in request.form
+    api_key = request.form.get("ai_api_key", "").strip()
+    model = request.form.get("ai_model", "claude-sonnet-4-20250514").strip()
+    max_tokens = request.form.get("ai_max_tokens", "4096").strip()
+    daily_limit = request.form.get("ai_daily_request_limit", "100").strip()
+
+    Setting.set("ai_enabled", "true" if enabled else "false")
+    if api_key:
+        Setting.set("ai_api_key", encrypt(api_key))
+    Setting.set("ai_model", model)
+    Setting.set("ai_max_tokens", max_tokens)
+    Setting.set("ai_daily_request_limit", daily_limit)
+
+    from clients.claude_client import invalidate_cached_client
+    invalidate_cached_client()
+
+    log_action("settings_ai_save", "settings", resource_name="ai")
+    db.session.commit()
+    flash("AI Assistant settings saved.", "success")
+    return redirect(url_for("settings.index"))
+
+
+@bp.route("/ai/test", methods=["POST"])
+def test_ai():
+    save_ai()
+
+    encrypted_key = Setting.get("ai_api_key", "")
+    model = Setting.get("ai_model", "claude-sonnet-4-20250514")
+
+    if not encrypted_key:
+        flash("API key is required.", "error")
+        return redirect(url_for("settings.index"))
+
+    api_key = decrypt(encrypted_key)
+    from clients.claude_client import ClaudeClient
+    client = ClaudeClient(api_key, model=model)
+    ok, msg = client.test_connection()
+
+    if ok:
+        flash(f"AI connection successful: {msg}", "success")
+    else:
+        flash(f"AI connection failed: {msg}", "error")
+
+    return redirect(url_for("settings.index"))

@@ -211,6 +211,7 @@ class TestInitScheduler:
             "ipmi_snapshot_purge",
             "revoked_token_prune",
             "moderation_check",
+            "ai_upgrade_analysis",
         }
         assert expected_ids == registered_ids
 
