@@ -5,15 +5,20 @@ A datacenter-wide administration tool for Proxmox environments. Runs as an LXC c
 ## Features
 
 - **Datacenter-wide update scanning** — Scan all hosts, VMs, and CTs for available APT updates with severity detection
-- **Web SSH terminal** — Browser-based SSH sessions to any managed guest
+- **Update history & trends** — Per-host update tracking with a trends page showing update activity over time
+- **Web SSH terminal** — Browser-based SSH sessions to any managed guest, with real-time terminal sharing
 - **UniFi network visibility** — View all UniFi devices and clients with subnet filtering and device restart support
-- **Mastodon (glitch-soc) upgrade automation** — One-click upgrades with PGBouncer swap, git stash/pop, Proxmox snapshots, and auto-upgrade support
-- **Discord notifications** — Webhook alerts for available updates, upgrade results, and service failures, with severity breakdown
+- **IPMI monitoring** — Sensor readings and power status for bare-metal hosts
+- **Service monitoring** — Track systemd service state across guests with failure/recovery alerts
+- **Application upgrade automation** — One-click upgrades for Mastodon (glitch-soc), Ghost, PeerTube, Elk, Jitsi Meet/Jibri, and Prometheus exporters, with Proxmox snapshots and auto-upgrade support
+- **Moderation tools** — PeerTube/Mastodon email cross-check for spam account detection
+- **Discord notifications** — Webhook alerts for available updates, upgrade results, and service failures, with severity breakdown and tag scoping
 - **Scheduled scans & auto-updates** — Configurable scan intervals and maintenance windows
 - **4-tier role-based access control** — Super Admin, Admin, Operator, and Viewer roles with tag-based guest filtering
 - **Encrypted credential storage** — SSH passwords and API tokens encrypted at rest with Fernet
 - **Cloudflare Zero Trust** — Optional SSO authentication via Cloudflare Access
 - **Local network bypass** — Trusted subnets skip authentication entirely
+- **Config export/import & backups** — Export settings and back up the app database from the web UI
 - **Self-updating** — Check for updates and apply them from the web UI
 
 ## Quick Start
@@ -23,7 +28,7 @@ A datacenter-wide administration tool for Proxmox environments. Runs as an LXC c
 Run this on any Proxmox host to create a ready-to-use CT:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/ChadOhman/mstdnca-proxmox-tool/main/create-ct.sh)" -- \
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ChadOhman/mstdnca-proxmox-tool/main/scripts/create-ct.sh)" -- \
   --hostname mstdnca \
   --storage local-lvm \
   --memory 1024 \
@@ -36,7 +41,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/ChadOhman/mstdnca-proxmo
 With a static IP:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/ChadOhman/mstdnca-proxmox-tool/main/create-ct.sh)" -- \
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ChadOhman/mstdnca-proxmox-tool/main/scripts/create-ct.sh)" -- \
   --hostname mstdnca \
   --ip 10.0.0.100/24 \
   --gateway 10.0.0.1
@@ -45,7 +50,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/ChadOhman/mstdnca-proxmo
 With Cloudflare Tunnel support:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/ChadOhman/mstdnca-proxmox-tool/main/create-ct.sh)" -- \
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ChadOhman/mstdnca-proxmox-tool/main/scripts/create-ct.sh)" -- \
   --hostname mstdnca \
   --ip dhcp \
   --cloudflared
@@ -74,7 +79,7 @@ Create a Debian 12 or Ubuntu 22.04+ CT in Proxmox, then inside the CT:
 ```bash
 apt-get update && apt-get install -y git
 git clone https://github.com/ChadOhman/mstdnca-proxmox-tool.git /tmp/mstdnca
-cd /tmp/mstdnca && bash setup.sh
+cd /tmp/mstdnca && bash scripts/setup.sh
 ```
 
 ### First Login
@@ -82,9 +87,13 @@ cd /tmp/mstdnca && bash setup.sh
 Once deployed, open `http://<CT-IP>:5000` in your browser.
 
 - **Username:** `admin`
-- **Password:** `admin`
+- **Password:** randomly generated on first start — retrieve it with:
 
-**Change the default password immediately** via the user dropdown menu.
+```bash
+journalctl -u mstdnca-proxmox-tool | grep -A3 'DEFAULT ADMIN'
+```
+
+**Change the generated password after first login** via the user dropdown menu.
 
 ## Configuration
 
@@ -143,9 +152,9 @@ All logged-in users can view the Network page. Only admins and super admins can 
 
 ## Mastodon Upgrades
 
-The **Mastodon** page automates glitch-soc upgrades:
+The **Applications > Mastodon** page automates glitch-soc upgrades:
 
-1. Navigate to **Mastodon** and configure:
+1. Navigate to **Applications > Mastodon** and configure:
    - **Mastodon App Guest** — the VM/CT running puma/sidekiq
    - **PostgreSQL Guest** — the VM/CT running your database
    - **PGBouncer host/port** — your normal DB connection (via PGBouncer)
@@ -219,7 +228,7 @@ If you already have `cloudflared` running on another CT, VM, or your Proxmox hos
 
 If you don't have a tunnel yet:
 
-1. Run `bash setup.sh --cloudflared` inside the MCAT CT to install cloudflared
+1. Run `bash scripts/setup.sh --cloudflared` inside the MCAT CT to install cloudflared
 2. `cloudflared tunnel login` and `cloudflared tunnel create mstdnca`
 3. Configure the tunnel to route to `http://localhost:5000`
 4. Create an Access Application in the Zero Trust dashboard
@@ -243,7 +252,7 @@ Go to **Settings > Application** and click **Check for Updates**. If a new versi
 ### From the Command Line
 
 ```bash
-bash /opt/mstdnca/update.sh
+bash /opt/mstdnca/scripts/update.sh
 ```
 
 This backs up the database, pulls the latest code, updates dependencies, and restarts the service.
@@ -252,20 +261,23 @@ This backs up the database, pulls the latest code, updates dependencies, and res
 
 ```
 Flask Web UI (:5000)
-├── Dashboard ─── update overview across datacenter
-├── Hosts ─────── Proxmox node management + guest discovery
-├── Guests ────── VM/CT list with update status
-├── Terminal ──── browser-based SSH (xterm.js + WebSocket)
-├── Network ───── UniFi device/client visibility
-├── Mastodon ──── glitch-soc upgrade automation
-├── Credentials ─ encrypted SSH key/password storage
-├── Schedules ─── maintenance windows for auto-updates
-├── Users ─────── 4-tier RBAC with tag-based filtering
-└── Settings ──── Discord, scan, UniFi, CF Access, local bypass
+├── Dashboard ────── update overview across datacenter
+├── Hosts ────────── PVE/PBS node management + guest discovery
+├── Guests ───────── VM/CT list with update status
+├── Update History ─ per-host update tracking and trends
+├── Terminal ─────── browser-based SSH (xterm.js + WebSocket)
+├── Network ──────── UniFi device/client visibility
+├── IPMI ─────────── sensor readings for bare-metal hosts
+├── Schedules ────── maintenance windows for auto-updates
+├── Services ─────── systemd service monitoring across guests
+├── Applications ─── upgrades for Mastodon, Ghost, PeerTube, Elk, Jitsi, exporters
+├── Moderation ───── PeerTube/Mastodon spam account cross-check
+├── Security ─────── users, roles, tags, sessions, audit log, credentials
+└── Settings ─────── Discord, scan, UniFi, CF Access, local bypass, backups
 
 Background Services (APScheduler)
 ├── Update scanner ─── periodic APT check across all guests
-├── Mastodon checker ─ polls GitHub for new releases
+├── App checkers ───── poll GitHub for new releases (Mastodon, Ghost, ...)
 ├── Auto-updater ───── applies updates during maintenance windows
 └── Discord notifier ─ webhook alerts for updates & upgrades
 ```
@@ -283,23 +295,24 @@ Installed automatically by `setup.sh`:
 
 ### Python Dependencies
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| Flask | 3.1.0 | Web framework |
-| Flask-SQLAlchemy | 3.1.1 | Database ORM integration |
-| Flask-Login | 0.6.3 | Session-based authentication |
-| flask-sock | 0.7.0 | WebSocket support for SSH terminal |
-| SQLAlchemy | 2.0.36 | Database ORM |
-| proxmoxer | 2.1.0 | Proxmox API client |
-| requests | 2.32.3 | HTTP client (used by proxmoxer and UniFi API) |
-| paramiko | 3.5.0 | SSH client for remote command execution |
-| cryptography | 44.0.0 | Fernet encryption for stored credentials |
-| APScheduler | 3.10.4 | Background job scheduling |
-| Werkzeug | 3.1.3 | WSGI utilities |
-| PyJWT[crypto] | 2.10.1 | JWT validation for Cloudflare Access |
-| gunicorn | 23.0.0 | Production WSGI server |
-| gevent | latest | Async worker for WebSocket support |
-| gevent-websocket | latest | WebSocket protocol for gunicorn |
+Pinned versions live in [requirements.txt](requirements.txt).
+
+| Package | Purpose |
+|---------|---------|
+| Flask / Werkzeug | Web framework |
+| Flask-SQLAlchemy / SQLAlchemy | Database ORM |
+| Flask-Login | Session-based authentication |
+| flask-sock | WebSocket support for SSH terminal |
+| proxmoxer | Proxmox API client |
+| requests | HTTP client (used by proxmoxer and UniFi API) |
+| paramiko | SSH client for remote command execution |
+| cryptography | Fernet encryption for stored credentials |
+| APScheduler | Background job scheduling |
+| PyJWT[crypto] | JWT validation for Cloudflare Access |
+| geoip2 | GeoIP lookups for UniFi clients |
+| prometheus-client | Metrics endpoint |
+| gunicorn | Production WSGI server |
+| gevent | Async worker for WebSocket support (installed by `setup.sh`) |
 
 ### Frontend (CDN, no install needed)
 
@@ -319,7 +332,7 @@ Installed automatically by `setup.sh`:
 - **Database:** SQLite
 - **Connections:** proxmoxer (Proxmox API), paramiko (SSH), UniFi Controller API
 - **Security:** Fernet encryption, PyJWT (Cloudflare Access), 4-tier RBAC
-- **Production server:** gunicorn with gevent-websocket worker
+- **Production server:** gunicorn with gevent worker
 
 ## File Layout
 
@@ -331,4 +344,4 @@ Installed automatically by `setup.sh`:
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU Affero General Public License v3.0 — see the [LICENSE](LICENSE) file for details.

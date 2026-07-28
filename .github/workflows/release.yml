@@ -48,19 +48,19 @@ jobs:
           echo "" >> release_notes.md
           echo "**Option 1: One-command CT creation (run on Proxmox host):**" >> release_notes.md
           echo '```bash' >> release_notes.md
-          echo "bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/ChadOhman/mstdnca-proxmox-tool/main/create-ct.sh)\" -- --hostname mstdnca --ip dhcp" >> release_notes.md
+          echo "bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/ChadOhman/mstdnca-proxmox-tool/main/scripts/create-ct.sh)\" -- --hostname mstdnca --ip dhcp" >> release_notes.md
           echo '```' >> release_notes.md
           echo "" >> release_notes.md
           echo "**Option 2: Manual setup (inside an existing Debian/Ubuntu CT):**" >> release_notes.md
           echo '```bash' >> release_notes.md
           echo "apt-get update && apt-get install -y git" >> release_notes.md
           echo "git clone https://github.com/ChadOhman/mstdnca-proxmox-tool.git /tmp/mstdnca" >> release_notes.md
-          echo "cd /tmp/mstdnca && bash setup.sh" >> release_notes.md
+          echo "cd /tmp/mstdnca && bash scripts/setup.sh" >> release_notes.md
           echo '```' >> release_notes.md
           echo "" >> release_notes.md
           echo "**Upgrade existing installation:**" >> release_notes.md
           echo '```bash' >> release_notes.md
-          echo "bash /opt/mstdnca/update.sh" >> release_notes.md
+          echo "bash /opt/mstdnca/scripts/update.sh" >> release_notes.md
           echo '```' >> release_notes.md
           echo "Or use the **Check for Updates** button in Settings." >> release_notes.md
           echo "" >> release_notes.md

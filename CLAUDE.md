@@ -6,7 +6,7 @@ Flask-based Proxmox datacenter administration tool (Python 3.13). Manages VMs/LX
 
 ```bash
 make install-dev   # Install dev dependencies
-make test          # Full test suite (814 tests, in-memory SQLite)
+make test          # Full test suite (~1600 tests, in-memory SQLite)
 make lint          # ruff check .
 make security      # bandit + pip-audit
 make all           # lint + security + test
@@ -22,7 +22,7 @@ Single test: `FLASK_SECRET_KEY=dev-secret DATABASE_URL="sqlite:////tmp/mstdnca-d
 
 ## Lint / Style
 
-- Ruff: `line-length = 120`, `target-version = "py310"`
+- Ruff: `line-length = 120`, `target-version = "py313"`
 - Rules: E, F, W, B (bugbear), S (bandit/security)
 - `routes/terminal.py` allows S602; `tests/**/*.py` allows S101
 
@@ -33,3 +33,4 @@ Detailed docs live in [docs/claude/](docs/claude/) — read on demand, not upfro
 - [architecture.md](docs/claude/architecture.md) — app factory, directory structure, blueprints, DB, auth, frontend
 - [patterns.md](docs/claude/patterns.md) — permission gates, audit logging, settings cache, import conventions
 - [testing.md](docs/claude/testing.md) — fixtures, coverage, test environment setup
+- [adapting.md](docs/claude/adapting.md) — forking/retooling this for different infrastructure: what's bespoke vs generic
