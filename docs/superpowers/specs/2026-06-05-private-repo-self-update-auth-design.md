@@ -1,7 +1,9 @@
 # Private-Repo Self-Update Authentication — Design
 
 **Date:** 2026-06-05
-**Status:** Approved (design)
+**Status:** Approved (design). **Historical note (2026-07-28):** the repo is
+now public again, so the GitHub token is no longer required for self-update —
+the token remains supported but optional.
 **Components:** `routes/settings.py`, `templates/settings.html`, `scripts/update.sh`
 
 ## Problem
