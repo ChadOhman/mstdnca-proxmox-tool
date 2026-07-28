@@ -127,8 +127,8 @@ The **Network** page shows all devices and clients from your Ubiquiti UniFi cont
 ### Setup
 
 1. Go to **Settings > UniFi Controller** (super admin only)
-2. Enter your controller URL (e.g. `https://10.0.4.1`), username, and password
-3. Set the site name (default: `default`) and optionally filter by subnet (e.g. `10.0.4.0/24`)
+2. Enter your controller URL (e.g. `https://192.168.1.1`), username, and password
+3. Set the site name (default: `default`) and optionally filter by subnet (e.g. `192.168.1.0/24`)
 4. Check **UDM / UniFi OS** if running on a UDM, UDM Pro, or UniFi OS Console; uncheck for standalone controller software
 5. Click **Test Connection** to verify, then enable and save
 

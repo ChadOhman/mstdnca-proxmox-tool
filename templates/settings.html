@@ -179,7 +179,7 @@
                         <input type="hidden" name="unifi_base_url" value="{{ settings.unifi_base_url or '' }}">
                         <input type="text" class="form-control text-muted" id="unifiBaseUrl" value="hidden" disabled>
                         {% else %}
-                        <input type="text" class="form-control" id="unifiBaseUrl" name="unifi_base_url" value="{{ settings.unifi_base_url or '' }}" placeholder="https://10.0.4.1">
+                        <input type="text" class="form-control" id="unifiBaseUrl" name="unifi_base_url" value="{{ settings.unifi_base_url or '' }}" placeholder="https://192.168.1.1">
                         {% endif %}
                     </div>
                     <div class="row mb-3">
@@ -208,7 +208,7 @@
                             <input type="hidden" name="unifi_filter_subnet" value="{{ settings.unifi_filter_subnet or '' }}">
                             <input type="text" class="form-control font-monospace text-muted" value="hidden" disabled>
                             {% else %}
-                            <input type="text" class="form-control font-monospace" name="unifi_filter_subnet" value="{{ settings.unifi_filter_subnet or '' }}" placeholder="10.0.4.0/24 (blank=all)">
+                            <input type="text" class="form-control font-monospace" name="unifi_filter_subnet" value="{{ settings.unifi_filter_subnet or '' }}" placeholder="192.168.1.0/24 (blank=all)">
                             {% endif %}
                         </div>
                     </div>
