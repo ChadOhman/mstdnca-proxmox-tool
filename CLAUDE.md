@@ -33,3 +33,4 @@ Detailed docs live in [docs/claude/](docs/claude/) — read on demand, not upfro
 - [architecture.md](docs/claude/architecture.md) — app factory, directory structure, blueprints, DB, auth, frontend
 - [patterns.md](docs/claude/patterns.md) — permission gates, audit logging, settings cache, import conventions
 - [testing.md](docs/claude/testing.md) — fixtures, coverage, test environment setup
+- [adapting.md](docs/claude/adapting.md) — forking/retooling this for different infrastructure: what's bespoke vs generic
