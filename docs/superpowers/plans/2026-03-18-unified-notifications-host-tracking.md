@@ -1448,7 +1448,7 @@ Review and update any internal API endpoint documentation affected by the change
 - [ ] **Step 6: Commit wiki changes**
 
 ```bash
-cd c:/tmp/mstdnca-proxmox-tool.wiki
+cd /path/to/mstdnca-proxmox-tool.wiki
 git add -A
 git commit -m "docs: add unified notifications, host update tracking, and service state change documentation"
 ```
@@ -1456,7 +1456,7 @@ git commit -m "docs: add unified notifications, host update tracking, and servic
 - [ ] **Step 7: Commit main repo docs**
 
 ```bash
-cd c:/Users/ChadOhman/Documents/GitHub/lambnet-proxmox-tool/lambnet-proxmox-tool
+cd /path/to/mstdnca-proxmox-tool
 git add docs/
 git commit -m "docs: add implementation plan for unified notifications feature"
 ```

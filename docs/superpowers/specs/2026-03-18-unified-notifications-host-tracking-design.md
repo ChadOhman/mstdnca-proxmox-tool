@@ -81,9 +81,9 @@ For host packages, there is no separate security advisory database like with gue
 Title: "Updates applied"
 Description: "85 update(s) applied across 3 guest(s)."
 Fields:
-  lambnet-pt (CT): 70 applied (17 security)
-  mstdnca-srv1 (VM): 10 applied (1 security)
-  agnes (PVE): 5 applied
+  ct-app1 (CT): 70 applied (17 security)
+  web01 (VM): 10 applied (1 security)
+  pve1 (PVE): 5 applied
 Footer: "Log in to MCAT to review details."
 ```
 

@@ -235,7 +235,7 @@ Hostname: $HOSTNAME
 CT Root Password: $CT_ROOT_PASS
 Web UI: ${WEB_URL}
 App Username: admin
-App Password: admin (change after first login)
+App Password: generated on first start (see: journalctl -u mstdnca-proxmox-tool | grep -A3 'DEFAULT ADMIN')
 App Directory: /opt/mstdnca
 Data Directory: /var/lib/mstdnca
 Provisioned: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -254,9 +254,9 @@ if [ -n "$CT_IP" ]; then
     echo " Web UI:        ${WEB_URL}"
 fi
 echo " App Username:  admin"
-echo " App Password:  admin"
+echo " App Password:  generated on first start (run 'journalctl -u mstdnca-proxmox-tool' in the CT to view it)"
 echo ""
-echo " IMPORTANT: Change the default app password after first login!"
+echo " IMPORTANT: Change the generated app password after first login!"
 echo " NOTE: All details have been saved to the CT notes in Proxmox."
 echo ""
 echo " Proxmox commands:"
