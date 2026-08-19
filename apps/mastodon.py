@@ -26,6 +26,18 @@ logger = logging.getLogger(__name__)
 # Prepend this to any command that invokes ruby, bundle, or bundler-installed executables.
 _RBENV_PATH = "export PATH=$HOME/.rbenv/bin:$HOME/.rbenv/shims:$PATH"
 
+# Lifts the session statement_timeout for migrations only. The mastodon role carries a
+# server-side statement_timeout, and the heavy migrations blow straight past it — rebuilding
+# the account_summaries materialized view, then converting it to a table. A cancelled
+# statement aborts the whole run and leaves the schema stranded mid-upgrade, which is
+# silent until something restarts. libpq reads PGOPTIONS at connect time, so this overrides
+# the role default for the migration session and nothing else.
+_MIGRATE_PGOPTIONS = 'PGOPTIONS="-c statement_timeout=0"'
+
+# Migrations that rebuild materialized views run for far longer than ordinary steps, and an
+# SSH read timeout mid-migration is indistinguishable from a failure. Ten minutes is not enough.
+_MIGRATE_TIMEOUT = 1800
+
 
 def _check_version_range(installed, requirement):
     """Simple semver range check. Supports >=, ^, and plain version.
@@ -1204,8 +1216,9 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             # 2h. Pre-deployment migrations
             log("--- Pre-deployment database migrations ---")
             stdout, stderr, code = ssh.execute_sudo(
-                f"su - {user} -c '{_RBENV_PATH}; cd {app_dir} && RAILS_ENV=production SKIP_POST_DEPLOYMENT_MIGRATIONS=true bundle exec rails db:migrate'",
-                timeout=600,
+                f"su - {user} -c '{_RBENV_PATH}; cd {app_dir} && {_MIGRATE_PGOPTIONS} "
+                f"RAILS_ENV=production SKIP_POST_DEPLOYMENT_MIGRATIONS=true bundle exec rails db:migrate'",
+                timeout=_MIGRATE_TIMEOUT,
             )
             _log_cmd_output(log, stdout, stderr, code)
             if code != 0:
@@ -1260,8 +1273,9 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             # 2n. Post-deployment migrations
             log("--- Post-deployment database migrations ---")
             stdout, stderr, code = ssh.execute_sudo(
-                f"su - {user} -c '{_RBENV_PATH}; cd {app_dir} && RAILS_ENV=production bundle exec rails db:migrate'",
-                timeout=600,
+                f"su - {user} -c '{_RBENV_PATH}; cd {app_dir} && {_MIGRATE_PGOPTIONS} "
+                f"RAILS_ENV=production bundle exec rails db:migrate'",
+                timeout=_MIGRATE_TIMEOUT,
             )
             _log_cmd_output(log, stdout, stderr, code)
             if code != 0:
