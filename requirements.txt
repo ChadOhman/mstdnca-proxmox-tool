@@ -11,7 +11,7 @@ requests==2.34.2
 paramiko==5.0.0
 # cryptography 48.0.1 fixes GHSA-537c-gmf6-5ccf (flagged by pip-audit against
 # 46.0.7). paramiko 5.0.0 and PyJWT[crypto] 2.13.0 both accept cryptography 48.x.
-cryptography==49.0.0
+cryptography==50.0.0
 APScheduler==3.11.3
 Werkzeug==3.1.8
 PyJWT[crypto]==2.13.0
