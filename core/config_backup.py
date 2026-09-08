@@ -4,12 +4,25 @@ This module handles the tool's own configuration — NOT the guest data it backs
 up elsewhere.  It produces a JSON snapshot of hosts, guests (config fields),
 tags, roles, and application settings, and can re-apply that snapshot.
 
-SECURITY-CRITICAL: decrypted secrets are NEVER exported.  Encrypted secret
-columns and secret-bearing settings are excluded entirely (see
-``_SECRET_SETTING_KEYS`` and the per-model field allowlists below).  On import,
-secrets are never restored — administrators must re-enter credentials.
+SECURITY-CRITICAL:
+- Export redaction is RULE-BASED, not a denylist: any Setting whose key looks
+  secret-shaped (``_SECRET_KEY_PATTERN``) or whose value looks like Fernet
+  ciphertext is redacted, on top of an explicit extra set. New secret-bearing
+  settings are caught automatically without needing a code change here.
+- Import uses an ALLOWLIST-style blocklist for auth-critical settings
+  (``_AUTH_CRITICAL_SETTING_KEYS``) so a tampered/shared export can never
+  disable auth, and interval settings are bounds-checked rather than trusted.
+- Importing role permissions and host connection fields is opt-in
+  (``import_roles`` / ``import_hosts``); when unchecked those sections are
+  left untouched.  Overwriting an existing host's connection fields always
+  clears its stored credential so a repointed host can't leak the old secret.
+- Secrets are never restored — administrators must re-enter credentials.
+- The whole import is applied atomically: writes go through the session
+  without per-row commits, and the caller commits once (or not at all, on
+  error).
 """
 
+import re
 import sqlite3
 import tempfile
 
@@ -29,12 +42,55 @@ from models import (
 # backward-incompatible way.
 EXPORT_VERSION = 1
 
-# Setting keys that hold secrets (encrypted values or credential-bearing URLs).
-# These are excluded from export and never written on import.
-_SECRET_SETTING_KEYS = frozenset({
-    "unifi_password",        # Fernet-encrypted
-    "github_token",          # Fernet-encrypted
-    "discord_webhook_url",   # URL embeds the webhook secret token
+# Any Setting key matching this pattern is treated as secret-bearing and is
+# redacted on export / never written on import, regardless of what the key is
+# called by future features. Catches *_password, *_passwd, *_secret, *_token,
+# *_api_key/apikey, *_private_key, and anything with "webhook" in it.
+_SECRET_KEY_PATTERN = re.compile(
+    r"(password|passwd|secret|token|api[_-]?key|private[_-]?key|webhook)", re.IGNORECASE
+)
+
+# Explicit extra keys to redact even if a future rename dodges the pattern
+# above. Kept as a belt-and-suspenders backstop, not the primary mechanism.
+_EXTRA_SECRET_SETTING_KEYS = frozenset()
+
+# Fernet tokens are urlsafe-base64 and always start with a version byte that
+# encodes as "gAAAAA..." — used as a second, value-based redaction signal so
+# an encrypted setting is caught even if its key doesn't look secret-shaped.
+_FERNET_LIKE_RE = re.compile(r"^gAAAAA[A-Za-z0-9_=-]{20,}$")
+
+
+def _looks_like_secret_key(key):
+    return bool(_SECRET_KEY_PATTERN.search(key)) or key in _EXTRA_SECRET_SETTING_KEYS
+
+
+def _looks_like_secret_value(value):
+    return isinstance(value, str) and bool(_FERNET_LIKE_RE.match(value))
+
+
+# Settings that gate or drive authentication, network trust, or the app's own
+# self-update mechanism. These are never written by import even though they
+# don't match the secret pattern — a tampered export must not be able to
+# disable auth, widen the trusted-proxy list, or repoint self-update.
+_AUTH_CRITICAL_SETTING_KEYS = frozenset({
+    "trusted_subnets",
+    "local_bypass_enabled",
+    "cf_access_enabled",
+    "cf_access_bypass_local_auth",
+    "cf_access_audience",
+    "cf_access_auto_provision",
+    "cf_access_team_domain",
+    "app_auto_update",
+    "app_update_branch",
+})
+
+# Interval-type settings: validated against core.scheduler.INTERVAL_BOUNDS
+# rather than blanket-skipped, since they're legitimate to import but an
+# out-of-range value could otherwise wedge a background job.
+_INTERVAL_SETTING_KEYS = frozenset({
+    "scan_interval", "discovery_interval", "service_check_interval",
+    "unifi_api_poll_interval", "prometheus_collect_interval",
+    "moderation_check_interval_hours",
 })
 
 # Host config fields that are safe to export (no secrets).  Explicitly EXCLUDES
@@ -44,6 +100,11 @@ _HOST_FIELDS = (
     "verify_ssl", "host_type", "ipmi_enabled", "ipmi_address", "ipmi_username",
     "ipmi_verify_ssl",
 )
+
+# Host fields that carry a stored secret, cleared whenever an existing host's
+# connection fields are overwritten by import so a repointed host can never
+# send the old credential to a new endpoint.
+_HOST_SECRET_FIELDS = ("encrypted_password", "api_token_secret", "ipmi_password")
 
 # Guest config fields that are safe to export.  Guests hold no secrets directly
 # (credentials live in the Credential table, referenced by id which we do not
@@ -69,9 +130,14 @@ def _model_to_dict(obj, fields):
 def build_export():
     """Build the export document (a JSON-serializable dict).
 
-    Never includes decrypted secrets.  Encrypted columns and secret settings
-    are omitted; the ``settings`` map has secret keys replaced with a
-    placeholder so importers can see that a value existed without leaking it.
+    Never includes decrypted secrets.  Encrypted columns are omitted at the
+    model-field-allowlist level (see ``_HOST_FIELDS`` / ``_GUEST_FIELDS``);
+    settings are redacted by rule (see ``_looks_like_secret_key`` /
+    ``_looks_like_secret_value``) rather than a fixed denylist, so a new
+    secret-bearing setting is caught automatically. Redacted keys are replaced
+    with a placeholder so importers can see that a value existed without
+    leaking it — this also covers Fernet ciphertext, which is treated as a
+    secret even when the key name doesn't look secret-shaped.
     """
     hosts = [
         _model_to_dict(h, _HOST_FIELDS)
@@ -99,7 +165,7 @@ def build_export():
 
     settings = {}
     for s in Setting.query.order_by(Setting.key).all():
-        if s.key in _SECRET_SETTING_KEYS:
+        if _looks_like_secret_key(s.key) or _looks_like_secret_value(s.value):
             # Record that a secret exists, but never its value.
             settings[s.key] = "***REDACTED***"
         else:
@@ -135,12 +201,32 @@ def _validate_document(doc):
             _require(isinstance(item, dict), f"{section}[{i}] must be an object.")
 
 
-def apply_import(doc):
-    """Validate ``doc`` and upsert hosts, tags, guests, and settings.
+def apply_import(doc, import_roles=False, import_hosts=False):
+    """Validate ``doc`` and upsert tags, guests, hosts, roles, and settings.
 
-    Secrets are NEVER imported.  Roles are validated but only their permission
-    flags / display fields are upserted for non-builtin roles (builtin roles are
-    left untouched to avoid privilege drift).  Returns a summary dict of counts.
+    Secrets are NEVER imported.  Auth-critical settings (trusted subnets,
+    local-bypass, Cloudflare Access, self-update source) are always skipped
+    regardless of ``import_roles``/``import_hosts``, and interval settings are
+    bounds-checked rather than trusted verbatim.
+
+    ``import_roles`` and ``import_hosts`` are opt-in and default to False:
+    - When ``import_roles`` is False, the roles section is ignored entirely
+      (no role is created or modified).
+    - When ``import_hosts`` is False, existing hosts are left untouched (their
+      connection fields are never overwritten); new hosts may still be
+      created with connection fields, since a new host has no stored
+      credential to leak. When ``import_hosts`` is True and an existing host's
+      connection fields are overwritten, that host's stored credential is
+      cleared in the same transaction so it can't be repointed to a new
+      endpoint while still holding the old secret.
+
+    Writes go through the session without per-row commits — the caller is
+    responsible for committing once, and for rolling back the whole session on
+    any exception, so an import either fully applies or leaves no changes.
+
+    Returns a summary dict: counts of applied items plus lists of settings
+    skipped (secret/auth-critical/invalid-interval) and hosts skipped because
+    ``import_hosts`` was not set, for the caller to report to the user.
 
     Raises ImportError_ on malformed input; the caller is responsible for
     rolling back the session on error.
@@ -148,6 +234,9 @@ def apply_import(doc):
     _validate_document(doc)
 
     counts = {"hosts": 0, "tags": 0, "guests": 0, "settings": 0, "roles": 0}
+    skipped_settings = []
+    skipped_hosts = []
+    skipped_roles = 0
 
     # --- Tags first (guests reference them by name) ---
     for item in doc["tags"]:
@@ -172,6 +261,11 @@ def apply_import(doc):
         counts["tags"] += 1
 
     # --- Hosts (referenced by guests via name) ---
+    # New hosts may always be created with connection fields (no stored
+    # credential exists yet to leak). Overwriting an EXISTING host's
+    # connection fields requires the import_hosts opt-in, and always clears
+    # that host's stored credential so it can't be repointed to a new
+    # endpoint while still carrying the old secret.
     valid_host_cols = {c.key for c in sa_inspect(ProxmoxHost).columns}
     for item in doc["hosts"]:
         name = (item.get("name") or "").strip()
@@ -182,6 +276,19 @@ def apply_import(doc):
         if host is None:
             host = ProxmoxHost(name=name, hostname=hostname)
             db.session.add(host)
+            for field in _HOST_FIELDS:
+                if field in item and field in valid_host_cols:
+                    setattr(host, field, item[field])
+            db.session.flush()
+            counts["hosts"] += 1
+            continue
+
+        if not import_hosts:
+            skipped_hosts.append(name)
+            continue
+
+        for secret_field in _HOST_SECRET_FIELDS:
+            setattr(host, secret_field, None)
         for field in _HOST_FIELDS:
             if field in item and field in valid_host_cols:
                 setattr(host, field, item[field])
@@ -224,49 +331,67 @@ def apply_import(doc):
         db.session.flush()
         counts["guests"] += 1
 
-    # --- Roles: only custom (non-builtin) roles get upserted ---
-    for item in doc["roles"]:
-        rname = (item.get("name") or "").strip()
-        if not rname:
-            continue
-        role = Role.query.filter_by(name=rname).first()
-        if role is not None and role.is_builtin:
-            continue  # never mutate builtin roles on import
-        if role is None:
-            if item.get("is_builtin"):
-                continue  # do not create phantom builtin roles
-            role = Role(
-                name=rname,
-                display_name=(item.get("display_name") or rname),
-                level=int(item.get("level") or 1),
-                is_builtin=False,
-                base_tier=item.get("base_tier"),
-            )
-            db.session.add(role)
-        else:
-            if item.get("display_name"):
-                role.display_name = item["display_name"]
-            if item.get("base_tier"):
-                role.base_tier = item["base_tier"]
-            if isinstance(item.get("level"), int):
-                role.level = item["level"]
-        for perm in Role.PERMISSION_FIELDS:
-            if perm in item:
-                setattr(role, perm, bool(item[perm]))
-        db.session.flush()
-        counts["roles"] += 1
+    # --- Roles: opt-in only; only custom (non-builtin) roles get upserted ---
+    if import_roles:
+        for item in doc["roles"]:
+            rname = (item.get("name") or "").strip()
+            if not rname:
+                continue
+            role = Role.query.filter_by(name=rname).first()
+            if role is not None and role.is_builtin:
+                continue  # never mutate builtin roles on import
+            if role is None:
+                if item.get("is_builtin"):
+                    continue  # do not create phantom builtin roles
+                role = Role(
+                    name=rname,
+                    display_name=(item.get("display_name") or rname),
+                    level=int(item.get("level") or 1),
+                    is_builtin=False,
+                    base_tier=item.get("base_tier"),
+                )
+                db.session.add(role)
+            else:
+                if item.get("display_name"):
+                    role.display_name = item["display_name"]
+                if item.get("base_tier"):
+                    role.base_tier = item["base_tier"]
+                if isinstance(item.get("level"), int):
+                    role.level = item["level"]
+            for perm in Role.PERMISSION_FIELDS:
+                if perm in item:
+                    setattr(role, perm, bool(item[perm]))
+            db.session.flush()
+            counts["roles"] += 1
+    else:
+        skipped_roles = len(doc["roles"])
 
-    # --- Settings (secrets skipped) ---
+    # --- Settings: secrets and auth-critical keys are always skipped;
+    # interval settings are bounds-checked rather than trusted verbatim ---
+    from core.scheduler import parse_interval
+
     for key, value in doc["settings"].items():
         if not isinstance(key, str):
             continue
-        if key in _SECRET_SETTING_KEYS:
+        if _looks_like_secret_key(key) or _looks_like_secret_value(value):
             continue  # never import secrets
+        if key in _AUTH_CRITICAL_SETTING_KEYS:
+            skipped_settings.append(key)
+            continue  # never let import touch auth/trust/self-update config
         if value is not None and not isinstance(value, str):
             continue  # settings are stored as text
-        Setting.set(key, value)
+        if key in _INTERVAL_SETTING_KEYS:
+            parsed, err = parse_interval(key, value)
+            if err is not None:
+                skipped_settings.append(key)
+                continue
+            value = str(parsed)
+        Setting.set_no_commit(key, value)
         counts["settings"] += 1
 
+    counts["skipped_settings"] = skipped_settings
+    counts["skipped_hosts"] = skipped_hosts
+    counts["skipped_roles"] = skipped_roles
     return counts
 
 
