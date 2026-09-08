@@ -9,7 +9,7 @@ import hashlib
 import json
 import logging
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request, session
 from flask_login import current_user
 
 from auth.audit import log_action
@@ -22,6 +22,7 @@ from auth.jwt_auth import (
     jwt_required,
     record_api_failed_login,
     revoke_token,
+    token_predates_password_change,
 )
 from auth.local_network import _get_client_ip
 from models import Guest, ProxmoxHost, PushWebhook, Tag, db
@@ -40,6 +41,33 @@ _DEFAULT_PER_PAGE = 50
 
 def _error(code, message, status=400):
     return jsonify({"error": {"code": code, "message": message}}), status
+
+
+@bp.after_request
+def _strip_session_cookie(response):
+    """Never let a bearer-token API call hand the client a browser session.
+
+    ``jwt_required`` no longer calls ``login_user``, so nothing should touch the
+    Flask session on this blueprint any more; this is the backstop that keeps it
+    that way.  Flask writes the session cookie *after* after_request handlers
+    run, so the decisive step is telling it there is nothing to save; the header
+    sweep afterwards catches a cookie a handler set by hand.
+    """
+    cookie_name = current_app.config.get("SESSION_COOKIE_NAME", "session")
+    if session.modified:
+        logger.warning("An /api/v1 handler modified the Flask session; discarding it")
+        session.clear()
+        session.modified = False
+    existing = response.headers.getlist("Set-Cookie")
+    if not existing:
+        return response
+    kept = [c for c in existing if c.split("=", 1)[0].strip() != cookie_name]
+    if len(kept) != len(existing):
+        logger.warning("Stripped an unexpected %s cookie from an /api/v1 response", cookie_name)
+        del response.headers["Set-Cookie"]
+        for c in kept:
+            response.headers.add("Set-Cookie", c)
+    return response
 
 
 def _paginate(query, page, per_page):
@@ -134,6 +162,10 @@ def login():
     if not user.is_active:
         return _error("UNAUTHORIZED", "Account is disabled.", 401)
 
+    if user.must_change_password:
+        return _error("PASSWORD_CHANGE_REQUIRED",
+                      "This account must change its password in the web UI before using the API.", 403)
+
     access_token = create_access_token(user)
     refresh_token, _jti = create_refresh_token(user)
 
@@ -157,7 +189,12 @@ def login():
 
 @bp.route("/auth/refresh", methods=["POST"])
 def refresh():
-    """Exchange a valid refresh token for a new access token."""
+    """Exchange a refresh token for a new access token and a new refresh token.
+
+    The presented refresh token is rotated: its jti is revoked before the
+    replacement pair is issued, so a leaked refresh token can be used at most
+    once and replaying it afterwards fails.
+    """
     data = request.get_json(silent=True) or {}
     refresh_token = data.get("refresh_token", "")
 
@@ -184,8 +221,17 @@ def refresh():
     if not user or not user.is_active:
         return _error("UNAUTHORIZED", "User not found or inactive.", 401)
 
+    if token_predates_password_change(user, payload):
+        return _error("TOKEN_REVOKED", "Refresh token was issued before the last password change.", 401)
+
+    # Rotate: burn the presented token, then mint a fresh pair.
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+    revoke_token(jti, _dt.fromtimestamp(payload["exp"], tz=_tz.utc))
+
     access_token = create_access_token(user)
-    return jsonify({"data": {"access_token": access_token}})
+    new_refresh_token, _new_jti = create_refresh_token(user)
+    return jsonify({"data": {"access_token": access_token, "refresh_token": new_refresh_token}})
 
 
 @bp.route("/auth/logout", methods=["POST"])

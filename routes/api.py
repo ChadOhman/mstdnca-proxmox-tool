@@ -1649,6 +1649,29 @@ def collab_stream():
     event_queue = collab_hub.connect(user_id, username, display_name, page=page,
                                      is_admin=is_admin, tag_ids=tag_ids)
 
+    # Revocation is otherwise only enforced in before_request, which a stream
+    # that never returns does not run again.  Capture the tracked session id up
+    # front and re-check it on every keepalive tick.
+    from flask import session as _flask_session
+
+    from auth.session_manager import SESSION_KEY, _hash_session_id
+    _raw_sid = _flask_session.get(SESSION_KEY)
+    _session_hash = _hash_session_id(_raw_sid) if _raw_sid else None
+
+    def _still_authorized():
+        from models import User, UserSession
+        try:
+            user = db.session.get(User, user_id)
+            if user is None or not user.is_active:
+                return False
+            if _session_hash:
+                record = UserSession.query.filter_by(session_id_hash=_session_hash).first()
+                if record is None or record.revoked:
+                    return False
+        except Exception:
+            logger.debug("Collaboration stream revocation re-check failed", exc_info=True)
+        return True
+
     @stream_with_context
     def generate():
         try:
@@ -1662,6 +1685,10 @@ def collab_stream():
                         break
                     yield f"data: {_json.dumps(event)}\n\n"
                 except queue.Empty:
+                    if not _still_authorized():
+                        logger.info("Closing collaboration stream for user %s: access revoked", user_id)
+                        yield f"data: {_json.dumps({'type': 'revoked'})}\n\n"
+                        break
                     yield ": keepalive\n\n"   # prevent proxy timeouts
         except GeneratorExit:
             pass

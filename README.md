@@ -87,13 +87,16 @@ cd /tmp/mstdnca && bash scripts/setup.sh
 Once deployed, open `http://<CT-IP>:5000` in your browser.
 
 - **Username:** `admin`
-- **Password:** randomly generated on first start — retrieve it with:
+- **Password:** randomly generated on first start and written to a root-only
+  file (mode `0600`) — read it with:
 
 ```bash
-journalctl -u mstdnca-proxmox-tool | grep -A3 'DEFAULT ADMIN'
+sudo cat /var/lib/mstdnca/initial-admin-password
 ```
 
-**Change the generated password after first login** via the user dropdown menu.
+The password is never printed to the console or the journal. The first login is
+forced through **Change Password**; the file is deleted as soon as you set a new
+one, and every API token and saved login issued earlier stops working.
 
 ### Deployment: reverse proxies and client IPs
 

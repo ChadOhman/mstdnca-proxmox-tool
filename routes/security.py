@@ -241,7 +241,13 @@ def edit_user(user_id):
         if len(new_password) < 8:
             flash("Password must be at least 8 characters.", "error")
             return redirect(url_for("security.index"))
+        # set_password() stamps tokens_valid_after, so every JWT and every
+        # "remember me" cookie issued to this account before now is refused.
+        # Revoke the tracked browser sessions too, so an admin reset really
+        # does sign the account out everywhere.
         user.set_password(new_password)
+        for record in UserSession.query.filter_by(user_id=user.id, revoked=False).all():
+            record.revoked = True
 
     log_action("user_edit", "user", resource_id=user.id, resource_name=user.username)
     db.session.commit()
