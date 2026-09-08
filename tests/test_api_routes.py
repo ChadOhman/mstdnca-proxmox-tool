@@ -1090,7 +1090,10 @@ class TestPollProxmoxTaskTermination:
             clock["t"] += 60 * 60  # an hour of wall clock per poll
 
         try:
-            with patch("clients.proxmox_api.ProxmoxClient", return_value=client), \
+            # The poller re-queries the host by id (#127); these tests exercise
+            # termination logic only, so hand it a stub host.
+            with patch.object(ProxmoxJob, "get_host", return_value=MagicMock()), \
+                 patch("clients.proxmox_api.ProxmoxClient", return_value=client), \
                  patch("routes.api.time.sleep", side_effect=fake_sleep), \
                  patch("routes.api.time.monotonic", side_effect=fake_monotonic):
                 api_mod._poll_proxmox_task(app, job_key)
@@ -1111,7 +1114,10 @@ class TestPollProxmoxTaskTermination:
         client.get_task_status.side_effect = RuntimeError("connection reset")
 
         try:
-            with patch("clients.proxmox_api.ProxmoxClient", return_value=client), \
+            # The poller re-queries the host by id (#127); these tests exercise
+            # termination logic only, so hand it a stub host.
+            with patch.object(ProxmoxJob, "get_host", return_value=MagicMock()), \
+                 patch("clients.proxmox_api.ProxmoxClient", return_value=client), \
                  patch("routes.api.time.sleep"):
                 api_mod._poll_proxmox_task(app, job_key)
 
@@ -1132,7 +1138,10 @@ class TestPollProxmoxTaskTermination:
         client.get_task_status.return_value = {"status": "stopped", "exitstatus": "OK"}
 
         try:
-            with patch("clients.proxmox_api.ProxmoxClient", return_value=client), \
+            # The poller re-queries the host by id (#127); these tests exercise
+            # termination logic only, so hand it a stub host.
+            with patch.object(ProxmoxJob, "get_host", return_value=MagicMock()), \
+                 patch("clients.proxmox_api.ProxmoxClient", return_value=client), \
                  patch("routes.api.time.sleep"):
                 api_mod._poll_proxmox_task(app, job_key)
 
