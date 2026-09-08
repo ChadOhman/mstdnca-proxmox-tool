@@ -598,6 +598,76 @@ class TestPrometheusAppRoutes:
         assert data["ok"] is False
 
 
+class TestPrometheusAuthTokenMasking:
+    """GHSA-qq45-f2h2-9j4q: the auth token must never be rendered into the
+    manage page, and a blank save must keep the currently stored token."""
+
+    def test_token_not_leaked_when_set(self, auth_client, app):
+        with app.app_context():
+            from models import Setting, db
+            Setting.set("prometheus_auth_token", "test-only-TOPSECRET")
+            db.session.commit()
+        resp = auth_client.get("/prometheus/manage")
+        assert resp.status_code == 200
+        assert b"test-only-TOPSECRET" not in resp.data
+        assert b'name="prometheus_auth_token"' in resp.data
+        assert b'type="password"' in resp.data
+
+    def test_placeholder_indicates_set_state(self, auth_client, app):
+        with app.app_context():
+            from models import Setting, db
+            Setting.set("prometheus_auth_token", "test-only-abc")
+            db.session.commit()
+        resp = auth_client.get("/prometheus/manage")
+        assert b"leave blank to keep" in resp.data
+
+    def test_placeholder_when_unset(self, auth_client, app):
+        with app.app_context():
+            from models import Setting, db
+            Setting.set("prometheus_auth_token", "")
+            db.session.commit()
+        resp = auth_client.get("/prometheus/manage")
+        assert b"Optional bearer token" in resp.data
+
+    def test_blank_token_does_not_overwrite(self, auth_client, app):
+        # Leave prometheus_url untouched (blank) — this test only cares about
+        # auth-token behavior, and other tests (e.g. TestUnpollerSettings)
+        # depend on prometheus_url being unset when they run in the shared,
+        # session-scoped test database.
+        with app.app_context():
+            from models import Setting, db
+            Setting.set("prometheus_auth_token", "test-only-existing")
+            db.session.commit()
+        auth_client.post("/prometheus/save", data={
+            "prometheus_guest_id": "",
+            "prometheus_url": "",
+            "prometheus_auth_token": "",
+            "prometheus_mstdnca_metrics_url": "10.0.0.10:5000",
+            "prometheus_retention_days": "90",
+            "prometheus_protection_type": "snapshot",
+            "prometheus_backup_storage": "",
+            "prometheus_backup_mode": "snapshot",
+        }, follow_redirects=True)
+        with app.app_context():
+            from models import Setting
+            assert Setting.get("prometheus_auth_token") == "test-only-existing"
+
+    def test_nonblank_token_saves(self, auth_client, app):
+        auth_client.post("/prometheus/save", data={
+            "prometheus_guest_id": "",
+            "prometheus_url": "",
+            "prometheus_auth_token": "test-only-newtoken",
+            "prometheus_mstdnca_metrics_url": "10.0.0.10:5000",
+            "prometheus_retention_days": "90",
+            "prometheus_protection_type": "snapshot",
+            "prometheus_backup_storage": "",
+            "prometheus_backup_mode": "snapshot",
+        }, follow_redirects=True)
+        with app.app_context():
+            from models import Setting
+            assert Setting.get("prometheus_auth_token") == "test-only-newtoken"
+
+
 # ---------------------------------------------------------------------------
 # Applications page includes Prometheus
 # ---------------------------------------------------------------------------
