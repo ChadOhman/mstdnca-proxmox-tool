@@ -24,15 +24,24 @@ def _create_host(app):
 
 
 def _create_guest(app, name="test-guest", ip="10.0.0.50", with_credential=False):
-    """Create a minimal guest for exporter tests."""
+    """Create a minimal guest for exporter tests.
+
+    (proxmox_host_id, vmid) is unique, and the app fixture is session-scoped,
+    so each call takes the next free VMID on the host instead of a fixed one.
+    """
     host = _create_host(app)
     credential_id = None
     if with_credential:
         cred = _get_or_create_credential()
         credential_id = cred.id
+    highest = (
+        db.session.query(db.func.max(Guest.vmid))
+        .filter(Guest.proxmox_host_id == host.id)
+        .scalar()
+    )
     guest = Guest(
         name=name,
-        vmid=100,
+        vmid=max(highest or 0, 99) + 1,
         guest_type="lxc",
         proxmox_host_id=host.id,
         ip_address=ip,

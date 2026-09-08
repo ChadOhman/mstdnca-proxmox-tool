@@ -168,7 +168,7 @@ class TestBulkApplyOrchestrator:
         h1 = _make_host(app, "_bulk-orch-1", ssh_credential_id=cred_id, pending=1)
         h2 = _make_host(app, "_bulk-orch-2", ssh_credential_id=cred_id, pending=1)
 
-        def fake_run_apply(host_id, hostname, cred, app_ctx):
+        def fake_run_apply(host_id, app_ctx):
             with _apply_lock:
                 _apply_jobs[host_id]["running"] = False
                 _apply_jobs[host_id]["success"] = True
@@ -218,7 +218,7 @@ class TestBulkApplyOrchestrator:
         h1 = _make_host(app, "_bulk-orch-fail-1", ssh_credential_id=cred_id, pending=1)
         h2 = _make_host(app, "_bulk-orch-fail-2", ssh_credential_id=cred_id, pending=1)
 
-        def fake_run_apply(host_id, hostname, cred, app_ctx):
+        def fake_run_apply(host_id, app_ctx):
             if host_id == h1:
                 raise RuntimeError("boom")
             with _apply_lock:

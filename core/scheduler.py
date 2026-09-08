@@ -1137,6 +1137,40 @@ def _run_moderation_check(app):
             logger.error("Scheduled moderation check failed")
 
 
+def _purge_old_update_history(app):
+    """Delete update-history and scan-result rows past their retention period.
+
+    Both retentions are configurable Settings, mirroring the UniFi log purge:
+    ``update_history_retention_days`` (default 365) and
+    ``scan_result_retention_days`` (default 90).
+    """
+    with app.app_context():
+        from models import ScanResult, Setting, UpdateHistory, db
+
+        try:
+            history_days = int(Setting.get("update_history_retention_days", "365") or 365)
+        except ValueError:
+            history_days = 365
+        try:
+            scan_days = int(Setting.get("scan_result_retention_days", "90") or 90)
+        except ValueError:
+            scan_days = 90
+
+        now = datetime.now(timezone.utc)
+        deleted_history = UpdateHistory.query.filter(
+            UpdateHistory.applied_at < now - timedelta(days=history_days)
+        ).delete()
+        deleted_scans = ScanResult.query.filter(
+            ScanResult.scanned_at < now - timedelta(days=scan_days)
+        ).delete()
+        db.session.commit()
+
+        if deleted_history:
+            logger.info(f"Purged {deleted_history} update history entries older than {history_days} days.")
+        if deleted_scans:
+            logger.info(f"Purged {deleted_scans} scan results older than {scan_days} days.")
+
+
 def init_scheduler(app):
     global _scheduler
 
@@ -1382,6 +1416,17 @@ def init_scheduler(app):
         args=[app],
         id="moderation_check",
         name="Cross-check PeerTube users against Mastodon emails",
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # Update history / scan result retention purge - runs daily
+    _scheduler.add_job(
+        _purge_old_update_history,
+        trigger=IntervalTrigger(hours=24),
+        args=[app],
+        id="update_history_purge",
+        name="Purge update history and scan results past retention period",
         replace_existing=True,
         max_instances=1,
     )

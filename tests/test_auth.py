@@ -68,3 +68,81 @@ class TestCsrfOriginCheck:
             headers={"Origin": "https://evil.com"},
         )
         assert resp.status_code == 403
+
+
+class TestUsernameCaseNormalisation:
+    """Usernames are stored lower-cased, so login must normalise too (#127)."""
+
+    def _make_user(self, app, username, password):
+        from models import Role, User, db
+
+        with app.app_context():
+            role = Role.query.filter_by(name="viewer").first()
+            user = User(username=username, display_name=username, role_id=role.id)
+            user.set_password(password)
+            db.session.add(user)
+            db.session.commit()
+            return user.id
+
+    def _delete_user(self, app, user_id):
+        from models import User, db
+
+        with app.app_context():
+            user = User.query.get(user_id)
+            if user:
+                db.session.delete(user)
+                db.session.commit()
+
+    def test_mixed_case_login_matches_lowercase_account(self, app, client):
+        user_id = self._make_user(app, "_case_test_user", "CasePass123!")
+        try:
+            resp = client.post(
+                "/login",
+                data={"username": "_Case_Test_User", "password": "CasePass123!"},
+                follow_redirects=False,
+            )
+            assert resp.status_code == 302
+            assert "/login" not in resp.headers.get("Location", "")
+        finally:
+            self._delete_user(app, user_id)
+
+    def test_surrounding_whitespace_is_stripped(self, app, client):
+        user_id = self._make_user(app, "_case_ws_user", "CasePass123!")
+        try:
+            resp = client.post(
+                "/login",
+                data={"username": "  _CASE_WS_USER  ", "password": "CasePass123!"},
+                follow_redirects=False,
+            )
+            assert resp.status_code == 302
+            assert "/login" not in resp.headers.get("Location", "")
+        finally:
+            self._delete_user(app, user_id)
+
+    def test_admin_created_via_security_route_can_log_in_with_any_case(self, app, auth_client, client):
+        from models import User, db
+
+        resp = auth_client.post(
+            "/security/users/add",
+            data={"username": "MixedCaseAdmin", "display_name": "Mixed",
+                  "password": "MixedPass123!"},
+            follow_redirects=True,
+        )
+        assert resp.status_code == 200
+        try:
+            with app.app_context():
+                assert User.query.filter_by(username="mixedcaseadmin").first() is not None
+
+            login = client.post(
+                "/login",
+                data={"username": "MixedCaseAdmin", "password": "MixedPass123!"},
+                follow_redirects=False,
+            )
+            assert login.status_code == 302
+            assert "/login" not in login.headers.get("Location", "")
+        finally:
+            with app.app_context():
+                user = User.query.filter_by(username="mixedcaseadmin").first()
+                if user:
+                    db.session.delete(user)
+                    db.session.commit()

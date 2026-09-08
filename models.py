@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 
 from flask_login import UserMixin
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import CompileError, IntegrityError, OperationalError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -13,6 +15,13 @@ def _in_request_context() -> bool:
         return False
 
 db = SQLAlchemy()
+
+# Foreign keys carry explicit ON DELETE clauses because app.py enables
+# ``PRAGMA foreign_keys=ON`` on every SQLite connection.  The ORM relationships
+# below still declare matching cascades, so deletes behave identically on
+# databases created before those clauses existed (SQLite cannot alter a
+# constraint in place) -- the DB-level rules are a backstop for bulk deletes
+# that bypass the ORM.
 
 # Package name prefixes that typically require a reboot on Debian/Ubuntu.
 # Used to predict whether pending updates will need one before they are applied.
@@ -32,15 +41,15 @@ _REBOOT_PKG_PREFIXES = (
 # Association table: which tags a user has access to
 user_tags = db.Table(
     "user_tags",
-    db.Column("user_id", db.Integer, db.ForeignKey("users.id"), primary_key=True),
-    db.Column("tag_id", db.Integer, db.ForeignKey("tags.id"), primary_key=True),
+    db.Column("user_id", db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    db.Column("tag_id", db.Integer, db.ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
 )
 
 # Association table: which tags a guest has
 guest_tags = db.Table(
     "guest_tags",
-    db.Column("guest_id", db.Integer, db.ForeignKey("guests.id"), primary_key=True),
-    db.Column("tag_id", db.Integer, db.ForeignKey("tags.id"), primary_key=True),
+    db.Column("guest_id", db.Integer, db.ForeignKey("guests.id", ondelete="CASCADE"), primary_key=True),
+    db.Column("tag_id", db.Integer, db.ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
 )
 
 
@@ -337,8 +346,10 @@ class Tag(db.Model):
     color = db.Column(db.String(7), default="#6c757d")  # hex color for UI
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
+    # No passive_deletes: the ORM deletes the rows itself so the cascade holds
+    # even on a connection where PRAGMA foreign_keys could not be enabled.
     unifi_networks = db.relationship(
-        "TagUnifiNetwork", backref="tag", cascade="all, delete-orphan", passive_deletes=True
+        "TagUnifiNetwork", backref="tag", cascade="all, delete-orphan"
     )
 
     def __repr__(self):
@@ -367,7 +378,9 @@ class ProxmoxHost(db.Model):
     api_token_secret = db.Column(db.Text)  # encrypted
     verify_ssl = db.Column(db.Boolean, default=False)
     host_type = db.Column(db.String(16), default="pve")  # "pve" or "pbs"
-    ssh_credential_id = db.Column(db.Integer, db.ForeignKey("credentials.id"), nullable=True)
+    ssh_credential_id = db.Column(
+        db.Integer, db.ForeignKey("credentials.id", ondelete="SET NULL"), nullable=True
+    )
     ipmi_enabled = db.Column(db.Boolean, default=False)
     ipmi_address = db.Column(db.String(256), nullable=True)  # BMC IP/hostname
     ipmi_username = db.Column(db.String(128), nullable=True)
@@ -379,6 +392,9 @@ class ProxmoxHost(db.Model):
     ssh_credential = db.relationship("Credential", foreign_keys=[ssh_credential_id])
     host_update_packages = db.relationship(
         "HostUpdatePackage", backref="host", lazy=True, cascade="all, delete-orphan"
+    )
+    metric_snapshots = db.relationship(
+        "HostMetricSnapshot", backref="host", lazy=True, cascade="all, delete-orphan"
     )
 
     @property
@@ -435,15 +451,21 @@ class Guest(db.Model):
     __tablename__ = "guests"
 
     id = db.Column(db.Integer, primary_key=True)
-    proxmox_host_id = db.Column(db.Integer, db.ForeignKey("proxmox_hosts.id"), nullable=True)
+    proxmox_host_id = db.Column(
+        db.Integer, db.ForeignKey("proxmox_hosts.id", ondelete="CASCADE"), nullable=True
+    )
     vmid = db.Column(db.Integer, nullable=True)
     name = db.Column(db.String(128), nullable=False)
     guest_type = db.Column(db.String(16), nullable=False)  # vm or ct
     ip_address = db.Column(db.String(64))
     connection_method = db.Column(db.String(16), default="ssh")  # ssh, agent, or auto
-    credential_id = db.Column(db.Integer, db.ForeignKey("credentials.id"), nullable=True)
+    credential_id = db.Column(
+        db.Integer, db.ForeignKey("credentials.id", ondelete="SET NULL"), nullable=True
+    )
     auto_update = db.Column(db.Boolean, default=False)
-    maintenance_window_id = db.Column(db.Integer, db.ForeignKey("maintenance_windows.id"), nullable=True)
+    maintenance_window_id = db.Column(
+        db.Integer, db.ForeignKey("maintenance_windows.id", ondelete="SET NULL"), nullable=True
+    )
     last_scan = db.Column(db.DateTime, nullable=True)
     status = db.Column(db.String(32), default="unknown", index=True)  # unknown, up-to-date, updates-available, error
     enabled = db.Column(db.Boolean, default=True)
@@ -497,12 +519,26 @@ class Guest(db.Model):
 
 db.Index("ix_guest_host_vmid", Guest.proxmox_host_id, Guest.vmid)
 
+# A host may not carry the same VMID twice.  Partial (vmid IS NOT NULL) so
+# manually-added guests that have no VMID yet are still allowed.  Kept in sync
+# with app.py::_ensure_guest_vmid_unique_index, which creates it on databases
+# that predate this index.
+GUEST_VMID_UNIQUE_INDEX = "uq_guest_host_vmid"
+
+db.Index(
+    GUEST_VMID_UNIQUE_INDEX,
+    Guest.proxmox_host_id,
+    Guest.vmid,
+    unique=True,
+    sqlite_where=db.text("vmid IS NOT NULL"),
+)
+
 
 class UpdatePackage(db.Model):
     __tablename__ = "update_packages"
 
     id = db.Column(db.Integer, primary_key=True)
-    guest_id = db.Column(db.Integer, db.ForeignKey("guests.id"), nullable=False)
+    guest_id = db.Column(db.Integer, db.ForeignKey("guests.id", ondelete="CASCADE"), nullable=False)
     package_name = db.Column(db.String(256), nullable=False)
     current_version = db.Column(db.String(128))
     available_version = db.Column(db.String(128))
@@ -546,7 +582,9 @@ class ScanResult(db.Model):
     __tablename__ = "scan_results"
 
     id = db.Column(db.Integer, primary_key=True)
-    guest_id = db.Column(db.Integer, db.ForeignKey("guests.id"), nullable=False, index=True)
+    guest_id = db.Column(
+        db.Integer, db.ForeignKey("guests.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     scanned_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     total_updates = db.Column(db.Integer, default=0)
     security_updates = db.Column(db.Integer, default=0)
@@ -606,13 +644,19 @@ class GuestService(db.Model):
     }
 
     id = db.Column(db.Integer, primary_key=True)
-    guest_id = db.Column(db.Integer, db.ForeignKey("guests.id"), nullable=False, index=True)
+    guest_id = db.Column(
+        db.Integer, db.ForeignKey("guests.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     service_name = db.Column(db.String(64), nullable=False)  # e.g. "elasticsearch"
     unit_name = db.Column(db.String(128), nullable=False)  # e.g. "elasticsearch.service"
     port = db.Column(db.Integer, nullable=True)
     status = db.Column(db.String(32), default="unknown")  # running, stopped, failed, unknown
     last_checked = db.Column(db.DateTime, nullable=True)
     auto_detected = db.Column(db.Boolean, default=False)
+
+    metric_snapshots = db.relationship(
+        "ServiceMetricSnapshot", backref="service", lazy=True, cascade="all, delete-orphan"
+    )
 
     def __repr__(self):
         return f"<GuestService {self.service_name} on guest {self.guest_id}>"
@@ -645,7 +689,9 @@ class ExporterInstance(db.Model):
     __tablename__ = "exporter_instances"
 
     id = db.Column(db.Integer, primary_key=True)
-    guest_id = db.Column(db.Integer, db.ForeignKey("guests.id"), nullable=False, index=True)
+    guest_id = db.Column(
+        db.Integer, db.ForeignKey("guests.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     exporter_type = db.Column(db.String(64), nullable=False)
     port = db.Column(db.Integer, nullable=False)
     version = db.Column(db.String(32), nullable=True)
@@ -672,7 +718,10 @@ class HostExporterInstance(db.Model):
     installed_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
-    host = db.relationship("ProxmoxHost", backref="host_exporter_instances")
+    host = db.relationship(
+        "ProxmoxHost",
+        backref=db.backref("host_exporter_instances", cascade="all, delete-orphan"),
+    )
 
     def __repr__(self):
         return f"<HostExporterInstance {self.exporter_type} on host={self.host_id} status={self.status}>"
@@ -704,13 +753,34 @@ class Setting(db.Model):
 
     @staticmethod
     def set(key, value):
+        """Insert or update a setting and commit.
+
+        Uses an upsert so two concurrent writers (e.g. a request thread and a
+        scheduler job) cannot lose the race on the unique ``key`` column.
+        Callers rely on this committing the session and invalidating the
+        per-request cache, so both behaviours are preserved.
+        """
         s = Setting.query.filter_by(key=key).first()
         if s:
             s.value = value
+            db.session.commit()
         else:
-            s = Setting(key=key, value=value)
-            db.session.add(s)
-        db.session.commit()
+            try:
+                stmt = sqlite_insert(Setting.__table__).values(key=key, value=value)
+                stmt = stmt.on_conflict_do_update(index_elements=["key"], set_={"value": value})
+                db.session.execute(stmt)
+                db.session.commit()
+            except (IntegrityError, OperationalError, CompileError):
+                # Non-SQLite backend, or a concurrent insert landed first.
+                db.session.rollback()
+                s = Setting.query.filter_by(key=key).first()
+                if s:
+                    s.value = value
+                else:
+                    s = Setting(key=key, value=value)
+                    db.session.add(s)
+                db.session.commit()
+            s = Setting.query.filter_by(key=key).first()
         if _in_request_context():
             from flask import g
             g.pop("_settings_cache", None)
@@ -722,7 +792,8 @@ class AuditLog(db.Model):
 
     id            = db.Column(db.Integer, primary_key=True)
     timestamp     = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), index=True)
-    user_id       = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True, index=True)
+    user_id       = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"),
+                              nullable=True, index=True)
     user          = db.relationship("User", backref="audit_logs")
     action        = db.Column(db.String(64),  nullable=False, index=True)
     resource_type = db.Column(db.String(32),  nullable=False, index=True)
@@ -806,7 +877,9 @@ class UserSession(db.Model):
     __tablename__ = "user_sessions"
 
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    user_id = db.Column(
+        db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     # SHA-256 hex digest of the opaque session id (never store the raw id).
     session_id_hash = db.Column(db.String(64), unique=True, nullable=False, index=True)
     ip_address = db.Column(db.String(45), nullable=True)
@@ -828,7 +901,7 @@ class PushWebhook(db.Model):
     VALID_EVENTS = {"security_update", "service_down", "service_failed", "service_recovered", "reboot_required", "guest_error"}
 
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     url = db.Column(db.String(512), nullable=False)
     device_token = db.Column(db.String(512), nullable=False)
     platform = db.Column(db.String(10), nullable=False)   # ios, android

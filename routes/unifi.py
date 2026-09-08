@@ -40,7 +40,14 @@ def _get_unifi_client():
     if not base_url or not username or not encrypted_pw:
         return None
 
-    password = decrypt(encrypted_pw)
+    try:
+        password = decrypt(encrypted_pw)
+    except Exception:
+        logger.warning(
+            "Stored UniFi password could not be decrypted (was the secret key rotated?)",
+            exc_info=True,
+        )
+        return None
     if not password:
         return None
 
