@@ -1,7 +1,6 @@
 import json
 import logging
 import queue
-import re
 import shlex
 import threading
 from datetime import datetime, timedelta, timezone
@@ -11,6 +10,7 @@ from flask_login import current_user, login_required
 from sqlalchemy import func
 
 from auth.audit import log_action
+from core.pg_identifiers import PG_DB_NAME_RE as _PG_DB_NAME_RE
 from core.scanner import (
     check_service_statuses,
     get_service_logs,
@@ -32,10 +32,6 @@ from core.scanner import (
 from models import AuditLog, Guest, GuestService, ServiceMetricSnapshot, Tag, db
 
 logger = logging.getLogger(__name__)
-
-# Allowlist for PostgreSQL database names: letters, digits, underscores only (max 63 chars).
-# Prevents command injection in shell commands that embed the database name.
-_PG_DB_NAME_RE = re.compile(r'^[A-Za-z0-9_]{1,63}$')
 
 bp = Blueprint("services", __name__)
 
