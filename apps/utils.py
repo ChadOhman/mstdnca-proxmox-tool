@@ -1,9 +1,66 @@
 """Shared helpers for application upgrade automation modules."""
 
+import contextlib
 import re
+import threading
 
 # Shell-safe value pattern: alphanumeric, hyphens, underscores, dots, forward slashes, colons
 _SHELL_SAFE_RE = re.compile(r'^[\w.\-/:~]+$')
+
+# ---------------------------------------------------------------------------
+# Per-app upgrade lock
+#
+# Manual upgrades (routes/*) and scheduled auto-upgrades (core/scheduler.py)
+# both drive the same remote host.  The per-blueprint JobTracker only guards
+# the manual path, so a cron-triggered upgrade could run concurrently with a
+# manual one.  Both paths take this process-wide, per-app lock instead.
+# ---------------------------------------------------------------------------
+
+_UPGRADE_LOCKS: dict[str, threading.Lock] = {}
+_UPGRADE_LOCKS_GUARD = threading.Lock()
+
+
+def _get_upgrade_lock(app_name: str) -> threading.Lock:
+    """Return (creating on first use) the upgrade lock for ``app_name``."""
+    with _UPGRADE_LOCKS_GUARD:
+        lock = _UPGRADE_LOCKS.get(app_name)
+        if lock is None:
+            lock = threading.Lock()
+            _UPGRADE_LOCKS[app_name] = lock
+        return lock
+
+
+def acquire_upgrade_lock(app_name: str) -> bool:
+    """Take the per-app upgrade lock without blocking.
+
+    Returns True if the caller now owns the lock (and must release it), or
+    False if another upgrade is already running for that app.
+    """
+    return _get_upgrade_lock(app_name).acquire(blocking=False)
+
+
+def release_upgrade_lock(app_name: str) -> None:
+    """Release the per-app upgrade lock; a double release is a no-op."""
+    try:
+        _get_upgrade_lock(app_name).release()
+    except RuntimeError:
+        pass
+
+
+@contextlib.contextmanager
+def upgrade_lock(app_name: str):
+    """Context manager yielding True when the per-app upgrade lock was taken.
+
+    Used by the scheduler, which can simply skip a run; the routes acquire the
+    lock in the request handler (so the check-and-set is atomic) and release it
+    from the background job.
+    """
+    acquired = acquire_upgrade_lock(app_name)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            release_upgrade_lock(app_name)
 
 
 def _log_cmd_output(log, stdout, stderr, code, max_chars=2000):
