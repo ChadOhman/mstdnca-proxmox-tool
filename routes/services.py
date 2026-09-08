@@ -44,6 +44,51 @@ def _require_login():
         return redirect(url_for("dashboard.index"))
 
 
+# Endpoints that answer with HTML; everything else in this blueprint speaks JSON
+# and gets a 403 body instead of a redirect when access is denied.
+_HTML_ENDPOINTS = {
+    "services.control",
+    "services.assign",
+    "services.remove",
+    "services.detail",
+}
+
+
+def _access_denied():
+    if request.endpoint in _HTML_ENDPOINTS:
+        flash("You don't have permission to access this guest.", "error")
+        return redirect(url_for("services.index"))
+    return jsonify({"ok": False, "message": "Permission denied."}), 403
+
+
+def _require_service_access(svc):
+    """Return an error response when the current user may not act on `svc`'s guest."""
+    if svc is not None and svc.guest is not None and current_user.may_access_guest(svc.guest):
+        return None
+    return _access_denied()
+
+
+@bp.before_request
+def _require_guest_scope():
+    """Tag-scope every route in this blueprint that resolves a service or guest id.
+
+    A ``can_view_services``/``can_edit_services`` flag says what a user may do;
+    it must not let them reach a guest outside their tags.  Enforced here rather
+    than route-by-route so a new ``<int:service_id>`` route cannot forget it.
+    """
+    view_args = request.view_args or {}
+    if "service_id" in view_args:
+        svc = db.session.get(GuestService, view_args["service_id"])
+        if svc is None:
+            return None  # let the view's get_or_404 raise the 404
+        return _require_service_access(svc)
+    if "guest_id" in view_args:
+        guest = db.session.get(Guest, view_args["guest_id"])
+        if guest is not None and not current_user.may_access_guest(guest):
+            return _access_denied()
+    return None
+
+
 @bp.route("/")
 def index():
     service_filter = request.args.get("service", "")
@@ -110,7 +155,11 @@ def refresh_all():
     if not current_user.can_edit_services:
         flash("You don't have permission to refresh service statuses.", "error")
         return redirect(url_for("services.index"))
-    guests = Guest.query.filter(Guest.enabled == True, Guest.services.any()).all()
+    query = Guest.query.filter(Guest.enabled == True, Guest.services.any())
+    if not current_user.is_admin:
+        user_tag_ids = [t.id for t in current_user.allowed_tags]
+        query = query.filter(Guest.tags.any(Tag.id.in_(user_tag_ids))) if user_tag_ids else query.filter(False)
+    guests = query.all()
     checked = 0
     for guest in guests:
         try:

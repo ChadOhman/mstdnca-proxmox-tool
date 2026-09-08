@@ -44,7 +44,10 @@ def _error(code, message, status=400):
 
 def _paginate(query, page, per_page):
     """Apply offset/limit pagination and return (items, total)."""
-    per_page = min(per_page, _MAX_PER_PAGE)
+    # Clamp both: a negative per_page becomes LIMIT -1 in SQLite (every row)
+    # and a page below 1 produces a negative OFFSET.
+    page = max(1, page)
+    per_page = max(1, min(per_page, _MAX_PER_PAGE))
     total = query.count()
     items = query.offset((page - 1) * per_page).limit(per_page).all()
     return items, total
@@ -289,10 +292,11 @@ def dashboard_alerts():
                 })
 
     host_security_updates = []
-    for host in ProxmoxHost.query.all():
-        sec_count = len(host.security_updates())
-        if sec_count > 0:
-            host_security_updates.append({"host_id": host.id, "host_name": host.name, "count": sec_count})
+    if current_user.can_view_hosts:
+        for host in ProxmoxHost.query.all():
+            sec_count = len(host.security_updates())
+            if sec_count > 0:
+                host_security_updates.append({"host_id": host.id, "host_name": host.name, "count": sec_count})
 
     return jsonify({
         "data": {
@@ -359,7 +363,7 @@ def guest_detail(guest_id):
     if not guest or not guest.enabled:
         return _error("NOT_FOUND", "Guest not found.", 404)
 
-    if not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         return _error("FORBIDDEN", "Access denied.", 403)
 
     return jsonify({"data": _serialize_guest_detail(guest)})
@@ -381,7 +385,7 @@ def guest_power(guest_id):
     if not guest or not guest.enabled:
         return _error("NOT_FOUND", "Guest not found.", 404)
 
-    if not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         return _error("FORBIDDEN", "Access denied.", 403)
 
     if not guest.proxmox_host or not guest.vmid:
