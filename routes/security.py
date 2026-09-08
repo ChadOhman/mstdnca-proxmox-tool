@@ -9,6 +9,13 @@ from models import AuditLog, Credential, Role, ScanResult, Setting, Tag, TagUnif
 # Strict hex-color validation: #RRGGBB only
 _HEX_COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
 
+# Cloudflare Access team domain: must be exactly "<team>.cloudflareaccess.com",
+# lowercase alphanumeric/hyphen team name only. A naive .endswith() check here
+# would accept "evil.com#.cloudflareaccess.com" or "evil.com.cloudflareaccess.com.evil.com"-
+# style values, which are then used to build both a logout redirect and a
+# JWKS fetch URL (open redirect + SSRF primitive).
+_CF_TEAM_DOMAIN_RE = re.compile(r'^[a-z0-9-]+\.cloudflareaccess\.com$')
+
 bp = Blueprint("security", __name__)
 
 
@@ -420,6 +427,10 @@ def save_cloudflare():
         if not team_domain or not audience:
             flash("Team domain and audience tag are required to enable CF Access-only mode.", "error")
             return redirect(url_for("security.index"))
+
+    if team_domain and not _CF_TEAM_DOMAIN_RE.match(team_domain.lower()):
+        flash("Invalid Cloudflare team domain. Expected format: <team>.cloudflareaccess.com", "error")
+        return redirect(url_for("security.index"))
 
     Setting.set("cf_access_enabled", "true" if cf_enabled else "false")
     Setting.set("cf_access_team_domain", team_domain)
