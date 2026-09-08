@@ -2651,6 +2651,45 @@ def scan_all_guests():
     return results
 
 
+def _reconcile_applied_updates(guest, upgradable_output):
+    """Mark pending packages applied based on a post-upgrade upgradable list.
+
+    ``apt-get upgrade -y`` exits 0 even when packages are kept back (a new
+    dependency, a phased update, a held package), so a zero exit is not proof
+    that everything was installed.  Re-read ``apt list --upgradable`` and only
+    retire the rows whose package no longer appears there; anything still
+    listed stays pending and keeps the guest out of 'up-to-date'.
+
+    ``upgradable_output`` of None means the re-check itself could not be run —
+    in that case nothing is marked applied and the guest is left as-is.
+    """
+    if upgradable_output is None:
+        logger.warning(
+            f"Could not re-check upgradable packages on {guest.name}; "
+            "leaving pending updates untouched"
+        )
+        return
+
+    still_upgradable = {p["name"] for p in parse_upgradable(upgradable_output or "")}
+    now = datetime.now(timezone.utc)
+    kept_back = []
+    for pkg in guest.pending_updates():
+        if pkg.package_name in still_upgradable:
+            kept_back.append(pkg.package_name)
+            continue
+        pkg.status = "applied"
+        pkg.applied_at = now
+
+    if kept_back:
+        logger.info(
+            f"{len(kept_back)} package(s) kept back on {guest.name}: {', '.join(sorted(kept_back))}"
+        )
+        guest.status = "updates-available"
+    else:
+        guest.status = "up-to-date"
+    db.session.commit()
+
+
 def apply_updates(guest, dist_upgrade=False):
     """Apply pending updates to a guest."""
     cmd = "DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y" if dist_upgrade else "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
@@ -2669,13 +2708,14 @@ def apply_updates(guest, dist_upgrade=False):
                     ssh.execute_sudo("apt-get update -qq", timeout=120)
                     stdout, stderr, code = ssh.execute_sudo(cmd, timeout=600)
                     if code == 0:
-                        # Mark all pending as applied
-                        now = datetime.now(timezone.utc)
-                        for pkg in guest.pending_updates():
-                            pkg.status = "applied"
-                            pkg.applied_at = now
-                        guest.status = "up-to-date"
-                        db.session.commit()
+                        # Re-read what is still upgradable: a zero exit does not
+                        # mean every pending package was actually installed.
+                        recheck_out, _, recheck_code = ssh.execute_sudo(
+                            APT_LIST_CMD, timeout=120
+                        )
+                        _reconcile_applied_updates(
+                            guest, recheck_out if recheck_code == 0 else None
+                        )
                         try:
                             check_reboot_required(guest)
                         except Exception:
@@ -2696,14 +2736,18 @@ def apply_updates(guest, dist_upgrade=False):
                     break
             if node:
                 client.exec_guest_agent(node, guest.vmid, "apt-get update -qq")
-                stdout, err = client.exec_guest_agent(node, guest.vmid, cmd)
+                # The agent runs argv directly, so an env-var prefix ('VAR=x cmd')
+                # is not a program name — wrap it in a shell like _execute_command.
+                stdout, err = client.exec_guest_agent(
+                    node, guest.vmid, f"sh -c {shlex.quote(cmd)}"
+                )
                 if err is None:
-                    now = datetime.now(timezone.utc)
-                    for pkg in guest.pending_updates():
-                        pkg.status = "applied"
-                        pkg.applied_at = now
-                    guest.status = "up-to-date"
-                    db.session.commit()
+                    recheck_out, recheck_err = client.exec_guest_agent(
+                        node, guest.vmid, "apt list --upgradable"
+                    )
+                    _reconcile_applied_updates(
+                        guest, recheck_out if recheck_err is None else None
+                    )
                     try:
                         check_reboot_required(guest)
                     except Exception:

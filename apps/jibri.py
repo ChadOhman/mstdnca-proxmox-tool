@@ -740,11 +740,13 @@ def run_jibri_install(log_callback=None):
             if svc_status == "active":
                 log("jibri service is active")
             else:
-                log(f"WARNING: jibri service status: {svc_status}")
+                log(f"ERROR: jibri service status: {svc_status or 'unknown'}")
                 stdout, stderr, code = ssh.execute_sudo(
                     "journalctl -u jibri --no-pager -n 30 2>&1", timeout=15
                 )
                 _log_cmd_output(log, stdout, stderr, code, max_chars=2000)
+                log("Install did not leave Jibri running — reporting failure.")
+                return False, "\n".join(log_lines)
 
             # Check health API
             stdout, stderr, code = ssh.execute_sudo(
@@ -770,6 +772,33 @@ def run_jibri_install(log_callback=None):
 # ---------------------------------------------------------------------------
 # Jitsi server-side configuration for recording/streaming
 # ---------------------------------------------------------------------------
+
+def _prosodyctl_register(ssh, account, domain, password, log):
+    """Register an XMPP account with prosodyctl. Returns True on success.
+
+    The password is passed base64-encoded so it never appears in the shell
+    command line.  prosodyctl exits non-zero when the account already exists;
+    that is a benign re-run, everything else is a real failure.
+    """
+    pw_b64 = base64.b64encode(password.encode("utf-8")).decode("ascii")
+    stdout, stderr, code = ssh.execute_sudo(
+        f"prosodyctl register {account} {domain} "
+        f"\"$(printf '%s' '{pw_b64}' | base64 -d)\" 2>&1",
+        timeout=15
+    )
+    if code == 0:
+        log(f"  Registered {account}@{domain}")
+        return True
+
+    combined = ((stdout or "") + " " + (stderr or "")).lower()
+    if "already exists" in combined:
+        log(f"  {account}@{domain} already exists — leaving the existing account in place")
+        return True
+
+    log(f"ERROR: prosodyctl register {account}@{domain} failed (exit {code})")
+    _log_cmd_output(log, stdout, stderr, code, max_chars=500)
+    return False
+
 
 def run_jibri_jitsi_configure(log_callback=None):
     """Configure the Jitsi Meet server to enable Jibri recording and streaming.
@@ -862,18 +891,12 @@ VirtualHost "recorder.{jitsi_hostname}"
 
             # Register XMPP accounts (passwords passed via base64 to avoid shell exposure)
             log("  Registering XMPP accounts...")
-            xmpp_pw_b64 = base64.b64encode(xmpp_password.encode("utf-8")).decode("ascii")
-            recorder_pw_b64 = base64.b64encode(recorder_password.encode("utf-8")).decode("ascii")
-            ssh.execute_sudo(
-                f"prosodyctl register jibri auth.{jitsi_hostname} "
-                f"\"$(printf '%s' '{xmpp_pw_b64}' | base64 -d)\" 2>&1",
-                timeout=15
-            )
-            ssh.execute_sudo(
-                f"prosodyctl register recorder recorder.{jitsi_hostname} "
-                f"\"$(printf '%s' '{recorder_pw_b64}' | base64 -d)\" 2>&1",
-                timeout=15
-            )
+            if not _prosodyctl_register(ssh, "jibri", f"auth.{jitsi_hostname}",
+                                        xmpp_password, log):
+                return False, "\n".join(log_lines)
+            if not _prosodyctl_register(ssh, "recorder", f"recorder.{jitsi_hostname}",
+                                        recorder_password, log):
+                return False, "\n".join(log_lines)
             log("  XMPP accounts registered (jibri@auth, recorder@recorder)")
             log("")
 

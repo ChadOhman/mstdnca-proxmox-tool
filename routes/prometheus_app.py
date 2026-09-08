@@ -6,6 +6,7 @@ same pattern as routes/jitsi.py.
 """
 
 import logging
+import re as _re
 import threading as _threading
 from datetime import datetime, timezone
 
@@ -872,24 +873,76 @@ def host_exporter_update_config(instance_id):
 _mastodon_exporter_job = {"running": False, "success": None, "log": []}
 
 
+_MASTODON_EXPORTER_MODES = ("external", "internal")
+
+# Bind address: an IPv4/IPv6 literal or a hostname — anything that would end up
+# quoted into a systemd unit must be checked before it gets there.
+_HOST_RE = _re.compile(
+    r'^(?:[0-9A-Fa-f:.]+|'
+    r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    r'(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)$'
+)
+
+
 def _parse_mastodon_exporter_config():
-    """Parse Mastodon exporter configuration from form data."""
+    """Parse and validate Mastodon exporter configuration from form data.
+
+    Returns (config, error). ``error`` is a user-facing message when any field
+    is invalid; callers must reject the request before starting a job.
+    """
+    mode = request.form.get("mode", "external")
+    if mode not in _MASTODON_EXPORTER_MODES:
+        return None, f"Invalid exporter mode: {mode!r}"
+
+    host = request.form.get("host", "0.0.0.0").strip() or "0.0.0.0"
+    if len(host) > 253 or not _HOST_RE.match(host):
+        return None, f"Invalid exporter host: {host!r}"
+
+    raw_port = request.form.get("port", "") or "9394"
+    try:
+        port = int(str(raw_port).strip())
+    except (TypeError, ValueError):
+        return None, f"Invalid exporter port: {raw_port!r}"
+    if not 1 <= port <= 65535:
+        return None, f"Exporter port out of range (1-65535): {port}"
+
     return {
         "web_detailed_metrics": request.form.get("web_detailed_metrics") == "on",
         "sidekiq_detailed_metrics": request.form.get("sidekiq_detailed_metrics") == "on",
-        "mode": request.form.get("mode", "external"),
-        "host": (request.form.get("host", "0.0.0.0").strip() or "0.0.0.0"),
-        "port": int(request.form.get("port", 9394) or 9394),
-    }
+        "mode": mode,
+        "host": host,
+        "port": port,
+    }, None
+
+
+def _parse_mastodon_guest_id(raw):
+    """Parse the configured Mastodon guest id. Returns (guest_id, error)."""
+    try:
+        return int(str(raw).strip()), None
+    except (TypeError, ValueError):
+        return None, f"Mastodon guest id is not a valid integer: {raw!r}"
 
 
 @bp.route("/mastodon-exporter/enable", methods=["POST"])
 def mastodon_exporter_enable():
+    from flask import current_app
+
     from apps.exporters import enable_mastodon_exporter
 
     mastodon_guest_id = Setting.get("mastodon_guest_id", "")
     if not mastodon_guest_id:
         flash("Mastodon guest not configured. Set it in the Mastodon management page first.", "error")
+        return redirect(url_for("prometheus_app.manage"))
+
+    # Parse and validate every input *before* flipping the job to running: a bad
+    # port used to raise after the flag was set, wedging the job forever.
+    guest_id, err = _parse_mastodon_guest_id(mastodon_guest_id)
+    if err:
+        flash(err, "error")
+        return redirect(url_for("prometheus_app.manage"))
+    config, err = _parse_mastodon_exporter_config()
+    if err:
+        flash(err, "error")
         return redirect(url_for("prometheus_app.manage"))
 
     if _mastodon_exporter_job["running"]:
@@ -900,13 +953,10 @@ def mastodon_exporter_enable():
     _mastodon_exporter_job["success"] = None
     _mastodon_exporter_job["log"] = []
 
-    guest_id = int(mastodon_guest_id)
-    config = _parse_mastodon_exporter_config()
+    _app = current_app._get_current_object()
 
     def _run():
-        from app import create_app
-        app = create_app()
-        with app.app_context():
+        with _app.app_context():
             def _log(msg):
                 _mastodon_exporter_job["log"].append(msg)
 
@@ -928,11 +978,18 @@ def mastodon_exporter_enable():
 
 @bp.route("/mastodon-exporter/disable", methods=["POST"])
 def mastodon_exporter_disable():
+    from flask import current_app
+
     from apps.exporters import disable_mastodon_exporter
 
     mastodon_guest_id = Setting.get("mastodon_guest_id", "")
     if not mastodon_guest_id:
         flash("Mastodon guest not configured.", "error")
+        return redirect(url_for("prometheus_app.manage"))
+
+    guest_id, err = _parse_mastodon_guest_id(mastodon_guest_id)
+    if err:
+        flash(err, "error")
         return redirect(url_for("prometheus_app.manage"))
 
     if _mastodon_exporter_job["running"]:
@@ -943,12 +1000,10 @@ def mastodon_exporter_disable():
     _mastodon_exporter_job["success"] = None
     _mastodon_exporter_job["log"] = []
 
-    guest_id = int(mastodon_guest_id)
+    _app = current_app._get_current_object()
 
     def _run():
-        from app import create_app
-        app = create_app()
-        with app.app_context():
+        with _app.app_context():
             def _log(msg):
                 _mastodon_exporter_job["log"].append(msg)
 
@@ -969,11 +1024,22 @@ def mastodon_exporter_disable():
 
 @bp.route("/mastodon-exporter/reconfigure", methods=["POST"])
 def mastodon_exporter_reconfigure():
+    from flask import current_app
+
     from apps.exporters import reconfigure_mastodon_exporter
 
     mastodon_guest_id = Setting.get("mastodon_guest_id", "")
     if not mastodon_guest_id:
         flash("Mastodon guest not configured.", "error")
+        return redirect(url_for("prometheus_app.manage"))
+
+    guest_id, err = _parse_mastodon_guest_id(mastodon_guest_id)
+    if err:
+        flash(err, "error")
+        return redirect(url_for("prometheus_app.manage"))
+    config, err = _parse_mastodon_exporter_config()
+    if err:
+        flash(err, "error")
         return redirect(url_for("prometheus_app.manage"))
 
     if _mastodon_exporter_job["running"]:
@@ -984,13 +1050,10 @@ def mastodon_exporter_reconfigure():
     _mastodon_exporter_job["success"] = None
     _mastodon_exporter_job["log"] = []
 
-    guest_id = int(mastodon_guest_id)
-    config = _parse_mastodon_exporter_config()
+    _app = current_app._get_current_object()
 
     def _run():
-        from app import create_app
-        app = create_app()
-        with app.app_context():
+        with _app.app_context():
             def _log(msg):
                 _mastodon_exporter_job["log"].append(msg)
 

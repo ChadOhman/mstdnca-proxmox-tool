@@ -715,7 +715,8 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
                 f"systemctl is-active {service_name} 2>/dev/null", timeout=15
             )
             service_status = (stdout or "").strip()
-            if service_status == "active":
+            service_ok = service_status == "active"
+            if service_ok:
                 log(f"Ghost service ({service_name}) is active — upgrade successful")
             else:
                 log(f"Ghost service ({service_name}) is {service_status or 'unknown'} "
@@ -730,10 +731,11 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
                     f"systemctl is-active {service_name} 2>/dev/null", timeout=15
                 )
                 service_status = (stdout or "").strip()
-                if service_status == "active":
+                service_ok = service_status == "active"
+                if service_ok:
                     log(f"Ghost service ({service_name}) started successfully.")
                 else:
-                    log(f"WARNING: Ghost service ({service_name}) is still "
+                    log(f"ERROR: Ghost service ({service_name}) is still "
                         f"{service_status or 'unknown'} after start attempt.")
                     # Show recent journal entries to aid diagnosis
                     stdout, _, _ = ssh.execute_sudo(
@@ -743,6 +745,13 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
                     if (stdout or "").strip():
                         log("--- Recent service journal ---")
                         log((stdout or "").strip())
+
+            if not service_ok:
+                # The new code is unpacked but the site is down: do not record
+                # the new version and do not report success.
+                log("ERROR: Ghost upgrade did not leave the service running — "
+                    "reporting failure (version tracking left unchanged).")
+                return False, "\n".join(log_lines)
 
             # Detect and persist new version via .ghost-cli metadata
             stdout, stderr, code = ssh.execute_sudo(

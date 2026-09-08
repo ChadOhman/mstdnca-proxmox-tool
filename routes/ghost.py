@@ -224,8 +224,11 @@ def upgrade():
     from flask_login import current_user
 
     from apps.ghost import run_ghost_upgrade
+    from apps.utils import acquire_upgrade_lock, release_upgrade_lock
 
-    if _upgrade_job["running"]:
+    # Atomic check-and-set, shared with the scheduler's auto-upgrade job so a
+    # cron upgrade and a manual one can never run against the same host at once.
+    if not acquire_upgrade_lock("ghost"):
         flash("An upgrade is already in progress.", "warning")
         return redirect(url_for("ghost.upgrade_page"))
 
@@ -266,11 +269,18 @@ def upgrade():
             from core.notifier import send_upgrade_result_notification
             send_upgrade_result_notification("ghost", target_version, ok, "manual")
 
+    def _bg_locked():
+        try:
+            _bg()
+        finally:
+            _upgrade_job["running"] = False
+            release_upgrade_lock("ghost")
+
     try:
         import gevent as _gevent
-        _gevent.spawn(_bg)
+        _gevent.spawn(_bg_locked)
     except ImportError:
-        _threading.Thread(target=_bg, daemon=True).start()
+        _threading.Thread(target=_bg_locked, daemon=True).start()
 
     return redirect(url_for("ghost.upgrade_page"))
 

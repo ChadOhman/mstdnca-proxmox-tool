@@ -245,8 +245,11 @@ def upgrade():
     from flask_login import current_user
 
     from apps.mastodon import run_mastodon_upgrade
+    from apps.utils import acquire_upgrade_lock, release_upgrade_lock
 
-    if _upgrade_job["running"]:
+    # Atomic check-and-set, shared with the scheduler's auto-upgrade job so a
+    # cron upgrade and a manual one can never run against the same host at once.
+    if not acquire_upgrade_lock("mastodon"):
         flash("An upgrade is already in progress.", "warning")
         return redirect(url_for("mastodon.upgrade_page"))
 
@@ -288,11 +291,18 @@ def upgrade():
             from core.notifier import send_upgrade_result_notification
             send_upgrade_result_notification("mastodon", target_version, ok, "manual")
 
+    def _bg_locked():
+        try:
+            _bg()
+        finally:
+            _upgrade_job["running"] = False
+            release_upgrade_lock("mastodon")
+
     try:
         import gevent as _gevent
-        _gevent.spawn(_bg)
+        _gevent.spawn(_bg_locked)
     except ImportError:
-        _threading.Thread(target=_bg, daemon=True).start()
+        _threading.Thread(target=_bg_locked, daemon=True).start()
 
     return redirect(url_for("mastodon.upgrade_page"))
 
@@ -329,12 +339,7 @@ def detect_versions():
             # fall back to grepping the config directory.
             import re as _re
 
-            def _find_first(patterns, text):
-                for pat in patterns:
-                    m = _re.search(pat, text)
-                    if m:
-                        return m.group(1)
-                return None
+            from apps.mastodon import parse_version_rb
 
             stdout, error = _execute_command(
                 mastodon_guest,
@@ -344,19 +349,7 @@ def detect_versions():
             )
             version = None
             if stdout and not error:
-                major = _find_first([r'MAJOR\s*=\s*(\d+)', r'def major\s+(\d+)'], stdout)
-                minor = _find_first([r'MINOR\s*=\s*(\d+)', r'def minor\s+(\d+)'], stdout)
-                patch = _find_first([r'PATCH\s*=\s*(\d+)', r'def patch\s+(\d+)'], stdout)
-                pre   = _find_first([r"PRE\s*=\s*['\"]([^'\"]+)['\"]",
-                                     r"def default_prerelease\s+['\"]([^'\"]+)['\"]"], stdout)
-                build = _find_first([r"BUILD_METADATA\s*=\s*['\"]([^'\"]+)['\"]"], stdout)
-
-                if major and minor and patch:
-                    version = f"{major}.{minor}.{patch}"
-                    if pre:
-                        version += f"-{pre}"
-                    if build:
-                        version += f"+{build}"
+                version = parse_version_rb(stdout)
 
             # build_metadata is not a literal in method-style version.rb (it reads from
             # Rails config).  Search config files for the metadata value.

@@ -275,6 +275,45 @@ _VER_PATCH_RE = re.compile(r'def patch\s+(\d+)')
 _VER_PRE_RE = re.compile(r"def default_prerelease\s+'([^']*)'")
 
 
+def parse_version_rb(content):
+    """Parse a version string out of a ``lib/mastodon/version.rb`` file.
+
+    Handles both layouts seen in the wild:
+      * constant-style  ``MAJOR = 4``            (older Mastodon)
+      * method-style    ``def major\\n  4\\nend`` (newer Mastodon / glitch-soc)
+
+    Returns e.g. ``'4.6.0-alpha.5+glitch'`` or None when the file cannot be
+    parsed.  ``BUILD_METADATA`` is only present as a literal in the
+    constant-style layout; callers that need it for method-style files fall
+    back to grepping the Rails config.
+    """
+    if not content:
+        return None
+
+    def _first(patterns):
+        for pat in patterns:
+            m = re.search(pat, content)
+            if m:
+                return m.group(1)
+        return None
+
+    major = _first([r'MAJOR\s*=\s*(\d+)', r'def major\s+(\d+)'])
+    minor = _first([r'MINOR\s*=\s*(\d+)', r'def minor\s+(\d+)'])
+    patch = _first([r'PATCH\s*=\s*(\d+)', r'def patch\s+(\d+)'])
+    if not (major and minor and patch):
+        return None
+
+    version = f"{major}.{minor}.{patch}"
+    pre = _first([r"PRE\s*=\s*['\"]([^'\"]+)['\"]",
+                  r"def default_prerelease\s+['\"]([^'\"]+)['\"]"])
+    if pre:
+        version += f"-{pre}"
+    build = _first([r"BUILD_METADATA\s*=\s*['\"]([^'\"]+)['\"]"])
+    if build:
+        version += f"+{build}"
+    return version
+
+
 def _fetch_branch_version(repo, branch):
     """Fetch the version from a repo branch's lib/mastodon/version.rb.
 
@@ -353,6 +392,36 @@ def check_mastodon_release():
         return False, "", ""
 
 
+def _git_stash(ssh, user, app_dir, log, prefix=""):
+    """Run 'git stash' in the app dir. Returns (ok, stashed).
+
+    ``stashed`` is True only when work was actually put on the stash, so the
+    caller knows whether a pop is owed on the failure paths.  'git stash' exits
+    0 with "No local changes to save" on a clean tree.
+    """
+    stdout, stderr, code = ssh.execute_sudo(
+        f"su - {user} -c 'cd {app_dir} && git stash'", timeout=30
+    )
+    log(stdout or stderr or "(no output)")
+    if code != 0:
+        log(f"ERROR: {prefix}git stash failed (exit {code}) — aborting before touching the working tree")
+        return False, False
+    return True, "No local changes" not in (stdout or "")
+
+
+def _git_stash_pop(ssh, user, app_dir, log, prefix=""):
+    """Pop the stash created by :func:`_git_stash`. Returns True on success."""
+    stdout, stderr, code = ssh.execute_sudo(
+        f"su - {user} -c 'cd {app_dir} && git stash pop'", timeout=30
+    )
+    log(stdout or stderr or "(no output)")
+    if code != 0:
+        log(f"WARNING: {prefix}git stash pop failed (exit {code}) — local changes are "
+            f"still on the stash (recover with 'git stash pop' in {app_dir})")
+        return False
+    return True
+
+
 def _run_second_guest_sync(guest, user, app_dir, log, branch=""):
     """Sync code to a second Mastodon app guest via SSH (no DB migrations).
 
@@ -378,10 +447,9 @@ def _run_second_guest_sync(guest, user, app_dir, log, branch=""):
     try:
         with SSHClient.from_credential(guest.ip_address, credential) as ssh:
             log("--- [VM2] git stash ---")
-            stdout, stderr, code = ssh.execute_sudo(
-                f"su - {user} -c 'cd {app_dir} && git stash'", timeout=30
-            )
-            log(stdout or stderr or "(no output)")
+            ok, stashed = _git_stash(ssh, user, app_dir, log, prefix="[VM2] ")
+            if not ok:
+                return False
 
             log(f"--- [VM2] {pull_cmd} ---")
             stdout, stderr, code = ssh.execute_sudo(
@@ -390,15 +458,14 @@ def _run_second_guest_sync(guest, user, app_dir, log, branch=""):
             log(stdout or stderr or "(no output)")
             if code != 0:
                 log(f"ERROR: [VM2] git pull failed (exit {code})")
+                if stashed:
+                    log("--- [VM2] git stash pop (restoring local changes after failure) ---")
+                    _git_stash_pop(ssh, user, app_dir, log, prefix="[VM2] ")
                 return False
 
-            log("--- [VM2] git stash pop ---")
-            stdout, stderr, code = ssh.execute_sudo(
-                f"su - {user} -c 'cd {app_dir} && git stash pop'", timeout=30
-            )
-            log(stdout or stderr or "(no output)")
-            if code != 0:
-                log("WARNING: [VM2] git stash pop returned non-zero (may be no stash to pop)")
+            if stashed:
+                log("--- [VM2] git stash pop ---")
+                _git_stash_pop(ssh, user, app_dir, log, prefix="[VM2] ")
 
             log("--- [VM2] Ensuring runtime versions (Ruby / Bundler / Node.js) ---")
             if not _remediate_environment(ssh, user, app_dir, log):
@@ -485,11 +552,29 @@ def _swap_env_db(ssh, app_dir, new_host, new_port):
         stdout, stderr, code = ssh.execute_sudo(cmd, timeout=10)
         if code != 0:
             return False, f"Failed to update .env.production: {stderr}"
-    # Read back and verify the swap actually took effect
-    verify_out, _, _ = ssh.execute_sudo(
+
+    # Read back and verify the swap actually took effect.  'sed -i' exits 0 when
+    # its pattern matched nothing, so a missing or commented-out DB_HOST/DB_PORT
+    # line would otherwise be reported as a successful swap.
+    verify_out, verify_err, verify_code = ssh.execute_sudo(
         f"grep -E '^DB_HOST=|^DB_PORT=' {env_file}", timeout=10
     )
-    actual = verify_out.strip().replace("\n", "  ")
+    if verify_code != 0:
+        return False, (
+            f"Could not read back .env.production to verify the DB swap: "
+            f"{(verify_err or '').strip() or f'exit {verify_code}'}"
+        )
+    lines = [ln.strip() for ln in (verify_out or "").splitlines() if ln.strip()]
+    actual = "  ".join(lines)
+    missing = [
+        expected for expected in (f"DB_HOST={new_host}", f"DB_PORT={new_port}")
+        if expected not in lines
+    ]
+    if missing:
+        return False, (
+            f".env.production does not contain {' and '.join(missing)} after the "
+            f"swap (actual: {actual or '(no DB_HOST/DB_PORT lines)'})"
+        )
     return True, f"DB config swapped → {new_host}:{new_port}  (actual: {actual})"
 
 
@@ -1093,6 +1178,32 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
     log("=== Step 3: Connecting to Mastodon guest via SSH ===")
 
     env_swapped = False
+    stash_pending = False
+    deployed_version = ""
+
+    def _restore_env(ssh):
+        """Point .env.production back at PGBouncer. Returns True on success."""
+        nonlocal env_swapped
+        ok, msg = _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
+        log(msg)
+        if ok:
+            env_swapped = False
+        else:
+            log("ERROR: could not restore .env.production to PGBouncer — Mastodon may "
+                "still be pointed at the direct database. Fix DB_HOST/DB_PORT in "
+                f"{app_dir}/.env.production and restart mastodon-* before serving traffic.")
+        return ok
+
+    def _abort(ssh, restore_env=True):
+        """Undo the stash / env swap, then build the failure return value."""
+        nonlocal stash_pending
+        if stash_pending:
+            log("--- git stash pop (restoring local changes after failure) ---")
+            _git_stash_pop(ssh, user, app_dir, log)
+            stash_pending = False
+        if restore_env and env_swapped:
+            _restore_env(ssh)
+        return False, "\n".join(log_lines)
 
     try:
         with SSHClient.from_credential(mastodon_guest.ip_address, credential) as ssh:
@@ -1122,17 +1233,17 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
 
             # 2a. git stash
             log("--- git stash ---")
-            stdout, stderr, code = ssh.execute_sudo(
-                f"su - {user} -c 'cd {app_dir} && git stash'", timeout=30
-            )
-            log(stdout or stderr or "(no output)")
+            ok, stashed = _git_stash(ssh, user, app_dir, log)
+            if not ok:
+                return False, "\n".join(log_lines)
+            stash_pending = stashed
 
             # 2b. Swap .env.production to direct DB
             log("--- Swapping .env.production to direct DB ---")
             ok, msg = _swap_env_db(ssh, app_dir, config["direct_db_host"], config["direct_db_port"])
             log(msg)
             if not ok:
-                return False, "\n".join(log_lines)
+                return _abort(ssh, restore_env=False)
             env_swapped = True
 
             # 2c. git pull
@@ -1143,16 +1254,19 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             log(stdout or stderr or "(no output)")
             if code != 0:
                 log(f"ERROR: git pull failed (exit {code})")
-                _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-                env_swapped = False
-                return False, "\n".join(log_lines)
+                return _abort(ssh)
 
             # 2d. git stash pop
-            log("--- git stash pop ---")
-            stdout, stderr, code = ssh.execute_sudo(
-                f"su - {user} -c 'cd {app_dir} && git stash pop'", timeout=30
-            )
-            log(stdout or stderr or "(no output)")
+            if not stash_pending:
+                log("--- git stash pop skipped (nothing was stashed) ---")
+                code = 0
+            else:
+                log("--- git stash pop ---")
+                stdout, stderr, code = ssh.execute_sudo(
+                    f"su - {user} -c 'cd {app_dir} && git stash pop'", timeout=30
+                )
+                log(stdout or stderr or "(no output)")
+                stash_pending = code != 0
             if code != 0:
                 # Check whether stash pop left unmerged files (conflict).
                 # If so, auto-resolve in favour of the stashed (local) version and drop the entry.
@@ -1174,6 +1288,7 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
                     ssh.execute_sudo(
                         f"su - {user} -c 'cd {app_dir} && git stash drop'", timeout=15
                     )
+                    stash_pending = False
                     log("  Stash conflicts resolved.")
                 else:
                     log("WARNING: git stash pop returned non-zero (may be no stash to pop)")
@@ -1185,9 +1300,7 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             log("--- Ensuring runtime versions (Ruby / Bundler / Node.js) ---")
             if not _remediate_environment(ssh, user, app_dir, log):
                 log("ERROR: Runtime version remediation failed. Aborting upgrade.")
-                _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-                env_swapped = False
-                return False, "\n".join(log_lines)
+                return _abort(ssh)
 
             # 2f. bundle install
             log("--- bundle install ---")
@@ -1197,9 +1310,7 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             _log_cmd_output(log, stdout, stderr, code)
             if code != 0:
                 log(f"ERROR: bundle install failed (exit {code})")
-                _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-                env_swapped = False
-                return False, "\n".join(log_lines)
+                return _abort(ssh)
 
             # 2g. yarn install
             log("--- yarn install ---")
@@ -1209,9 +1320,7 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             _log_cmd_output(log, stdout, stderr, code)
             if code != 0:
                 log(f"ERROR: yarn install failed (exit {code})")
-                _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-                env_swapped = False
-                return False, "\n".join(log_lines)
+                return _abort(ssh)
 
             # 2h. Pre-deployment migrations
             log("--- Pre-deployment database migrations ---")
@@ -1223,9 +1332,7 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             _log_cmd_output(log, stdout, stderr, code)
             if code != 0:
                 log(f"ERROR: pre-deployment migrations failed (exit {code})")
-                _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-                env_swapped = False
-                return False, "\n".join(log_lines)
+                return _abort(ssh)
 
             # 2i. Asset precompilation
             log("--- Asset precompilation ---")
@@ -1236,16 +1343,16 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             _log_cmd_output(log, stdout, stderr, code)
             if code != 0:
                 log(f"ERROR: asset precompilation failed (exit {code})")
-                _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-                env_swapped = False
-                return False, "\n".join(log_lines)
+                return _abort(ssh)
 
             # 2j. Restore .env.production to PGBouncer before the intermediate restart
             # so live traffic goes back through the connection pool, not direct PostgreSQL.
             log("--- Restoring .env.production to PGBouncer (pre-restart) ---")
-            ok, msg = _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-            log(msg)
-            env_swapped = False
+            if not _restore_env(ssh):
+                # Restarting now would put live traffic on the direct database,
+                # bypassing the connection pool — abort instead.
+                log("ERROR: aborting before the service restart.")
+                return _abort(ssh, restore_env=False)
 
             # 2k. Restart all mastodon services (now on PGBouncer, running new code)
             log("--- Restarting mastodon services ---")
@@ -1267,7 +1374,7 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             ok, msg = _swap_env_db(ssh, app_dir, config["direct_db_host"], config["direct_db_port"])
             log(msg)
             if not ok:
-                return False, "\n".join(log_lines)
+                return _abort(ssh, restore_env=False)
             env_swapped = True
 
             # 2n. Post-deployment migrations
@@ -1280,15 +1387,13 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             _log_cmd_output(log, stdout, stderr, code)
             if code != 0:
                 log(f"ERROR: post-deployment migrations failed (exit {code})")
-                _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-                env_swapped = False
-                return False, "\n".join(log_lines)
+                return _abort(ssh)
 
             # 2n. Restore .env.production to PGBouncer
             log("--- Restoring .env.production to PGBouncer ---")
-            ok, msg = _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-            log(msg)
-            env_swapped = False
+            if not _restore_env(ssh):
+                log("ERROR: aborting before the final service restart.")
+                return _abort(ssh, restore_env=False)
 
             # 2o. Final service restart
             log("--- Final service restart ---")
@@ -1297,16 +1402,29 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
             )
             log(stdout or stderr or "(no output)")
 
+            # 2p. Read the version actually checked out, rather than assuming the
+            # upgrade landed on whatever the release check last advertised.
+            v_out, _, v_code = ssh.execute_sudo(
+                f"su - {user} -c 'cat {app_dir}/lib/mastodon/version.rb 2>/dev/null'",
+                timeout=15,
+            )
+            if v_code == 0:
+                deployed_version = parse_version_rb(v_out or "") or ""
+                if deployed_version:
+                    log(f"Deployed version (lib/mastodon/version.rb): {deployed_version}")
+                else:
+                    log("WARNING: Could not parse lib/mastodon/version.rb — "
+                        "recording the expected version instead")
+
     except Exception as e:
         log(f"SSH ERROR: {e}")
-        # Try to restore .env.production if we swapped it
-        if env_swapped:
+        # Reconnect to restore .env.production and pop the stash if we owe either.
+        if env_swapped or stash_pending:
             try:
                 with SSHClient.from_credential(mastodon_guest.ip_address, credential) as ssh:
-                    _swap_env_db(ssh, app_dir, config["pgbouncer_host"], config["pgbouncer_port"])
-                    log("Restored .env.production to PGBouncer after failure")
+                    _abort(ssh)
             except Exception:
-                log("WARNING: Could not restore .env.production after failure")
+                log("WARNING: Could not restore .env.production / pop the stash after failure")
         return False, "\n".join(log_lines)
 
     # --- Step 4: Sync code to second Mastodon app guest (if configured) ---
@@ -1318,7 +1436,7 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
 
     # Success - update version tracking
     log("=== Upgrade complete! ===")
-    latest = config["latest_version"] or config["current_version"]
+    latest = deployed_version or config["latest_version"] or config["current_version"]
     now = datetime.now(timezone.utc).isoformat()
     Setting.set("mastodon_current_version", latest)
     Setting.set("mastodon_update_available", "false")
