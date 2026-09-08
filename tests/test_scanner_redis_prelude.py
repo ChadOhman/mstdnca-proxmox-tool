@@ -46,7 +46,11 @@ NORMALISED_TIMEOUT_LINE = b"    s.settimeout(8)"
 
 def _load_baseline(name):
     with open(os.path.join(FIXTURES_DIR, f"{name}.bin"), "rb") as f:
-        return f.read()
+        data = f.read()
+    # The fixtures are committed with LF endings (and marked ``binary`` in
+    # .gitattributes), but normalise defensively so a checkout that applied
+    # core.autocrlf cannot turn a byte-exact comparison into a false failure.
+    return data.replace(b"\r\n", b"\n")
 
 
 def _expected_bytes(baseline):
