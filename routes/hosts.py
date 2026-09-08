@@ -329,10 +329,10 @@ def discover(host_id):
         # Discover guests only on this host's node (not the entire cluster)
         node_name = client.get_local_node_name()
         if node_name:
-            node_guests = client.get_node_guests(node_name)
+            node_guests, guests_complete = client.get_node_guests(node_name, with_completeness=True)
         else:
             # Fallback: if we can't determine the local node, get all guests
-            node_guests = client.get_all_guests()
+            node_guests, guests_complete = client.get_all_guests(with_completeness=True)
             node_name = "cluster"
 
         # Fetch replication info (VMID -> target node)
@@ -351,15 +351,33 @@ def discover(host_id):
         # Clean up duplicates: remove guests on THIS host whose VMID
         # is not actually present on this node (leftover from cluster-wide discovery)
         node_vmids = {g.get("vmid") for g in node_guests}
-        stale = Guest.query.filter(
-            Guest.proxmox_host_id == host.id,
-            Guest.vmid.isnot(None),
-            ~Guest.vmid.in_(node_vmids),
-        ).all()
         removed = 0
-        for s in stale:
-            db.session.delete(s)
-            removed += 1
+        if not node_vmids:
+            logger.warning(
+                "Discovery for host '%s' node '%s' returned no guests; skipping stale-guest "
+                "cleanup to avoid deleting every tracked guest.", host.name, node_name,
+            )
+        elif not guests_complete:
+            logger.warning(
+                "Discovery for host '%s' node '%s' was incomplete (VM or CT listing failed); "
+                "skipping stale-guest cleanup.", host.name, node_name,
+            )
+        else:
+            stale = Guest.query.filter(
+                Guest.proxmox_host_id == host.id,
+                Guest.vmid.isnot(None),
+                ~Guest.vmid.in_(node_vmids),
+            ).all()
+            if stale:
+                tracked = Guest.query.filter(Guest.proxmox_host_id == host.id, Guest.vmid.isnot(None)).count()
+                if tracked and len(stale) > tracked / 2:
+                    logger.warning(
+                        "Stale-guest cleanup for host '%s' node '%s' would remove %d of %d tracked "
+                        "guests.", host.name, node_name, len(stale), tracked,
+                    )
+            for s in stale:
+                db.session.delete(s)
+                removed += 1
 
         added = 0
         updated = 0
@@ -479,9 +497,9 @@ def discover_all():
             client = ProxmoxClient(host)
             node_name = client.get_local_node_name()
             if node_name:
-                node_guests = client.get_node_guests(node_name)
+                node_guests, guests_complete = client.get_node_guests(node_name, with_completeness=True)
             else:
-                node_guests = client.get_all_guests()
+                node_guests, guests_complete = client.get_all_guests(with_completeness=True)
                 node_name = "cluster"
 
             repl_map = client.get_replication_map()
@@ -497,13 +515,31 @@ def discover_all():
                 return _cache[name]
 
             node_vmids = {g.get("vmid") for g in node_guests}
-            stale = Guest.query.filter(
-                Guest.proxmox_host_id == host.id,
-                Guest.vmid.isnot(None),
-                ~Guest.vmid.in_(node_vmids),
-            ).all()
-            for s in stale:
-                db.session.delete(s)
+            if not node_vmids:
+                logger.warning(
+                    "Discovery for host '%s' node '%s' returned no guests; skipping stale-guest "
+                    "cleanup to avoid deleting every tracked guest.", host.name, node_name,
+                )
+            elif not guests_complete:
+                logger.warning(
+                    "Discovery for host '%s' node '%s' was incomplete (VM or CT listing failed); "
+                    "skipping stale-guest cleanup.", host.name, node_name,
+                )
+            else:
+                stale = Guest.query.filter(
+                    Guest.proxmox_host_id == host.id,
+                    Guest.vmid.isnot(None),
+                    ~Guest.vmid.in_(node_vmids),
+                ).all()
+                if stale:
+                    tracked = Guest.query.filter(Guest.proxmox_host_id == host.id, Guest.vmid.isnot(None)).count()
+                    if tracked and len(stale) > tracked / 2:
+                        logger.warning(
+                            "Stale-guest cleanup for host '%s' node '%s' would remove %d of %d tracked "
+                            "guests.", host.name, node_name, len(stale), tracked,
+                        )
+                for s in stale:
+                    db.session.delete(s)
 
             added = 0
             updated = 0
