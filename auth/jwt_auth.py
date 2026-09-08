@@ -13,8 +13,7 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 import jwt
-from flask import current_app, jsonify, request
-from flask_login import login_user
+from flask import current_app, g, jsonify, request
 
 from models import User, db
 
@@ -28,22 +27,86 @@ REFRESH_TOKEN_EXPIRES = timedelta(days=30)
 # ---------------------------------------------------------------------------
 _API_FAIL_WINDOW = 300  # 5-minute sliding window
 _API_FAIL_LIMIT = 5     # stricter than web login (10)
+_API_FAIL_MAX_KEYS = 4096  # hard cap so a flood of distinct IPs cannot grow the dict
 
 _api_failed_attempts: dict = collections.defaultdict(list)
 _api_failed_lock = threading.Lock()
+
+
+def _prune_api_failed_attempts(cutoff: float) -> None:
+    """Drop buckets with no attempt newer than ``cutoff``. Caller holds the lock.
+
+    Without this the dict only ever grows: every distinct source IP that fails an
+    API login leaves a permanent (eventually empty) entry behind.
+    """
+    for key in [k for k, v in _api_failed_attempts.items() if not v or v[-1] <= cutoff]:
+        del _api_failed_attempts[key]
+    if len(_api_failed_attempts) > _API_FAIL_MAX_KEYS:
+        # Still over the cap after pruning: evict the least recently active keys.
+        stale = sorted(_api_failed_attempts, key=lambda k: _api_failed_attempts[k][-1])
+        for key in stale[: len(_api_failed_attempts) - _API_FAIL_MAX_KEYS]:
+            del _api_failed_attempts[key]
 
 
 def check_api_rate_limit(ip: str) -> bool:
     """Return True if this IP is currently locked out."""
     cutoff = time.time() - _API_FAIL_WINDOW
     with _api_failed_lock:
-        _api_failed_attempts[ip] = [t for t in _api_failed_attempts[ip] if t > cutoff]
-        return len(_api_failed_attempts[ip]) >= _API_FAIL_LIMIT
+        _prune_api_failed_attempts(cutoff)
+        recent = [t for t in _api_failed_attempts.get(ip, []) if t > cutoff]
+        if recent:
+            _api_failed_attempts[ip] = recent
+        else:
+            _api_failed_attempts.pop(ip, None)
+        return len(recent) >= _API_FAIL_LIMIT
 
 
 def record_api_failed_login(ip: str) -> None:
     with _api_failed_lock:
         _api_failed_attempts[ip].append(time.time())
+        _prune_api_failed_attempts(time.time() - _API_FAIL_WINDOW)
+
+
+# ---------------------------------------------------------------------------
+# Password-change invalidation
+# ---------------------------------------------------------------------------
+
+def tokens_valid_after(user):
+    """Return the user's ``tokens_valid_after`` as an aware UTC datetime, or None.
+
+    SQLite hands back naive datetimes; everything stored in this column is UTC.
+    """
+    value = getattr(user, "tokens_valid_after", None)
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def credential_epoch(user):
+    """Integer stamp of the user's last password change, or None if never.
+
+    Tokens and "remember me" markers carry the epoch that was current when they
+    were minted.  Comparing epochs for equality avoids the one-second ambiguity
+    an ``iat``-vs-timestamp comparison would have (a JWT ``iat`` has only second
+    resolution, so a token minted in the same second as a password change could
+    not otherwise be told apart from one minted just before it).
+    """
+    floor = tokens_valid_after(user)
+    if floor is None:
+        return None
+    return int(floor.timestamp())
+
+
+def token_predates_password_change(user, payload) -> bool:
+    """True when this token was issued before the user's last password change."""
+    epoch = credential_epoch(user)
+    if epoch is None:
+        # The account has never changed its password since the column existed:
+        # there is nothing to invalidate against.
+        return False
+    return payload.get("pwd") != epoch
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +120,7 @@ def create_access_token(user):
         "sub": str(user.id),
         "role": user.role,
         "type": "access",
+        "pwd": credential_epoch(user),
         "iat": now,
         "exp": now + ACCESS_TOKEN_EXPIRES,
     }
@@ -71,6 +135,7 @@ def create_refresh_token(user):
         "sub": str(user.id),
         "type": "refresh",
         "jti": jti,
+        "pwd": credential_epoch(user),
         "iat": now,
         "exp": now + REFRESH_TOKEN_EXPIRES,
     }
@@ -91,7 +156,7 @@ def decode_token(token_str):
         token_str,
         current_app.config["SECRET_KEY"],
         algorithms=["HS256"],
-        options={"require": ["sub", "type", "exp"]},
+        options={"require": ["sub", "type", "exp", "iat"]},
     )
 
 
@@ -120,8 +185,13 @@ def is_token_revoked(jti):
 def jwt_required(f):
     """Decorator that requires a valid access token in the Authorization header.
 
-    On success, sets current_user via login_user() so that existing permission
-    checks and audit logging work unchanged.
+    On success the authenticated user is published for the duration of the
+    request through Flask-Login's request-scoped slot (``g._login_user``), which
+    is what ``current_user`` resolves to, so existing permission checks and
+    audit logging work unchanged.  It deliberately does NOT call ``login_user``:
+    that wrote ``_user_id`` into the Flask session and made every bearer-token
+    request emit ``Set-Cookie: session=...``, upgrading a 15-minute token into a
+    durable, untracked browser session that outlived it.
     """
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -145,8 +215,12 @@ def jwt_required(f):
         if not user or not user.is_active:
             return jsonify({"error": {"code": "UNAUTHORIZED", "message": "User not found or inactive"}}), 401
 
-        # Set current_user for the request so existing permission checks work
-        login_user(user, remember=False)
+        if token_predates_password_change(user, payload):
+            return jsonify({"error": {"code": "TOKEN_REVOKED",
+                                      "message": "Token was issued before the last password change"}}), 401
+
+        # Publish the user for this request only -- no session, no cookie.
+        g._login_user = user
 
         return f(*args, **kwargs)
     return decorated

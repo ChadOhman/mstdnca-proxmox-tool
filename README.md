@@ -87,13 +87,47 @@ cd /tmp/mstdnca && bash scripts/setup.sh
 Once deployed, open `http://<CT-IP>:5000` in your browser.
 
 - **Username:** `admin`
-- **Password:** randomly generated on first start — retrieve it with:
+- **Password:** randomly generated on first start and written to a root-only
+  file (mode `0600`) — read it with:
 
 ```bash
-journalctl -u mstdnca-proxmox-tool | grep -A3 'DEFAULT ADMIN'
+sudo cat /var/lib/mstdnca/initial-admin-password
 ```
 
-**Change the generated password after first login** via the user dropdown menu.
+The password is never printed to the console or the journal. The first login is
+forced through **Change Password**; the file is deleted as soon as you set a new
+one, and every API token and saved login issued earlier stops working.
+
+### Deployment: reverse proxies and client IPs
+
+Every IP-based decision in the app — the local-network bypass, login rate
+limiting, and the `ip_address` column of the audit log — uses the address of the
+TCP connection. `X-Forwarded-For`, `X-Real-IP` and `CF-Connecting-IP` are
+client-supplied, so they are only honoured when you tell the app how many
+reverse proxies you actually operate:
+
+| `TRUSTED_PROXY_COUNT` | Meaning |
+| --- | --- |
+| `0` (default) | Clients connect straight to gunicorn. Forwarded headers are ignored everywhere. |
+| `1` | Exactly one proxy you control (cloudflared, nginx) fronts the app and appends `X-Forwarded-For`. |
+| `N` | N chained proxies you control. |
+
+**If you put cloudflared or nginx in front of this app, set
+`TRUSTED_PROXY_COUNT=1`** in the systemd unit
+(`/etc/systemd/system/mstdnca-proxmox-tool.service`) and restart the service —
+otherwise every request appears to come from the proxy and LAN bypass, rate
+limiting and audit entries will all key on the proxy's address:
+
+```ini
+Environment=TRUSTED_PROXY_COUNT=1
+```
+
+Never set it higher than the number of proxies you control: each extra hop lets
+the client choose one more entry of `X-Forwarded-For`, i.e. forge its own IP.
+
+The listen address is configurable too — `scripts/setup.sh --bind 127.0.0.1:5000`
+(or `Environment=BIND_ADDR=...` in the unit) when a proxy on the same host fronts
+the app. The default stays `0.0.0.0:5000` for direct LAN access.
 
 ## Configuration
 
@@ -241,7 +275,9 @@ If you don't have a tunnel yet:
 
 ## Local Network Bypass
 
-Under **Settings > Local Network Access**, trusted subnets (default `10.0.0.0/8`) are automatically authenticated as admin without login. This allows seamless LAN access while requiring authentication for external connections.
+Under **Settings > Local Network Access**, requests from a trusted subnet are automatically authenticated as admin without login. This allows seamless LAN access while requiring authentication for external connections.
+
+No subnets are trusted until you enter them — the field starts empty, and `0.0.0.0/0` / `::/0` are rejected. These sessions are recorded like any other login (visible and revocable under **Profile > Sessions** and **Security > Sessions**, audited as `login_local_bypass`) and are re-checked on every request, so disabling the bypass or narrowing the subnet list ends them immediately. Because the match is on the connection's source address, this feature only behaves correctly behind a proxy when `TRUSTED_PROXY_COUNT` is set (see [Deployment](#deployment-reverse-proxies-and-client-ips)).
 
 ## Updating
 

@@ -146,11 +146,16 @@ if [ -d "$GIT_DIR/.git" ]; then
         # Private repo: authenticate this fetch only via an ephemeral header.
         # GitHub git-over-HTTPS requires Basic auth with the token as the password
         # (it rejects "Authorization: Bearer" for git transport — that is only for
-        # the REST API). -c http.extraheader keeps the token out of .git/config; the
-        # base64 value is not echoed, git does not print header values, and this
-        # script does not run `set -x`, so the token never reaches the update log.
+        # the REST API).  The header is handed to git through GIT_CONFIG_* in the
+        # environment rather than `git -c ...`: a command-line argument is visible
+        # in /proc/<pid>/cmdline and to `ps` for anyone on the box while the fetch
+        # runs.  It still never lands in .git/config, is not echoed, is not printed
+        # by git, and this script does not run `set -x`, so it stays out of the log.
         _gh_basic=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
-        git -c http.extraheader="Authorization: Basic $_gh_basic" fetch origin 2>&1 | sed 's/^/    /'
+        GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0=http.extraheader \
+        GIT_CONFIG_VALUE_0="Authorization: Basic $_gh_basic" \
+            git fetch origin 2>&1 | sed 's/^/    /'
         fetch_status=${PIPESTATUS[0]}
         unset _gh_basic
     else

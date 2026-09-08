@@ -565,7 +565,7 @@
 
                             <div class="mb-3">
                                 <label class="form-label">Trusted Subnets</label>
-                                <input type="text" class="form-control font-monospace" name="trusted_subnets" value="{{ settings.trusted_subnets or '10.0.0.0/8' }}" placeholder="10.0.0.0/8">
+                                <input type="text" class="form-control font-monospace" name="trusted_subnets" value="{{ settings.trusted_subnets }}" placeholder="e.g. 10.0.0.0/8">
                                 <div class="form-text">
                                     Comma-separated CIDR notation. Common examples:<br>
                                     <code>10.0.0.0/8</code> (Class A private),
@@ -614,7 +614,7 @@
                                 <td class="text-muted">LAN Bypass</td>
                                 <td>
                                     {% if settings.local_bypass_enabled != 'false' %}
-                                    <span class="badge bg-info">{{ settings.trusted_subnets or '10.0.0.0/8' }}</span>
+                                    <span class="badge bg-info">{{ settings.trusted_subnets or 'No subnets trusted' }}</span>
                                     {% else %}
                                     <span class="badge bg-secondary">Disabled</span>
                                     {% endif %}

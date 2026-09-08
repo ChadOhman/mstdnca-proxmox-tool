@@ -4,9 +4,10 @@ set -e
 # ============================================================
 # Mastodon Canada Administration Tool - CT Setup Script
 # Run this inside a fresh Debian/Ubuntu LXC container
-# Usage: bash setup.sh [--version <TAG>] [--cloudflared]
+# Usage: bash setup.sh [--version <TAG>] [--cloudflared] [--bind <ADDR:PORT>]
 #   --version <TAG>  Checkout a specific version tag (default: main branch)
 #   --cloudflared    Also install cloudflared for CF Zero Trust tunnel
+#   --bind <A:P>     gunicorn listen address (default: 0.0.0.0:5000, LAN access)
 # ============================================================
 
 APP_NAME="mstdnca-proxmox-tool"
@@ -17,6 +18,10 @@ SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 REPO_URL="https://github.com/ChadOhman/mstdnca-proxmox-tool.git"
 INSTALL_CLOUDFLARED=false
 TARGET_VERSION=""
+# gunicorn listen address. The tool is normally reached over the datacenter LAN,
+# so this stays 0.0.0.0:5000; pass --bind 127.0.0.1:5000 when a reverse proxy on
+# this host fronts it (and set TRUSTED_PROXY_COUNT=1 in the unit).
+BIND_ADDR="${BIND_ADDR:-0.0.0.0:5000}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -27,6 +32,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --version)
             TARGET_VERSION="$2"
+            shift 2
+            ;;
+        --bind)
+            BIND_ADDR="$2"
             shift 2
             ;;
         *)
@@ -166,7 +175,18 @@ Environment=FLASK_SECRET_KEY_FILE=$SECRET_DIR/flask_secret
 # session cookie back over plain HTTP (see config.py). Remove this line (and
 # restart the service) to require HTTPS; scripts/update.sh will not re-add it.
 Environment=SESSION_COOKIE_SECURE=0
-ExecStart=$APP_DIR/venv/bin/gunicorn --worker-class gevent --bind 0.0.0.0:5000 --workers 1 --timeout 120 "app:create_app()"
+# Number of reverse proxies you operate in front of this app. 0 means clients
+# connect directly, so X-Forwarded-For / CF-Connecting-IP are ignored entirely
+# and every IP-based decision (local-network bypass, login rate limiting, audit
+# log) uses the real TCP peer. Set this to 1 if you put cloudflared or nginx in
+# front, otherwise those decisions will see the proxy's address instead of the
+# client's. Never set it higher than the number of proxies you actually control.
+Environment=TRUSTED_PROXY_COUNT=0
+# Listen address. Defaults to the LAN-reachable 0.0.0.0:5000 so the tool can be
+# used directly from the datacenter network. Change to 127.0.0.1:5000 when a
+# reverse proxy on this host fronts the app (and set TRUSTED_PROXY_COUNT=1).
+Environment=BIND_ADDR=$BIND_ADDR
+ExecStart=$APP_DIR/venv/bin/gunicorn --worker-class gevent --bind \${BIND_ADDR} --workers 1 --timeout 120 "app:create_app()"
 Restart=always
 RestartSec=5
 # Hardening directives that cannot break the app (verified against clients/ssh_client.py,
@@ -223,9 +243,10 @@ echo "============================================"
 echo ""
 echo " Web UI:    http://$(hostname -I | awk '{print $1}'):5000"
 echo " Username:  admin"
-echo " Password:  generated on first start (view with: journalctl -u $APP_NAME | grep -A3 'DEFAULT ADMIN')"
+echo " Password:  generated on first start (read with: sudo cat $DATA_DIR/initial-admin-password)"
 echo ""
-echo " IMPORTANT: Change the generated password after first login!"
+echo " IMPORTANT: the first login is forced through Change Password; the file above"
+echo "            is deleted once you set a new one."
 echo ""
 echo " Service commands:"
 echo "   systemctl status $APP_NAME"

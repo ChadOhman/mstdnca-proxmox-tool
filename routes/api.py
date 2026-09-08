@@ -393,9 +393,15 @@ def scan_single(guest_id):
     guest = Guest.query.get_or_404(guest_id)
 
     # Check permission
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to scan this guest.", "error")
         return redirect(url_for("guests.index"))
+
+    # A scan opens an SSH session and runs package-manager commands on the
+    # guest, so it needs the same "Apply Updates" permission as /apply.
+    if not current_user.can_update:
+        flash("You don't have permission to scan guests.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest_id))
 
     with _scan_jobs_lock:
         existing = _scan_jobs.get(guest_id)
@@ -426,7 +432,7 @@ def scan_single(guest_id):
 @login_required
 def scan_status(guest_id):
     guest = Guest.query.get_or_404(guest_id)
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         return jsonify({"error": "forbidden"}), 403
 
     job = _scan_jobs.get(guest_id)
@@ -580,7 +586,7 @@ def scan_all_status():
 def apply(guest_id):
     guest = Guest.query.get_or_404(guest_id)
 
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to update this guest.", "error")
         return redirect(url_for("guests.index"))
 
@@ -642,7 +648,7 @@ def apply(guest_id):
 def update_progress(guest_id):
     guest = Guest.query.get_or_404(guest_id)
 
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to view this guest.", "error")
         return redirect(url_for("guests.index"))
 
@@ -658,7 +664,7 @@ def update_progress(guest_id):
 @login_required
 def update_status(guest_id):
     guest = Guest.query.get_or_404(guest_id)
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         return jsonify({"error": "forbidden"}), 403
 
     job = _update_jobs.get(guest_id)
@@ -671,7 +677,7 @@ def update_status(guest_id):
 @login_required
 def update_cancel(guest_id):
     guest = Guest.query.get_or_404(guest_id)
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest) or not current_user.can_update:
         return jsonify({"ok": False, "error": "forbidden"}), 403
 
     with _jobs_lock:
@@ -786,7 +792,7 @@ def apply_all():
     targets = []
     for guest in candidates:
         # Tag scoping: non-admins only act on guests they can access.
-        if not current_user.is_admin and not current_user.can_access_guest(guest):
+        if not current_user.may_access_guest(guest):
             continue
         if not guest.pending_updates():
             continue
@@ -1056,7 +1062,7 @@ def start_proxmox_job(guest, job_type, upid, node):
 def task_progress(guest_id, job_type):
     guest = Guest.query.get_or_404(guest_id)
 
-    if not current_user.can_manage_guests and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to view this guest.", "error")
         return redirect(url_for("guests.index"))
 
@@ -1073,7 +1079,7 @@ def task_progress(guest_id, job_type):
 @login_required
 def task_status(guest_id, job_type):
     guest = Guest.query.get_or_404(guest_id)
-    if not current_user.can_manage_guests and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         return jsonify({"error": "forbidden"}), 403
 
     job_key = f"{job_type}:{guest_id}"
@@ -1087,7 +1093,7 @@ def task_status(guest_id, job_type):
 @login_required
 def task_cancel(guest_id, job_type):
     guest = Guest.query.get_or_404(guest_id)
-    if not current_user.can_manage_guests and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest) or not current_user.can_manage_guests:
         return jsonify({"ok": False, "error": "forbidden"}), 403
 
     job_key = f"{job_type}:{guest_id}"
@@ -1121,7 +1127,7 @@ def guest_rrd(guest_id):
 
     guest = Guest.query.get_or_404(guest_id)
 
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         return jsonify({"error": "Permission denied"}), 403
 
     if not guest.proxmox_host or not guest.vmid:
@@ -1462,6 +1468,17 @@ def dashboard_guest_stats():
         if g.proxmox_host_id and g.vmid:
             db_lookup[(g.proxmox_host_id, g.vmid)] = g
 
+    # Tag scope is independent of the tag *filter*: a non-admin never sees a
+    # guest outside their tags, whatever ?tag= asks for (and never sees a
+    # guest that exists on the host but not in the database).
+    accessible = None
+    if not current_user.is_admin:
+        accessible = {
+            (g.proxmox_host_id, g.vmid)
+            for g in current_user.accessible_guests()
+            if g.proxmox_host_id and g.vmid
+        }
+
     results = []
     for host in hosts:
         if host.is_pbs:
@@ -1479,6 +1496,8 @@ def dashboard_guest_stats():
 
             vmid = g.get("vmid")
             db_guest = db_lookup.get((host.id, vmid))
+            if accessible is not None and (host.id, vmid) not in accessible:
+                continue
             # When a tag filter is active, skip guests not in the filtered set.
             if tag_filter and db_guest is None:
                 continue
@@ -1534,10 +1553,20 @@ def host_guest_stats(host_id):
         logger.exception("Host guest stats error for host %s", host_id)
         return jsonify({"error": "Failed to fetch host guest statistics."}), 500
 
+    # Non-admins only see the VMIDs of guests carrying one of their tags.
+    accessible_vmids = None
+    if not current_user.is_admin:
+        accessible_vmids = {
+            g.vmid for g in current_user.accessible_guests()
+            if g.proxmox_host_id == host.id and g.vmid
+        }
+
     stats = {}
     for g in raw:
         vmid = g.get("vmid")
         if vmid is None:
+            continue
+        if accessible_vmids is not None and vmid not in accessible_vmids:
             continue
         mem_used = g.get("mem", 0)
         mem_total = g.get("maxmem", 0) or 1
@@ -1563,7 +1592,7 @@ def host_guest_stats(host_id):
 def guest_unifi_stats(guest_id):
     """Return fresh UniFi stats for a guest as JSON (used for live polling)."""
     guest = Guest.query.get_or_404(guest_id)
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         return jsonify({"error": "forbidden"}), 403
 
     if not guest.mac_address:
@@ -1613,7 +1642,35 @@ def collab_stream():
     page = request.args.get("page", "/")
     if not _is_safe_relative_page(page):
         return jsonify({"error": "invalid_page"}), 400
-    event_queue = collab_hub.connect(user_id, username, display_name, page=page)
+    # Captured now so the hub can filter guest-scoped events per recipient
+    # without a database round-trip on the fan-out path.
+    is_admin = current_user.is_admin
+    tag_ids = {t.id for t in current_user.allowed_tags}
+    event_queue = collab_hub.connect(user_id, username, display_name, page=page,
+                                     is_admin=is_admin, tag_ids=tag_ids)
+
+    # Revocation is otherwise only enforced in before_request, which a stream
+    # that never returns does not run again.  Capture the tracked session id up
+    # front and re-check it on every keepalive tick.
+    from flask import session as _flask_session
+
+    from auth.session_manager import SESSION_KEY, _hash_session_id
+    _raw_sid = _flask_session.get(SESSION_KEY)
+    _session_hash = _hash_session_id(_raw_sid) if _raw_sid else None
+
+    def _still_authorized():
+        from models import User, UserSession
+        try:
+            user = db.session.get(User, user_id)
+            if user is None or not user.is_active:
+                return False
+            if _session_hash:
+                record = UserSession.query.filter_by(session_id_hash=_session_hash).first()
+                if record is None or record.revoked:
+                    return False
+        except Exception:
+            logger.debug("Collaboration stream revocation re-check failed", exc_info=True)
+        return True
 
     @stream_with_context
     def generate():
@@ -1628,6 +1685,10 @@ def collab_stream():
                         break
                     yield f"data: {_json.dumps(event)}\n\n"
                 except queue.Empty:
+                    if not _still_authorized():
+                        logger.info("Closing collaboration stream for user %s: access revoked", user_id)
+                        yield f"data: {_json.dumps({'type': 'revoked'})}\n\n"
+                        break
                     yield ": keepalive\n\n"   # prevent proxy timeouts
         except GeneratorExit:
             pass
@@ -1668,7 +1729,7 @@ def collab_terminal_sessions():
         guest = Guest.query.get(s.guest_id)
         if not guest:
             continue
-        if not current_user.is_admin and not current_user.can_access_guest(guest):
+        if not current_user.may_access_guest(guest):
             continue
         sessions.append({
             "session_id": s.session_id,

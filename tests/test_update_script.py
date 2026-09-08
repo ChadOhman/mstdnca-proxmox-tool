@@ -45,9 +45,22 @@ def test_script_syntax_is_valid():
 def test_fetch_uses_token_extraheader_when_present():
     content = _read()
     assert 'GITHUB_TOKEN' in content
-    assert 'http.extraheader=' in content
-    # token is passed via -c extraheader, never embedded in a remote URL
+    assert 'GIT_CONFIG_KEY_0=http.extraheader' in content
+    # token is passed via an ephemeral header, never embedded in a remote URL
     assert '@github.com' not in content
+
+
+def test_fetch_passes_token_via_environment_not_argv():
+    """The Authorization header must never appear in the fetch command line.
+
+    `git -c http.extraheader="Authorization: Basic ..."` put the credential in
+    /proc/<pid>/cmdline, readable by every local user for the duration of the
+    fetch.  GIT_CONFIG_COUNT/KEY/VALUE pass it through the environment instead.
+    """
+    content = _read()
+    assert 'GIT_CONFIG_COUNT=1' in content
+    assert 'GIT_CONFIG_VALUE_0="Authorization: Basic $_gh_basic"' in content
+    assert '-c http.extraheader=' not in content
 
 
 def test_fetch_uses_basic_auth_not_bearer():

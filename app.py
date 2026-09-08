@@ -46,13 +46,24 @@ def create_app(test_config=None):
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config.from_object(Config)
 
-    # Trust one layer of reverse-proxy headers (nginx, Cloudflare, etc.).
-    # This makes request.remote_addr reflect the real client IP.
-    from werkzeug.middleware.proxy_fix import ProxyFix
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-
     if test_config:
         app.config.update(test_config)
+
+    # Reverse-proxy header trust is opt-in.  ProxyFix rewrites REMOTE_ADDR from
+    # the client-supplied X-Forwarded-For header, so installing it when nothing
+    # trustworthy sits in front of the app would let any client choose its own
+    # source IP.  With TRUSTED_PROXY_COUNT=0 (the default) it is not installed at
+    # all and request.remote_addr stays the real TCP peer everywhere.
+    proxy_count = app.config.get("TRUSTED_PROXY_COUNT", 0) or 0
+    if proxy_count > 0:
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=proxy_count,
+            x_proto=proxy_count,
+            x_host=proxy_count,
+            x_prefix=proxy_count,
+        )
 
     # Ensure data directory exists
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -75,6 +86,7 @@ def create_app(test_config=None):
         _migrate_moderation_columns()
         _migrate_smcipmi_to_ipmi_exporter()
         _migrate_guest_lock_column()
+        _migrate_user_security_columns()
         _ensure_guest_vmid_unique_index()
         _seed_roles()
         _ensure_default_admin()
@@ -417,6 +429,17 @@ def _migrate_guest_lock_column():
     _add_column_if_missing("guests", "lock_reason", "VARCHAR(32)")
 
 
+def _migrate_user_security_columns():
+    """Add the credential-invalidation columns to pre-existing user rows.
+
+    Both default to "nothing to enforce" so existing accounts are unaffected:
+    ``tokens_valid_after`` stays NULL until the next password change and
+    ``must_change_password`` defaults to 0.
+    """
+    _add_column_if_missing("users", "tokens_valid_after", "DATETIME")
+    _add_column_if_missing("users", "must_change_password", "BOOLEAN DEFAULT 0")
+
+
 def _ensure_guest_vmid_unique_index():
     """Create the (proxmox_host_id, vmid) unique index on pre-existing databases.
 
@@ -473,8 +496,48 @@ def _seed_roles():
     logger.info(f"Seeded {len(DEFAULT_ROLES)} default roles.")
 
 
+INITIAL_ADMIN_PASSWORD_FILE = "initial-admin-password"
+
+
+def initial_admin_password_path():
+    """Absolute path of the one-time bootstrap password file."""
+    return os.path.join(DATA_DIR, INITIAL_ADMIN_PASSWORD_FILE)
+
+
+def _write_initial_admin_password(password):
+    """Write the bootstrap password to a 0600 file and return its path.
+
+    The file is created with ``O_CREAT | O_EXCL | O_WRONLY`` so the mode is
+    applied atomically at creation rather than after a umask-widened open, and
+    so an existing path (including a symlink planted by another user) is never
+    followed.  Returns None when the file could not be written.
+    """
+    path = initial_admin_password_path()
+    try:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, (password + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        return path
+    except OSError:
+        logger.warning("Could not write the initial admin password file at %s", path, exc_info=True)
+        return None
+
+
 def _ensure_default_admin():
-    """Create default admin user if no users exist."""
+    """Create default admin user if no users exist.
+
+    The generated password is never printed or logged -- it used to go to both
+    stdout and the logger, which put it in journald forever.  It is written to
+    a 0600 file under DATA_DIR instead and the account is flagged
+    ``must_change_password``, so the first login is forced through
+    /change-password (which then deletes the file).
+    """
     if User.query.count() == 0:
         sa_role = Role.query.filter_by(name="super_admin").first()
         if not sa_role:
@@ -487,20 +550,21 @@ def _ensure_default_admin():
             role_id=sa_role.id,
         )
         admin.set_password(default_password)
+        admin.must_change_password = True
         db.session.add(admin)
         db.session.commit()
-        logger.warning("=" * 60)
-        logger.warning("  DEFAULT ADMIN ACCOUNT CREATED")
-        logger.warning("  Username: admin")
-        logger.warning("  Password: %s", default_password)
-        logger.warning("  Please change this password immediately!")
-        logger.warning("=" * 60)
-        print("=" * 60)
-        print("  DEFAULT ADMIN ACCOUNT CREATED")
-        print("  Username: admin")
-        print(f"  Password: {default_password}")
-        print("  Please change this password immediately!")
-        print("=" * 60)
+        path = _write_initial_admin_password(default_password)
+        location = path or "(could not be written -- reset the password manually)"
+        banner = (
+            "=" * 60
+            + "\n  DEFAULT ADMIN ACCOUNT CREATED"
+            + "\n  Username: admin"
+            + f"\n  Password file (mode 0600): {location}"
+            + "\n  You must change this password at first login."
+            + "\n" + "=" * 60
+        )
+        logger.warning("%s", banner)
+        print(banner)
 
 
 if __name__ == "__main__":

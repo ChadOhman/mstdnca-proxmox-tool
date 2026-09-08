@@ -2,21 +2,126 @@ import io
 import json
 import logging
 import queue as _queue
+import re
 import threading
 import time as _time
+from urllib.parse import urlsplit
 
 import paramiko
-from flask import Blueprint, flash, redirect, render_template, request, session, url_for
+from flask import Blueprint, current_app, flash, redirect, render_template, request, session, url_for
 from flask_login import current_user, login_required
 from flask_sock import Sock
 
 from auth.audit import log_action
 from auth.credential_store import decrypt
+from auth.session_manager import SESSION_KEY, _hash_session_id
 from models import Credential, Guest, Tag, db
 
 logger = logging.getLogger(__name__)
 
 _IDLE_TIMEOUT = 1800  # 30 minutes — close idle SSH terminals automatically
+
+# How long a server-observed sudo password prompt keeps a client "sudo" message
+# honourable, plus a rate limit so the stored password cannot be sprayed into
+# the shell (and into the follower catch-up buffer and ~/.bash_history).
+_SUDO_PROMPT_WINDOW = 15   # seconds
+_SUDO_RATE_WINDOW = 60     # seconds
+_SUDO_RATE_LIMIT = 3       # injections per _SUDO_RATE_WINDOW
+
+# How often a live terminal re-checks that its operator is still authorised.
+_REVOCATION_CHECK_INTERVAL = 60  # seconds
+
+# Prompts emitted by sudo (and by su / ssh password auth) on the outbound stream.
+_SUDO_PROMPT_RE = re.compile(
+    r"\[sudo\] password for |sorry, try again|^[^\n]{0,40}password[^\n]{0,40}:\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def looks_like_sudo_prompt(data: str) -> bool:
+    """True when server output looks like a password prompt awaiting input."""
+    if not data:
+        return False
+    return _SUDO_PROMPT_RE.search(data) is not None
+
+
+class SudoGate:
+    """Server-side gate for the client's sudo-password-injection message.
+
+    The browser used to decide on its own whether a sudo prompt was on screen,
+    so any terminal user could send the message at will and have the stored
+    sudo password echoed into the shell.  The gate only opens when the server
+    itself saw a prompt in the outbound stream recently, and never more than
+    ``_SUDO_RATE_LIMIT`` times per ``_SUDO_RATE_WINDOW``.
+    """
+
+    def __init__(self, prompt_window=_SUDO_PROMPT_WINDOW, rate_window=_SUDO_RATE_WINDOW,
+                 rate_limit=_SUDO_RATE_LIMIT, clock=_time.monotonic):
+        self._prompt_window = prompt_window
+        self._rate_window = rate_window
+        self._rate_limit = rate_limit
+        self._clock = clock
+        self._last_prompt_at = None
+        self._injections = []
+        self._lock = threading.Lock()
+
+    def note_prompt(self):
+        """Record that a password prompt was just seen on the outbound stream."""
+        with self._lock:
+            self._last_prompt_at = self._clock()
+
+    def allow(self):
+        """Return (allowed, reason). Consumes the prompt when it allows."""
+        now = self._clock()
+        with self._lock:
+            if self._last_prompt_at is None or now - self._last_prompt_at > self._prompt_window:
+                return False, "no_recent_sudo_prompt"
+            self._injections = [t for t in self._injections if now - t < self._rate_window]
+            if len(self._injections) >= self._rate_limit:
+                return False, "rate_limited"
+            self._injections.append(now)
+            # One prompt authorises one injection.
+            self._last_prompt_at = None
+            return True, None
+
+
+def ws_origin_allowed(origin, host) -> bool:
+    """True when a WebSocket handshake's ``Origin`` matches the served host.
+
+    ``_csrf_origin_check`` in app.py only guards unsafe HTTP methods and a
+    WebSocket handshake is a GET, so without this check a page on any other
+    site could open a socket to a live root shell using the browser's ambient
+    cookies.  Only the host is compared (scheme- and case-insensitively) so a
+    TLS-terminating reverse proxy does not break same-origin connections.
+    Requests with no ``Origin`` header are refused: every browser sends one on
+    a WebSocket handshake.
+    """
+    if not origin or not host:
+        return False
+    netloc = urlsplit(origin).netloc or origin
+    return netloc.strip().lower() == host.strip().lower()
+
+
+def _revocation_reason(app, user_id, session_hash):
+    """Return a reason string when a live session's operator lost their access.
+
+    ``auth.session_manager`` only enforces revocation in ``before_request``,
+    which a long-lived WebSocket never runs again after the handshake.
+    """
+    try:
+        with app.app_context():
+            from models import User, UserSession
+            user = db.session.get(User, user_id)
+            if user is None or not user.is_active:
+                return "user_disabled"
+            if session_hash:
+                record = UserSession.query.filter_by(session_id_hash=session_hash).first()
+                if record is None or record.revoked:
+                    return "session_revoked"
+    except Exception:
+        logger.debug("Terminal revocation re-check failed", exc_info=True)
+    return None
+
 
 bp = Blueprint("terminal", __name__)
 sock = Sock()
@@ -84,7 +189,7 @@ def _ws_send(ws, msg_type, data):
 @bp.route("/")
 @login_required
 def index():
-    if not current_user.can_ssh and not current_user.is_admin:
+    if not current_user.can_ssh:
         flash("You don't have SSH terminal permission.", "error")
         return redirect(url_for("dashboard.index"))
 
@@ -126,13 +231,13 @@ def index():
 @bp.route("/<int:guest_id>")
 @login_required
 def connect(guest_id):
-    if not current_user.can_ssh and not current_user.is_admin:
+    if not current_user.can_ssh:
         flash("You don't have SSH terminal permission.", "error")
         return redirect(url_for("dashboard.index"))
 
     guest = Guest.query.get_or_404(guest_id)
 
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to access this guest.", "error")
         return redirect(url_for("terminal.index"))
 
@@ -165,13 +270,13 @@ def connect(guest_id):
 @login_required
 def follow(guest_id, session_id):
     """Read-only follow view that mirrors an active terminal session."""
-    if not current_user.can_ssh and not current_user.is_admin:
+    if not current_user.can_ssh:
         flash("You don't have SSH terminal permission.", "error")
         return redirect(url_for("dashboard.index"))
 
     guest = Guest.query.get_or_404(guest_id)
 
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to access this guest.", "error")
         return redirect(url_for("terminal.index"))
 
@@ -193,13 +298,13 @@ def follow(guest_id, session_id):
 @login_required
 def popout(guest_id):
     """Render the terminal in a minimal standalone window (no navbar)."""
-    if not current_user.can_ssh and not current_user.is_admin:
+    if not current_user.can_ssh:
         flash("You don't have SSH terminal permission.", "error")
         return redirect(url_for("dashboard.index"))
 
     guest = Guest.query.get_or_404(guest_id)
 
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to access this guest.", "error")
         return redirect(url_for("terminal.index"))
 
@@ -228,12 +333,12 @@ def popout(guest_id):
 @login_required
 def connect_adhoc(guest_id):
     """Store ad-hoc SSH credentials in the session and redirect to the terminal."""
-    if not current_user.can_ssh and not current_user.is_admin:
+    if not current_user.can_ssh:
         flash("You don't have SSH terminal permission.", "error")
         return redirect(url_for("dashboard.index"))
 
     guest = Guest.query.get_or_404(guest_id)
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to access this guest.", "error")
         return redirect(url_for("terminal.index"))
 
@@ -244,8 +349,12 @@ def connect_adhoc(guest_id):
         flash("Username is required.", "error")
         return redirect(url_for("terminal.connect", guest_id=guest_id))
 
-    from auth.credential_store import encrypt as _encrypt
-    session[f"terminal_cred_{guest_id}"] = {"username": username, "password": _encrypt(password) if password else ""}
+    # Only an opaque single-use token goes into the cookie; the credentials stay
+    # in a short-lived server-side store (see core/adhoc_credentials.py).
+    from core.adhoc_credentials import store_credentials
+    session[f"terminal_cred_token_{guest_id}"] = store_credentials(
+        user_id=current_user.id, guest_id=guest_id, username=username, password=password,
+    )
     return redirect(url_for("terminal.connect", guest_id=guest_id))
 
 
@@ -263,6 +372,16 @@ def terminal_ws(ws, guest_id):
       (default)                    — primary connection; creates an SSH
                                      channel and registers a shared session.
     """
+    if not ws_origin_allowed(request.headers.get("Origin"), request.host):
+        logger.warning("Refused terminal WebSocket for guest %s: Origin %r does not match host %r",
+                       guest_id, request.headers.get("Origin"), request.host)
+        _ws_send(ws, "error", "Cross-origin WebSocket connections are not allowed.")
+        try:
+            ws.close()
+        except Exception:
+            pass
+        return
+
     mode = request.args.get("mode", "primary")
     session_id = request.args.get("session_id")
 
@@ -290,7 +409,7 @@ def _ws_primary(ws, guest_id):
         if not ws_user.is_authenticated:
             _ws_send(ws, "error", "Not authenticated")
             return
-        if not ws_user.can_ssh and not ws_user.is_admin:
+        if not ws_user.can_ssh:
             _ws_send(ws, "error", "No SSH permission")
             return
 
@@ -298,7 +417,7 @@ def _ws_primary(ws, guest_id):
         if not guest:
             _ws_send(ws, "error", "Guest not found")
             return
-        if not ws_user.is_admin and not ws_user.can_access_guest(guest):
+        if not ws_user.may_access_guest(guest):
             _ws_send(ws, "error", "Access denied")
             return
 
@@ -310,11 +429,15 @@ def _ws_primary(ws, guest_id):
             _ws_send(ws, "error", "Could not resolve IP address for this guest. Try running discovery again.")
             return
 
-        # Resolve credentials — check session for ad-hoc creds first
-        adhoc = session.pop(f"terminal_cred_{guest_id}", None)
+        # Resolve credentials — consume any single-use ad-hoc credentials first.
+        # The cookie only holds an opaque token: popping the session here would
+        # never reach the browser (the 101 response bypasses Flask's response
+        # handling), so the store itself enforces single use and a 5-minute TTL.
+        from core.adhoc_credentials import take_credentials
+        adhoc = take_credentials(session.get(f"terminal_cred_token_{guest_id}"),
+                                 user_id=ws_user.id, guest_id=guest_id)
         adhoc_username = adhoc.get("username") if adhoc else None
-        _adhoc_pw_enc = adhoc.get("password") if adhoc else None
-        adhoc_password = decrypt(_adhoc_pw_enc) if _adhoc_pw_enc else None
+        adhoc_password = (adhoc.get("password") or None) if adhoc else None
 
         credential = None
         if not adhoc_username:
@@ -398,6 +521,8 @@ def _ws_primary(ws, guest_id):
                              "session_id": term_session.session_id})
         db.session.commit()
 
+        sudo_gate = SudoGate()
+
         # SSH read thread: fans output to all subscribers via the session
         def read_from_ssh():
             try:
@@ -405,6 +530,8 @@ def _ws_primary(ws, guest_id):
                     if channel.recv_ready():
                         data = channel.recv(4096).decode("utf-8", errors="replace")
                         if data:
+                            if looks_like_sudo_prompt(data):
+                                sudo_gate.note_prompt()
                             term_session.broadcast_output(data)
                     if channel.closed:
                         break
@@ -422,13 +549,21 @@ def _ws_primary(ws, guest_id):
         read_thread = threading.Thread(target=read_from_ssh, daemon=True)
         read_thread.start()
 
-        # Idle-timeout watchdog: close the SSH channel if no input is received
-        # for _IDLE_TIMEOUT seconds, which gracefully ends the main loop.
+        # Watchdog: closes the SSH channel on idle timeout, and also re-checks
+        # every _REVOCATION_CHECK_INTERVAL that the operator's account and web
+        # session are still valid — before_request never runs again for a
+        # long-lived socket, so a revoked user otherwise keeps an open shell.
         _last_activity = [_time.monotonic()]
+        _wd_app = current_app._get_current_object()
+        _wd_user_id = ws_user.id
+        _wd_username = ws_user.username
+        _wd_raw_sid = session.get(SESSION_KEY)
+        _wd_session_hash = _hash_session_id(_wd_raw_sid) if _wd_raw_sid else None
+        _wd_session_id = term_session.session_id
 
-        def _idle_watchdog():
+        def _session_watchdog():
             while not channel.closed:
-                _time.sleep(60)
+                _time.sleep(_REVOCATION_CHECK_INTERVAL)
                 if channel.closed:
                     break
                 if _time.monotonic() - _last_activity[0] >= _IDLE_TIMEOUT:
@@ -439,8 +574,27 @@ def _ws_primary(ws, guest_id):
                     except Exception:
                         pass
                     break
+                reason = _revocation_reason(_wd_app, _wd_user_id, _wd_session_hash)
+                if reason:
+                    logger.warning("Closing terminal for guest %s: %s", guest_id, reason)
+                    term_session.send_control({"type": "error",
+                                               "data": "Your access was revoked — terminal closed."})
+                    with _wd_app.app_context():
+                        log_action("guest_terminal_revoked", "guest",
+                                   resource_id=_audit_guest_id, resource_name=_audit_guest_name,
+                                   details={"reason": reason, "session_id": _wd_session_id},
+                                   actor=_wd_username)
+                        try:
+                            db.session.commit()
+                        except Exception:
+                            db.session.rollback()
+                    try:
+                        channel.close()
+                    except Exception:
+                        pass
+                    break
 
-        threading.Thread(target=_idle_watchdog, daemon=True).start()
+        threading.Thread(target=_session_watchdog, daemon=True).start()
 
         # Main loop: WebSocket → SSH (primary only)
         while not channel.closed:
@@ -454,7 +608,22 @@ def _ws_primary(ws, guest_id):
                     channel.send(msg["data"])
                 elif msg.get("type") == "sudo":
                     if sudo_password:
-                        channel.send(sudo_password + "\n")
+                        allowed, reason = sudo_gate.allow()
+                        if allowed:
+                            channel.send(sudo_password + "\n")
+                            log_action("guest_terminal_sudo_injected", "guest",
+                                       resource_id=guest.id, resource_name=guest.name,
+                                       details={"session_id": term_session.session_id})
+                        else:
+                            _ws_send(ws, "error",
+                                     "Sudo password not sent: no sudo prompt was seen on this session.")
+                            log_action("guest_terminal_sudo_blocked", "guest",
+                                       resource_id=guest.id, resource_name=guest.name,
+                                       details={"session_id": term_session.session_id, "reason": reason})
+                        try:
+                            db.session.commit()
+                        except Exception:
+                            db.session.rollback()
                 elif msg.get("type") == "resize":
                     cols = msg.get("cols", 120)
                     rows = msg.get("rows", 40)
@@ -521,7 +690,7 @@ def _ws_follow(ws, guest_id, session_id):
         if not ws_user.is_authenticated:
             _ws_send(ws, "error", "Not authenticated")
             return
-        if not ws_user.can_ssh and not ws_user.is_admin:
+        if not ws_user.can_ssh:
             _ws_send(ws, "error", "No SSH permission")
             return
 
@@ -529,7 +698,7 @@ def _ws_follow(ws, guest_id, session_id):
         if not guest:
             _ws_send(ws, "error", "Guest not found")
             return
-        if not ws_user.is_admin and not ws_user.can_access_guest(guest):
+        if not ws_user.may_access_guest(guest):
             _ws_send(ws, "error", "Access denied")
             return
 

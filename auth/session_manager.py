@@ -8,9 +8,10 @@ id whose hash is stored) and installs a ``before_app_request`` hook that:
   * forces logout if the current session's row is missing or revoked, and
   * refreshes ``last_seen_at`` at most once per minute.
 
-The hook is deliberately tolerant of sessions established by auth paths that do
-not go through the web login form (Cloudflare Access, local-network bypass) and
-never runs for the JWT mobile API (``/api/v1``), which has no cookie session.
+Sessions established outside the web login form (Cloudflare Access,
+local-network bypass) call ``start_session()`` too, so they are listed and
+revocable like any other.  The hook never runs for the JWT mobile API
+(``/api/v1``), which has no cookie session.
 """
 
 import hashlib
@@ -90,10 +91,10 @@ def init_session_tracking(app):
 
         raw_id = session.get(SESSION_KEY)
         if not raw_id:
-            # Authenticated without a tracked web session: this is a session
-            # established by Cloudflare Access or local-network bypass (they call
-            # session.clear() and login_user() without start_session()).  Leave
-            # those alone -- they re-authenticate on every request anyway.
+            # Authenticated without a tracked session id.  Every auth path in the
+            # app (login form, Cloudflare Access, local-network bypass) calls
+            # start_session(), so this only happens for a cookie minted before
+            # tracking existed; leave it alone rather than logging the user out.
             return
 
         record = UserSession.query.filter_by(session_id_hash=_hash_session_id(raw_id)).first()

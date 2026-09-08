@@ -6,6 +6,16 @@ import pytest
 from models import AuditLog, Guest, ProxmoxHost, Role, User, db
 
 
+def _client_listing(*volids):
+    """A ProxmoxClient mock whose backup listing contains exactly `volids`."""
+    mock = MagicMock()
+    mock.find_guest_node.return_value = "pve1"
+    mock.list_all_backups.return_value = [
+        {"volid": v, "storage": v.split(":")[0]} for v in volids
+    ]
+    return mock
+
+
 def _login(client, username, password):
     return client.post(
         "/login",
@@ -123,13 +133,27 @@ class TestRestoreConfirmation:
         mock_client_cls.assert_not_called()
         mock_job.assert_not_called()
 
-    def test_confirm_page_renders(self, auth_client, restore_guest):
+    @patch("routes.guests.ProxmoxClient")
+    def test_confirm_page_renders(self, mock_client_cls, auth_client, restore_guest):
         gid = restore_guest
         volid = "pbs-prod:backup/ct/140/2026-07-01"
+        mock_client_cls.return_value = _client_listing(volid)
         resp = auth_client.get(f"/guests/{gid}/backup/{volid}/restore")
         assert resp.status_code == 200
         assert b"_restore-target" in resp.data
         assert b"confirm_name" in resp.data
+
+    @patch("routes.guests.ProxmoxClient")
+    def test_confirm_page_rejects_foreign_volid(self, mock_client_cls, auth_client, restore_guest):
+        """A volid that is not in this guest's backup list never reaches the confirm page."""
+        gid = restore_guest
+        mock_client_cls.return_value = _client_listing("pbs-prod:backup/ct/140/2026-07-01")
+        resp = auth_client.get(
+            f"/guests/{gid}/backup/pbs-prod:backup/ct/999/2026-07-01/restore",
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        assert f"/guests/{gid}" in resp.headers["Location"]
 
 
 class TestRestoreSuccess:
@@ -142,6 +166,9 @@ class TestRestoreSuccess:
         mock = MagicMock()
         mock.find_guest_node.return_value = "pve1"
         mock.restore_backup.return_value = (True, "UPID:pve1:restore:1234")
+        mock.list_all_backups.return_value = [
+            {"volid": "pbs-prod:backup/ct/140/2026-07-01", "storage": "pbs-prod"},
+        ]
         mock_client_cls.return_value = mock
 
         volid = "pbs-prod:backup/ct/140/2026-07-01"
@@ -180,6 +207,26 @@ class TestRestoreSuccess:
             assert log.details is not None
             assert log.details.get("volid") == volid
             assert log.details.get("storage") == "pbs-prod"
+
+
+class TestRestoreForeignArchive:
+    """A volid outside the guest's own backup list is rejected server-side."""
+
+    @patch("routes.api.start_proxmox_job")
+    @patch("routes.guests.ProxmoxClient")
+    def test_foreign_volid_not_restored(self, mock_client_cls, mock_job, auth_client, restore_guest):
+        gid = restore_guest
+        mock = _client_listing("pbs-prod:backup/ct/140/2026-07-01")
+        mock_client_cls.return_value = mock
+
+        resp = auth_client.post(
+            f"/guests/{gid}/backup/pbs-prod:backup/ct/777/2026-07-01/restore",
+            data={"confirm_name": "_restore-target"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        mock.restore_backup.assert_not_called()
+        mock_job.assert_not_called()
 
 
 class TestRestoreClient:

@@ -449,6 +449,84 @@ class TestGuestPower:
         assert resp.status_code == 403
 
 
+class TestPaginationClamp:
+    """_paginate must never emit a negative LIMIT/OFFSET (GHSA-hjq8-j54x-c7rr)."""
+
+    def test_negative_per_page_is_clamped(self, client):
+        access, _ = _login(client)
+        unbounded = client.get("/api/v1/guests?per_page=-1", headers=_auth_headers(access))
+        assert unbounded.status_code == 200
+        # LIMIT -1 in SQLite means "no limit"; the clamp must cap it at one row.
+        assert len(unbounded.get_json()["data"]) == 1
+
+    def test_zero_per_page_is_clamped(self, client):
+        access, _ = _login(client)
+        resp = client.get("/api/v1/guests?per_page=0", headers=_auth_headers(access))
+        assert resp.status_code == 200
+        assert len(resp.get_json()["data"]) == 1
+
+    def test_per_page_above_max_is_clamped(self, client):
+        from routes.api_v1 import _MAX_PER_PAGE
+        access, _ = _login(client)
+        resp = client.get("/api/v1/guests?per_page=100000", headers=_auth_headers(access))
+        assert resp.status_code == 200
+        assert len(resp.get_json()["data"]) <= _MAX_PER_PAGE
+
+    def test_page_below_one_is_clamped(self, client):
+        access, _ = _login(client)
+        resp = client.get("/api/v1/guests?page=-3&per_page=1", headers=_auth_headers(access))
+        assert resp.status_code == 200
+        assert len(resp.get_json()["data"]) == 1
+
+
+class TestGuestScopePredicate:
+    """Guest detail/power use may_access_guest, so an admin-tier role is not locked out."""
+
+    def test_admin_reads_untagged_guest(self, client, app):
+        """An untagged guest is listed for admins, so detail must not 403 on it."""
+        with app.app_context():
+            guest = Guest(name="test-api-untagged", guest_type="ct", vmid=180,
+                          status="up-to-date", power_state="running", enabled=True)
+            _db.session.add(guest)
+            _db.session.commit()
+            gid = guest.id
+
+        access, _ = _login(client)
+        listed = client.get("/api/v1/guests?search=test-api-untagged", headers=_auth_headers(access))
+        assert [g["id"] for g in listed.get_json()["data"]] == [gid]
+        detail = client.get(f"/api/v1/guests/{gid}", headers=_auth_headers(access))
+        assert detail.status_code == 200
+
+        with app.app_context():
+            g = _db.session.get(Guest, gid)
+            _db.session.delete(g)
+            _db.session.commit()
+
+    def test_tagged_viewer_denied_other_guest(self, client, app):
+        """A tag-scoped viewer gets 403 on a guest outside their tags."""
+        with app.app_context():
+            guest = Guest(name="test-api-foreign", guest_type="ct", vmid=181,
+                          status="up-to-date", power_state="running", enabled=True)
+            other = Tag.query.filter_by(name="test-api-other-tag").first()
+            if not other:
+                other = Tag(name="test-api-other-tag", color="#ff0000")
+                _db.session.add(other)
+                _db.session.flush()
+            guest.tags.append(other)
+            _db.session.add(guest)
+            _db.session.commit()
+            gid = guest.id
+
+        access, _ = _login(client, "viewer_api", _VIEWER_PASSWORD)
+        resp = client.get(f"/api/v1/guests/{gid}", headers=_auth_headers(access))
+        assert resp.status_code == 403
+
+        with app.app_context():
+            g = _db.session.get(Guest, gid)
+            _db.session.delete(g)
+            _db.session.commit()
+
+
 # ============================================================================
 # Host tests
 # ============================================================================
@@ -475,6 +553,13 @@ class TestHosts:
         access, _ = _login(client)
         resp = client.get("/api/v1/hosts/999999", headers=_auth_headers(access))
         assert resp.status_code == 404
+
+    def test_alerts_hide_host_updates_from_viewer(self, client):
+        """The host section of /dashboard/alerts is host data — gated on can_view_hosts."""
+        access, _ = _login(client, "viewer_api", _VIEWER_PASSWORD)
+        resp = client.get("/api/v1/dashboard/alerts", headers=_auth_headers(access))
+        assert resp.status_code == 200
+        assert resp.get_json()["data"]["host_security_updates"] == []
 
     def test_viewer_cannot_list_hosts(self, client):
         access, _ = _login(client, "viewer_api", _VIEWER_PASSWORD)

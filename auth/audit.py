@@ -8,6 +8,10 @@ from models import AuditLog, db
 # request context (scheduler jobs, CLI, maintenance tasks).
 BACKGROUND_ACTOR = "system"
 
+# Actions that are audit-logged but never fanned out to the activity feed:
+# they narrate the lifecycle of a live terminal session to every browser.
+NO_BROADCAST_ACTIONS = frozenset({"guest_ssh_disconnect"})
+
 
 def log_action(action, resource_type, resource_id=None, resource_name=None, details=None, actor=None):
     """Add an AuditLog entry to the current db.session.
@@ -40,18 +44,29 @@ def log_action(action, resource_type, resource_id=None, resource_name=None, deta
     else:
         username = actor or BACKGROUND_ACTOR
 
+    if action in NO_BROADCAST_ACTIONS:
+        return
+
     # Broadcast to collaboration hub (best-effort — never breaks the audit write)
     try:
         import datetime as _dt
 
         from core.collaboration import collab_hub
-        collab_hub.broadcast({
+        payload = {
             "type": "activity",
             "action": action,
             "resource_type": resource_type,
             "resource_name": resource_name or "",
             "username": username,
             "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        })
+        }
+        # Guest activity is tag-scoped: attach the guest's id and tag ids so the
+        # hub can drop the event for subscribers who cannot access that guest.
+        if resource_type == "guest" and resource_id is not None:
+            from models import Guest
+            guest = db.session.get(Guest, resource_id)
+            payload["guest_id"] = resource_id
+            payload["guest_tag_ids"] = [t.id for t in guest.tags] if guest else []
+        collab_hub.broadcast(payload)
     except Exception:
         pass
