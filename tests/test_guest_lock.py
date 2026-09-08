@@ -40,12 +40,23 @@ def host(app):
         db.session.commit()
 
 
-def _mock_proxmox_client(node_guests):
-    """Mock ProxmoxClient returning the given guest list from every list method."""
+def _mock_proxmox_client(node_guests, complete=True):
+    """Mock ProxmoxClient returning the given guest list from every list method.
+
+    Mirrors the real ``get_node_guests``/``get_all_guests`` signature: with
+    ``with_completeness=True`` they return ``(guests, complete)``.
+    """
     mock_client = MagicMock()
     mock_client.get_local_node_name.return_value = "node1"
-    mock_client.get_node_guests.return_value = node_guests
-    mock_client.get_all_guests.return_value = node_guests
+
+    def _get_node_guests(node_name, with_completeness=False):
+        return (node_guests, complete) if with_completeness else node_guests
+
+    def _get_all_guests(with_completeness=False):
+        return (node_guests, complete) if with_completeness else node_guests
+
+    mock_client.get_node_guests.side_effect = _get_node_guests
+    mock_client.get_all_guests.side_effect = _get_all_guests
     mock_client.get_replication_map.return_value = {}
     mock_client.get_guest_ip.return_value = "10.0.4.50"
     mock_client.get_guest_mac.return_value = "AA:BB:CC:DD:EE:FF"
