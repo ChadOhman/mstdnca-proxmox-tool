@@ -89,7 +89,9 @@ def login():
             flash("Too many failed login attempts. Please try again later.", "error")
             return render_template("login.html")
 
-        username = request.form.get("username", "").strip()
+        # Usernames are stored lower-cased (see security.add_user), so
+        # normalise here too or "Admin" can never log in as "admin".
+        username = request.form.get("username", "").strip().lower()
         password = request.form.get("password", "")
 
         user = User.query.filter_by(username=username).first()

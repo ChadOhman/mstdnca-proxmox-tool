@@ -722,8 +722,14 @@ def task_log(host_id, upid):
         return jsonify({"error": "Failed to fetch task log."}), 500
 
 
-def _run_apply(host_id, hostname, credential_model, app_ctx):
-    """Background thread: SSH to host and run apt-get dist-upgrade."""
+def _run_apply(host_id, app_ctx):
+    """Background thread: SSH to host and run apt-get dist-upgrade.
+
+    Only the host id crosses the thread boundary; the host and its SSH
+    credential are re-queried inside this thread's own app context (the same
+    pattern _run_bulk_apply uses) so no ORM instance is shared between
+    sessions and nothing can be expired out from under us.
+    """
     from clients.ssh_client import SSHClient
 
     def _append(chunk):
@@ -738,19 +744,27 @@ def _run_apply(host_id, hostname, credential_model, app_ctx):
             return bool(job and job.get("cancelled"))
 
     with app_ctx.app_context():
+        client = None
         try:
-            client = SSHClient.from_credential(hostname, credential_model)
-            cmd = "DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade 2>&1"
-            exit_code = client.execute_streaming(cmd, _append, timeout=1800, stop_fn=_stop_fn)
-            success = exit_code == 0
+            host = ProxmoxHost.query.get(host_id)
+            credential_model = host.ssh_credential if host else None
+            if host is None or credential_model is None:
+                _append("\n[Error: host or SSH credential is no longer available]\n")
+                success = False
+            else:
+                client = SSHClient.from_credential(host.hostname, credential_model)
+                cmd = "DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade 2>&1"
+                exit_code = client.execute_streaming(cmd, _append, timeout=1800, stop_fn=_stop_fn)
+                success = exit_code == 0
         except Exception as e:
             _append(f"\n[Error: {e}]\n")
             success = False
         finally:
-            try:
-                client.close()
-            except Exception:
-                pass
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
         if success:
             try:
@@ -806,7 +820,7 @@ def apply_updates(host_id):
     from flask import current_app
     t = _threading.Thread(
         target=_run_apply,
-        args=(host_id, host.hostname, host.ssh_credential, current_app._get_current_object()),
+        args=(host_id, current_app._get_current_object()),
         daemon=True,
     )
     t.start()
@@ -879,7 +893,7 @@ def _run_bulk_apply(app_ctx):
                 _apply_jobs[host_id] = {"log": [], "running": True, "success": None, "cancelled": False}
 
             try:
-                _run_apply(host_id, host.hostname, host.ssh_credential, app_ctx)
+                _run_apply(host_id, app_ctx)
                 with _apply_lock:
                     success = bool(_apply_jobs.get(host_id, {}).get("success"))
             except Exception as e:

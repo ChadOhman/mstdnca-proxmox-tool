@@ -1,0 +1,2 @@
+# Byte-exact test fixtures must never be line-ending converted on checkout.
+tests/fixtures/redis_scripts_baseline/*.bin binary
