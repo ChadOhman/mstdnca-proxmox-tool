@@ -6,7 +6,15 @@ from datetime import datetime
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import login_required
 
-from apps.utils import _SHELL_SAFE_RE, JobTracker
+from apps.utils import (
+    _SHELL_SAFE_RE,
+    JobTracker,
+    _validate_abs_path,
+    _validate_db_name,
+    _validate_git_branch,
+    _validate_git_repo,
+    _validate_username,
+)
 from auth.audit import log_action
 from models import Guest, Setting, db
 
@@ -124,18 +132,28 @@ def upgrade_page():
 
 @bp.route("/save", methods=["POST"])
 def save():
-    Setting.set("mastodon_guest_id", request.form.get("mastodon_guest_id", "").strip())
-    Setting.set("mastodon_guest_id_2", request.form.get("mastodon_guest_id_2", "").strip())
-    Setting.set("mastodon_db_guest_id", request.form.get("mastodon_db_guest_id", "").strip())
-    Setting.set("mastodon_db_name", request.form.get("mastodon_db_name", "mastodon_production").strip() or "mastodon_production")
-    Setting.set("mastodon_user", request.form.get("mastodon_user", "mastodon").strip())
-    Setting.set("mastodon_app_dir", request.form.get("mastodon_app_dir", "/home/mastodon/live").strip())
-    Setting.set("mastodon_repo", request.form.get("mastodon_repo", "mastodon/mastodon").strip())
-    Setting.set("mastodon_branch", request.form.get("mastodon_branch", "").strip())
+    # The user / app_dir / db_name / branch / repo values all reach a root shell
+    # on the Mastodon guest (upgrade) and on the Prometheus exporter path, so
+    # they are allow-listed here before anything is persisted.
+    db_name = request.form.get("mastodon_db_name", "mastodon_production").strip() or "mastodon_production"
+    mastodon_user = request.form.get("mastodon_user", "mastodon").strip() or "mastodon"
+    app_dir = request.form.get("mastodon_app_dir", "/home/mastodon/live").strip() or "/home/mastodon/live"
+    repo = request.form.get("mastodon_repo", "mastodon/mastodon").strip() or "mastodon/mastodon"
+    branch = request.form.get("mastodon_branch", "").strip()
     pgbouncer_host = request.form.get("mastodon_pgbouncer_host", "").strip()
     pgbouncer_port = request.form.get("mastodon_pgbouncer_port", "").strip()
     direct_db_host = request.form.get("mastodon_direct_db_host", "").strip()
     direct_db_port = request.form.get("mastodon_direct_db_port", "5432").strip()
+    try:
+        _validate_db_name(db_name, "Database name")
+        _validate_username(mastodon_user, "Mastodon user")
+        _validate_abs_path(app_dir, "Mastodon app directory")
+        _validate_git_repo(repo, "Mastodon repo")
+        if branch:
+            _validate_git_branch(branch, "Git branch")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("mastodon.upgrade_page"))
 
     for label, val in [("PGBouncer host", pgbouncer_host), ("Direct DB host", direct_db_host)]:
         if val and not _SHELL_SAFE_RE.match(val):
@@ -146,6 +164,14 @@ def save():
             flash(f"Invalid {label}: must be numeric.", "error")
             return redirect(url_for("mastodon.upgrade_page"))
 
+    Setting.set("mastodon_guest_id", request.form.get("mastodon_guest_id", "").strip())
+    Setting.set("mastodon_guest_id_2", request.form.get("mastodon_guest_id_2", "").strip())
+    Setting.set("mastodon_db_guest_id", request.form.get("mastodon_db_guest_id", "").strip())
+    Setting.set("mastodon_db_name", db_name)
+    Setting.set("mastodon_user", mastodon_user)
+    Setting.set("mastodon_app_dir", app_dir)
+    Setting.set("mastodon_repo", repo)
+    Setting.set("mastodon_branch", branch)
     Setting.set("mastodon_pgbouncer_host", pgbouncer_host)
     Setting.set("mastodon_pgbouncer_port", pgbouncer_port)
     Setting.set("mastodon_direct_db_host", direct_db_host)

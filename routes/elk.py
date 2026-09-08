@@ -5,7 +5,12 @@ from datetime import datetime
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import login_required
 
-from apps.utils import JobTracker
+from apps.utils import (
+    JobTracker,
+    _validate_abs_path,
+    _validate_http_url,
+    _validate_username,
+)
 from auth.audit import log_action
 from models import Guest, Setting, db
 
@@ -104,11 +109,29 @@ def upgrade_page():
 
 @bp.route("/save", methods=["POST"])
 def save():
+    # Validate every value that ends up in a root shell on the Elk guest BEFORE
+    # anything is persisted, so a rejected save leaves the stored settings as
+    # they were.
+    elk_user = request.form.get("elk_user", "elk").strip() or "elk"
+    elk_dir = request.form.get("elk_dir", "/opt/elk").strip() or "/opt/elk"
+    elk_url = request.form.get("elk_url", "").strip()
+    instance_url = request.form.get("elk_instance_url", "").strip()
+    try:
+        _validate_username(elk_user, "Elk user")
+        _validate_abs_path(elk_dir, "Elk directory")
+        if instance_url:
+            _validate_http_url(instance_url, "Mastodon instance URL")
+        if elk_url:
+            _validate_http_url(elk_url, "Elk URL")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("elk.upgrade_page"))
+
     Setting.set("elk_guest_id", request.form.get("elk_guest_id", "").strip())
-    Setting.set("elk_user", request.form.get("elk_user", "elk").strip() or "elk")
-    Setting.set("elk_dir", request.form.get("elk_dir", "/opt/elk").strip() or "/opt/elk")
-    Setting.set("elk_url", request.form.get("elk_url", "").strip())
-    Setting.set("elk_instance_url", request.form.get("elk_instance_url", "").strip())
+    Setting.set("elk_user", elk_user)
+    Setting.set("elk_dir", elk_dir)
+    Setting.set("elk_url", elk_url)
+    Setting.set("elk_instance_url", instance_url)
     deploy_method = request.form.get("elk_deploy_method", "docker")
     Setting.set("elk_deploy_method",
                 deploy_method if deploy_method in ("docker", "bare-metal") else "docker")

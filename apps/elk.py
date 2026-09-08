@@ -15,7 +15,14 @@ from urllib.request import Request, urlopen
 from apps.backup import backup_guest, snapshot_guest
 
 # Shared shell-safety and output helpers from the Mastodon module
-from apps.utils import _log_cmd_output, _validate_shell_param, _version_gt
+from apps.utils import (
+    _log_cmd_output,
+    _remote_write_cmd,
+    _validate_abs_path,
+    _validate_http_url,
+    _validate_username,
+    _version_gt,
+)
 from clients.proxmox_api import ProxmoxClient
 from clients.ssh_client import SSHClient
 from models import Guest, Setting
@@ -120,7 +127,7 @@ def detect_elk_version(guest, elk_dir, deploy_method="docker"):
     from models import Credential
 
     try:
-        _validate_shell_param(elk_dir, "Elk dir")
+        _validate_abs_path(elk_dir, "Elk dir")
     except ValueError as e:
         return None, str(e)
 
@@ -263,9 +270,11 @@ def run_elk_preflight(log_callback=None):
     user = config.get("user", "elk")
 
     try:
-        _validate_shell_param(elk_dir, "Elk dir")
+        _validate_abs_path(elk_dir, "Elk dir")
         if deploy_method == "bare-metal":
-            _validate_shell_param(user, "Elk user")
+            _validate_username(user, "Elk user")
+        if instance_url:
+            _validate_http_url(instance_url, "Mastodon instance URL")
         check("Shell-safe config values", True)
     except ValueError as e:
         check("Shell-safe config values", False, str(e))
@@ -535,9 +544,14 @@ def run_elk_install(log_callback=None):
     deploy_method = config["deploy_method"]
 
     try:
-        _validate_shell_param(elk_dir, "Elk dir")
+        _validate_abs_path(elk_dir, "Elk dir")
         if deploy_method == "bare-metal":
-            _validate_shell_param(user, "Elk user")
+            _validate_username(user, "Elk user")
+        # instance_url is written into .env on the guest — re-check it here so a
+        # value stored before this validation existed (or written by another code
+        # path) still cannot reach the shell.
+        if instance_url:
+            _validate_http_url(instance_url, "Mastodon instance URL")
     except ValueError as e:
         return False, str(e)
 
@@ -699,8 +713,12 @@ def run_elk_install(log_callback=None):
                 env_lines.append("PORT=5314")
 
             if env_lines:
-                env_content = "\\n".join(env_lines)
-                env_cmd = f"printf '{env_content}\\n' > {elk_dir}/.env"
+                # Written via the base64 pipe with a shell-quoted destination:
+                # the previous `printf '<content>' > <dir>/.env` let a quote in
+                # the instance URL escape into the root shell (and a '%' be eaten
+                # as a printf format directive).
+                env_content = "\n".join(env_lines) + "\n"
+                env_cmd = _remote_write_cmd(f"{elk_dir}/.env", env_content)
                 stdout, stderr, code = ssh.execute_sudo(env_cmd, timeout=10)
                 if code != 0:
                     # The bare-metal systemd unit declares 'EnvironmentFile={elk_dir}/.env';
@@ -920,9 +938,9 @@ def run_elk_upgrade(log_callback=None, skip_protection=False):
     deploy_method = config["deploy_method"]
 
     try:
-        _validate_shell_param(elk_dir, "Elk dir")
+        _validate_abs_path(elk_dir, "Elk dir")
         if deploy_method == "bare-metal":
-            _validate_shell_param(user, "Elk user")
+            _validate_username(user, "Elk user")
     except ValueError as e:
         return False, str(e)
 

@@ -9,12 +9,19 @@ Proxmox snapshot or vzdump backup of the guest before any changes.
 import base64
 import logging
 import re
+import shlex
 import time
 
 from apps.backup import backup_guest, snapshot_guest
 
 # Shared shell-safety and output helpers from the Mastodon module
-from apps.utils import _log_cmd_output, _validate_shell_param, _version_gt
+from apps.utils import (
+    _log_cmd_output,
+    _validate_email,
+    _validate_hostname,
+    _validate_shell_param,
+    _version_gt,
+)
 from clients.proxmox_api import ProxmoxClient
 from clients.ssh_client import SSHClient
 from models import Guest, Setting
@@ -160,7 +167,7 @@ def _ssh_write_file(ssh, path, content, log):
     """
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     stdout, stderr, code = ssh.execute_sudo(
-        f"printf '%s' '{encoded}' | base64 -d | tee {path} > /dev/null",
+        f"printf '%s' '{encoded}' | base64 -d | tee {shlex.quote(path)} > /dev/null",
         timeout=15,
     )
     if code != 0:
@@ -168,6 +175,23 @@ def _ssh_write_file(ssh, path, content, log):
         _log_cmd_output(log, stdout, stderr, code, max_chars=500)
         return False
     return True
+
+
+def _require_valid_hostname(config):
+    """Return an error string if the configured Jitsi hostname is unusable.
+
+    Every configure/user-management entry point calls this before opening an SSH
+    connection: the hostname is interpolated into config-file paths and into
+    `cat`/`grep`/`sed` arguments, so it must be a real FQDN and nothing else.
+    """
+    hostname = config.get("hostname", "")
+    if not hostname:
+        return "Jitsi hostname not configured"
+    try:
+        _validate_hostname(hostname, "Jitsi hostname")
+    except ValueError as e:
+        return str(e)
+    return None
 
 
 def _get_jitsi_config():
@@ -330,9 +354,12 @@ def run_jitsi_preflight(log_callback=None):
             config_ok = False
 
     try:
-        _validate_shell_param(hostname, "Hostname")
+        _validate_hostname(hostname, "Hostname")
         if cert_type == "letsencrypt":
-            _validate_shell_param(config.get("letsencrypt_email", ""), "Email")
+            # Email addresses contain '@' (and often '+'), which _SHELL_SAFE_RE
+            # excludes — running _validate_shell_param over one rejected every
+            # valid address and made this check unpassable.
+            _validate_email(config.get("letsencrypt_email", ""), "Email")
         check("Shell-safe config values", True)
     except ValueError as e:
         check("Shell-safe config values", False, str(e))
@@ -578,9 +605,11 @@ def run_jitsi_install(log_callback=None):
         return False, "Jitsi hostname not configured"
 
     try:
-        _validate_shell_param(hostname, "Hostname")
+        _validate_hostname(hostname, "Hostname")
         if cert_type == "letsencrypt" and letsencrypt_email:
-            _validate_shell_param(letsencrypt_email, "Email")
+            # _validate_shell_param rejects '@', so it rejected every valid
+            # address; an email needs the email allow-list, not the shell one.
+            _validate_email(letsencrypt_email, "Email")
     except ValueError as e:
         return False, str(e)
 
@@ -1039,9 +1068,10 @@ def run_cloudflare_configure(log_callback=None):
     if not config.get("installed"):
         return False, "Jitsi must be installed before configuring Cloudflare"
 
-    hostname = config.get("hostname", "")
-    if not hostname:
-        return False, "Jitsi hostname not configured"
+    err = _require_valid_hostname(config)
+    if err:
+        return False, err
+    hostname = config["hostname"]
 
     public_ip = config.get("public_ip", "")
     if cf_mode == "hybrid":
@@ -1147,7 +1177,7 @@ def _enable_jvb_rest_api(ssh, log):
     log("=== Step 11: Enabling JVB REST API for monitoring ===")
     path = "/etc/jitsi/videobridge/jvb.conf"
 
-    stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+    stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
     if code != 0 or not stdout:
         log(f"  WARNING: Could not read {path} — skipping REST API enablement")
         return
@@ -1209,7 +1239,7 @@ def configure_jvb_rest_binding(bind_all=True):
 
     try:
         path = "/etc/jitsi/videobridge/jvb.conf"
-        stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+        stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
         if code != 0 or not stdout:
             return False, f"Could not read {path}"
 
@@ -1279,7 +1309,7 @@ def _cf_patch_jvb_conf_tcp(ssh, log):
     log("=== Step 1: Enabling TCP transport in jvb.conf ===")
     path = "/etc/jitsi/videobridge/jvb.conf"
 
-    stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+    stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
     if code != 0 or not stdout:
         log(f"  WARNING: Could not read {path}")
         return 1
@@ -1369,7 +1399,7 @@ def _cf_patch_meet_config_js(ssh, hostname, log):
     log("=== Step 2: Patching Jitsi Meet client config ===")
     path = f"/etc/jitsi/meet/{hostname}-config.js"
 
-    stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+    stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
     if code != 0 or not stdout:
         log(f"  WARNING: Could not read {path}")
         return 1
@@ -1405,7 +1435,7 @@ def _cf_patch_nat_harvester(ssh, guest_ip, public_ip, log):
     log("=== Step 1: Configuring NAT Harvester ===")
     path = "/etc/jitsi/videobridge/sip-communicator.properties"
 
-    stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+    stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
     if code != 0:
         log(f"  WARNING: Could not read {path} — file may not exist yet")
         # Create the file with just the harvester config
@@ -1457,7 +1487,7 @@ def _cf_verify_prosody_turns(ssh, hostname, log):
     log("=== Verifying Prosody TURN advertisement ===")
     path = f"/etc/prosody/conf.d/{hostname}.cfg.lua"
 
-    stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+    stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
     if code != 0 or not stdout:
         log(f"  WARNING: Could not read {path}")
         return
@@ -1501,7 +1531,7 @@ def _configure_coturn_tls(ssh, hostname, log):
     log("=== Configuring coturn TLS ===")
     path = "/etc/turnserver.conf"
 
-    stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+    stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
     if code != 0 or not stdout:
         log(f"  WARNING: Could not read {path} — coturn may not be installed")
         log("  Install coturn: apt-get install -y coturn")
@@ -1516,7 +1546,7 @@ def _configure_coturn_tls(ssh, hostname, log):
 
     # Check for Let's Encrypt certs (preferred if they exist)
     le_check, _, le_code = ssh.execute_sudo(
-        f"test -f /etc/letsencrypt/live/{hostname}/fullchain.pem && echo yes",
+        f"test -f {shlex.quote(f'/etc/letsencrypt/live/{hostname}/fullchain.pem')} && echo yes",
         timeout=5,
     )
     if le_code == 0 and "yes" in (le_check or ""):
@@ -1602,7 +1632,7 @@ def _configure_prosody_turn(ssh, hostname, log):
     log("=== Configuring Prosody TURN advertisement ===")
     path = f"/etc/prosody/conf.d/{hostname}.cfg.lua"
 
-    stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+    stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
     if code != 0 or not stdout:
         log(f"  WARNING: Could not read {path}")
         return 1
@@ -1617,7 +1647,7 @@ def _configure_prosody_turn(ssh, hostname, log):
     # Read the TURN secret from the standard Jitsi location
     secret_path = f"/etc/jitsi/meet/{hostname}-oauthl-oauthSecret.key"
     secret_stdout, _, secret_code = ssh.execute_sudo(
-        f"cat {secret_path} 2>/dev/null", timeout=5
+        f"cat {shlex.quote(secret_path)} 2>/dev/null", timeout=5
     )
     # Fall back to turnserver.conf static-auth-secret
     if secret_code != 0 or not (secret_stdout or "").strip():
@@ -1706,7 +1736,7 @@ def _sd_patch_prosody(ssh, hostname, enable, log):
     log("=== Patching Prosody config for secure domain ===")
     path = f"/etc/prosody/conf.d/{hostname}.cfg.lua"
 
-    stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+    stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
     if code != 0 or not stdout:
         log(f"  WARNING: Could not read {path}")
         return 1
@@ -1813,7 +1843,7 @@ def _sd_patch_meet_config_js(ssh, hostname, enable, log):
     log("=== Patching Jitsi Meet config.js for secure domain ===")
     path = f"/etc/jitsi/meet/{hostname}-config.js"
 
-    stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+    stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
     if code != 0 or not stdout:
         log(f"  WARNING: Could not read {path}")
         return 1
@@ -1849,7 +1879,7 @@ def _sd_patch_jicofo_conf(ssh, hostname, enable, log):
     log("=== Patching Jicofo config for secure domain ===")
     path = "/etc/jitsi/jicofo/jicofo.conf"
 
-    stdout, stderr, code = ssh.execute_sudo(f"cat {path} 2>/dev/null", timeout=10)
+    stdout, stderr, code = ssh.execute_sudo(f"cat {shlex.quote(path)} 2>/dev/null", timeout=10)
     if code != 0 or not stdout:
         log(f"  WARNING: Could not read {path}")
         return 1
@@ -1937,9 +1967,10 @@ def run_secure_domain_configure(log_callback=None):
     if not config.get("installed"):
         return False, "Jitsi must be installed before configuring Secure Domain"
 
-    hostname = config.get("hostname", "")
-    if not hostname:
-        return False, "Jitsi hostname not configured"
+    err = _require_valid_hostname(config)
+    if err:
+        return False, err
+    hostname = config["hostname"]
 
     if not config["guest_id"]:
         return False, "Jitsi guest not configured"
@@ -2048,9 +2079,10 @@ def sd_list_users():
     Returns (users_list, error_message).
     """
     config = _get_jitsi_config()
-    hostname = config.get("hostname", "")
-    if not hostname:
-        return [], "Hostname not configured"
+    err = _require_valid_hostname(config)
+    if err:
+        return [], err
+    hostname = config["hostname"]
 
     ssh, guest, err = _sd_get_ssh(config)
     if err:
@@ -2058,10 +2090,11 @@ def sd_list_users():
 
     # Prosody encodes dots as %2e in its data directory
     encoded_host = hostname.replace(".", "%2e")
+    accounts_dir = shlex.quote(f"/var/lib/prosody/{encoded_host}/accounts/")
     try:
         with ssh:
             stdout, stderr, code = ssh.execute_sudo(
-                f"ls /var/lib/prosody/{encoded_host}/accounts/ 2>/dev/null",
+                f"ls {accounts_dir} 2>/dev/null",
                 timeout=10,
             )
             if code != 0 or not stdout:
@@ -2083,9 +2116,10 @@ def sd_add_user(username, password):
         return False, "Password must be at least 8 characters"
 
     config = _get_jitsi_config()
-    hostname = config.get("hostname", "")
-    if not hostname:
-        return False, "Hostname not configured"
+    err = _require_valid_hostname(config)
+    if err:
+        return False, err
+    hostname = config["hostname"]
 
     ssh, guest, err = _sd_get_ssh(config)
     if err:
@@ -2093,7 +2127,6 @@ def sd_add_user(username, password):
 
     try:
         _validate_shell_param(username, "username")
-        _validate_shell_param(hostname, "hostname")
     except ValueError as e:
         return False, str(e)
 
@@ -2125,9 +2158,10 @@ def sd_remove_user(username):
         return False, "Invalid username"
 
     config = _get_jitsi_config()
-    hostname = config.get("hostname", "")
-    if not hostname:
-        return False, "Hostname not configured"
+    err = _require_valid_hostname(config)
+    if err:
+        return False, err
+    hostname = config["hostname"]
 
     ssh, guest, err = _sd_get_ssh(config)
     if err:
@@ -2135,7 +2169,6 @@ def sd_remove_user(username):
 
     try:
         _validate_shell_param(username, "username")
-        _validate_shell_param(hostname, "hostname")
     except ValueError as e:
         return False, str(e)
 

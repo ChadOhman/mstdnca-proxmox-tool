@@ -5,7 +5,12 @@ from datetime import datetime
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import login_required
 
-from apps.utils import JobTracker
+from apps.utils import (
+    JobTracker,
+    _validate_abs_path,
+    _validate_http_url,
+    _validate_username,
+)
 from auth.audit import log_action
 from models import Guest, Setting, db
 
@@ -119,10 +124,23 @@ def upgrade_page():
 
 @bp.route("/save", methods=["POST"])
 def save():
+    # user / dir reach a root shell on the Ghost guest — allow-list before storing.
+    ghost_user = request.form.get("ghost_user", "ghost_user").strip() or "ghost_user"
+    ghost_dir = request.form.get("ghost_dir", "/opt/ghost").strip() or "/opt/ghost"
+    ghost_url = request.form.get("ghost_url", "").strip()
+    try:
+        _validate_username(ghost_user, "Ghost user")
+        _validate_abs_path(ghost_dir, "Ghost directory")
+        if ghost_url:
+            _validate_http_url(ghost_url, "Ghost URL")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("ghost.upgrade_page"))
+
     Setting.set("ghost_guest_id", request.form.get("ghost_guest_id", "").strip())
-    Setting.set("ghost_user", request.form.get("ghost_user", "ghost_user").strip() or "ghost_user")
-    Setting.set("ghost_dir", request.form.get("ghost_dir", "/opt/ghost").strip() or "/opt/ghost")
-    Setting.set("ghost_url", request.form.get("ghost_url", "").strip())
+    Setting.set("ghost_user", ghost_user)
+    Setting.set("ghost_dir", ghost_dir)
+    Setting.set("ghost_url", ghost_url)
     Setting.set("ghost_current_version", request.form.get("ghost_current_version", "").strip())
     Setting.set("ghost_auto_upgrade", "true" if "ghost_auto_upgrade" in request.form else "false")
     protection_type = request.form.get("ghost_protection_type", "snapshot")

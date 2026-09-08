@@ -142,6 +142,10 @@ class TestUnpollerGetConfig:
         from apps.unpoller import _get_config
 
         with app.app_context():
+            # prometheus_guest_id is a shared, cross-test Setting in this
+            # session-scoped DB (the Prometheus/exporter tests set it), so clear
+            # it here instead of depending on file execution order.
+            Setting.set("prometheus_guest_id", "")
             config = _get_config()
             assert config["guest_id"] == ""
             assert config["unifi_site"] == "default"

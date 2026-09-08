@@ -10,11 +10,21 @@ PGBouncer-to-direct-DB swap for migrations, and service restarts.
 import json
 import logging
 import re
+import shlex
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 
 from apps.backup import backup_guest, snapshot_guest
-from apps.utils import _log_cmd_output, _validate_shell_param, _version_gt
+from apps.utils import (
+    _RUBY_VERSION_RE,
+    _log_cmd_output,
+    _validate_abs_path,
+    _validate_db_name,
+    _validate_git_branch,
+    _validate_shell_param,
+    _validate_username,
+    _version_gt,
+)
 from clients.proxmox_api import ProxmoxClient
 from clients.ssh_client import SSHClient
 from models import Guest, Setting
@@ -148,6 +158,13 @@ def _remediate_ruby(ssh, user, app_dir, log):
     required = (out or "").strip()
     if not required:
         log(f"ERROR: Could not read {app_dir}/.ruby-version — cannot verify Ruby version")
+        return False
+    # The file lives on the remote host and its contents are interpolated into
+    # `su - <user> -c '...'` below, so anything but a plain version string is a
+    # privilege-escalation vector out of the mastodon account.
+    if not _RUBY_VERSION_RE.match(required):
+        log(f"ERROR: {app_dir}/.ruby-version does not contain a plain version "
+            f"string ({required[:60]!r}) — refusing to use it in a shell command")
         return False
 
     installed = None
@@ -538,7 +555,7 @@ def _get_mastodon_config():
 
 def _swap_env_db(ssh, app_dir, new_host, new_port):
     """Swap DB_HOST and DB_PORT in .env.production via sed."""
-    _validate_shell_param(app_dir, "app_dir")
+    _validate_abs_path(app_dir, "app_dir")
     _validate_shell_param(new_host, "DB host")
     if not re.match(r'^\d+$', str(new_port)):
         return False, f"Invalid DB port: {new_port}"
@@ -788,10 +805,10 @@ def run_mastodon_preflight(log_callback=None):
     branch = (config.get("branch") or "").strip()
 
     try:
-        _validate_shell_param(user, "Mastodon user")
-        _validate_shell_param(app_dir, "Mastodon app_dir")
+        _validate_username(user, "Mastodon user")
+        _validate_abs_path(app_dir, "Mastodon app_dir")
         if branch:
-            _validate_shell_param(branch, "Git branch")
+            _validate_git_branch(branch, "Git branch")
         _validate_shell_param(config.get("direct_db_host", ""), "Direct DB host")
         _validate_shell_param(config.get("pgbouncer_host", ""), "PGBouncer host")
         if not re.match(r'^\d+$', str(config.get("direct_db_port", ""))):
@@ -1059,11 +1076,11 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
 
     # Validate shell-interpolated values to prevent command injection
     try:
-        _validate_shell_param(user, "Mastodon user")
-        _validate_shell_param(app_dir, "Mastodon app_dir")
-        _validate_shell_param(db_name, "Database name")
+        _validate_username(user, "Mastodon user")
+        _validate_abs_path(app_dir, "Mastodon app_dir")
+        _validate_db_name(db_name, "Database name")
         if branch:
-            _validate_shell_param(branch, "Git branch")
+            _validate_git_branch(branch, "Git branch")
     except ValueError as e:
         return False, str(e)
 
@@ -1210,18 +1227,23 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
 
             # Pre-check: abort before touching anything if unmerged files exist.
             # git stash silently skips unmerged files, which then causes git pull to fail.
+            #
+            # `--diff-filter=U -z` gives one NUL-separated path per conflicted
+            # file, so a name containing whitespace or a quote is parsed exactly
+            # (the old `git ls-files --unmerged` + `line.split()[-1]` mangled it),
+            # and every reported name is shell-quoted before it is printed.
             stdout, stderr, code = ssh.execute_sudo(
-                f"su - {user} -c 'cd {app_dir} && git ls-files --unmerged'", timeout=15
+                f"su - {user} -c 'cd {app_dir} && git diff --name-only --diff-filter=U -z'",
+                timeout=15,
             )
-            if stdout.strip():
-                # git ls-files --unmerged emits 3 lines per file (stages 1/2/3); deduplicate
+            if stdout.strip("\x00 \t\r\n"):
                 seen = set()
                 unique_files = []
-                for line in stdout.strip().splitlines():
-                    fname = line.split()[-1]
-                    if fname not in seen:
+                for fname in stdout.split("\x00"):
+                    fname = fname.strip("\r\n")
+                    if fname and fname not in seen:
                         seen.add(fname)
-                        unique_files.append(f"  {fname}")
+                        unique_files.append(f"  {shlex.quote(fname)}")
                 unmerged = "\n".join(unique_files)
                 log(f"ERROR: Repository has unmerged (conflicted) files:\n{unmerged}")
                 log("Resolve these conflicts manually on the server before running the upgrade:")

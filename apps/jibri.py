@@ -10,11 +10,19 @@ import base64
 import logging
 import re
 import secrets
+import shlex
 import time
 import uuid
 
 from apps.backup import backup_guest, snapshot_guest
-from apps.utils import _log_cmd_output, _validate_shell_param
+from apps.utils import (
+    _log_cmd_output,
+    _remote_write_cmd,
+    _validate_abs_path,
+    _validate_hostname,
+    _validate_safe_filename,
+    _validate_shell_param,
+)
 from clients.proxmox_api import ProxmoxClient
 from clients.ssh_client import SSHClient
 from models import Guest, Setting
@@ -63,6 +71,47 @@ def _get_jibri_config():
     }
 
 
+def _get_jibri_secret(key):
+    """Read a Jibri secret from settings, decrypting it.
+
+    Jibri's XMPP/recorder/SMB passwords used to be stored as plaintext settings.
+    A value that does not decrypt is treated as one of those legacy plaintexts
+    exactly once: it is returned as-is and immediately re-encrypted, so the next
+    read takes the normal path.
+    """
+    raw = Setting.get(key, "")
+    if not raw:
+        return ""
+    from auth.credential_store import decrypt
+    try:
+        return decrypt(raw) or ""
+    except Exception:
+        logger.info("Migrating legacy plaintext setting %s to encrypted storage", key)
+        _set_jibri_secret(key, raw)
+        return raw
+
+
+def _set_jibri_secret(key, value):
+    """Store a Jibri secret encrypted at rest."""
+    from auth.credential_store import encrypt
+    Setting.set(key, encrypt(value) if value else "")
+
+
+def _validate_recording_dir(recording_dir):
+    """Return an error string if the configured recording directory is unusable.
+
+    The directory is a mount point in /etc/fstab, an argument to `mount`, and the
+    parent of every `rm` on a recording — an empty, relative, or quote-bearing
+    value there is a root-level foot-gun (``/`` alone would have had `sed` strip
+    every line of /etc/fstab).
+    """
+    try:
+        _validate_abs_path(recording_dir, "Jibri recording directory")
+    except ValueError as e:
+        return str(e)
+    return None
+
+
 def _ssh_write_file(ssh, path, content, log):
     """Write content to a remote file via base64 pipe.
 
@@ -71,7 +120,7 @@ def _ssh_write_file(ssh, path, content, log):
     """
     encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
     stdout, stderr, code = ssh.execute_sudo(
-        f"printf '%s' '{encoded}' | base64 -d | tee {path} > /dev/null",
+        f"printf '%s' '{encoded}' | base64 -d | tee {shlex.quote(path)} > /dev/null",
         timeout=15,
     )
     if code != 0:
@@ -181,10 +230,23 @@ def run_jibri_preflight(log_callback=None):
     jitsi_hostname = config.get("jitsi_hostname", "")
     if jitsi_hostname:
         check("Jitsi hostname configured", True)
+        try:
+            _validate_hostname(jitsi_hostname, "Jitsi hostname")
+            check("Jitsi hostname format valid", True)
+        except ValueError as e:
+            check("Jitsi hostname format valid", False, str(e))
+            config_ok = False
     else:
         check("Jitsi hostname configured", False,
               "Jitsi hostname must be set for XMPP connection")
         config_ok = False
+
+    dir_err = _validate_recording_dir(config.get("recording_dir", ""))
+    if dir_err:
+        check("Recording directory valid", False, dir_err)
+        config_ok = False
+    else:
+        check("Recording directory valid", True)
 
     protection_type = config.get("protection_type", "snapshot")
     backup_storage = config.get("backup_storage", "")
@@ -410,7 +472,7 @@ def run_jibri_install(log_callback=None):
     jitsi_ip = jitsi_guest.ip_address
 
     try:
-        _validate_shell_param(jitsi_hostname, "Jitsi hostname")
+        _validate_hostname(jitsi_hostname, "Jitsi hostname")
     except ValueError as e:
         return False, str(e)
 
@@ -659,16 +721,20 @@ def run_jibri_install(log_callback=None):
 
             # Phase G: Generate XMPP credentials
             log("=== Phase G: Generating XMPP credentials ===")
-            xmpp_password = Setting.get("jibri_xmpp_password", "") or secrets.token_urlsafe(32)
-            recorder_password = Setting.get("jibri_recorder_password", "") or secrets.token_urlsafe(32)
-            Setting.set("jibri_xmpp_password", xmpp_password)
-            Setting.set("jibri_recorder_password", recorder_password)
-            log("XMPP credentials generated and stored")
+            xmpp_password = _get_jibri_secret("jibri_xmpp_password") or secrets.token_urlsafe(32)
+            recorder_password = _get_jibri_secret("jibri_recorder_password") or secrets.token_urlsafe(32)
+            _set_jibri_secret("jibri_xmpp_password", xmpp_password)
+            _set_jibri_secret("jibri_recorder_password", recorder_password)
+            log("XMPP credentials generated and stored (encrypted at rest)")
             log("")
 
             # Phase H: Write Jibri config
             log("=== Phase H: Writing Jibri configuration ===")
             recording_dir = config.get("recording_dir", "/srv/recordings")
+            dir_err = _validate_recording_dir(recording_dir)
+            if dir_err:
+                log(f"ERROR: {dir_err}")
+                return False, "\n".join(log_lines)
             jibri_nickname = f"jibri-{uuid.uuid4().hex[:8]}"
 
             jibri_conf = f"""jibri {{
@@ -717,8 +783,9 @@ def run_jibri_install(log_callback=None):
   }}
 }}
 """
-            ssh.execute_sudo(f"mkdir -p {recording_dir}", timeout=10)
-            ssh.execute_sudo(f"chown jibri:jibri {recording_dir}", timeout=10)
+            q_recording_dir = shlex.quote(recording_dir)
+            ssh.execute_sudo(f"mkdir -p {q_recording_dir}", timeout=10)
+            ssh.execute_sudo(f"chown jibri:jibri {q_recording_dir}", timeout=10)
 
             if not _ssh_write_file(ssh, "/etc/jitsi/jibri/jibri.conf", jibri_conf, log):
                 return False, "\n".join(log_lines)
@@ -825,9 +892,15 @@ def run_jibri_jitsi_configure(log_callback=None):
     jitsi_hostname = config.get("jitsi_hostname", "")
     if not jitsi_hostname:
         return False, "Jitsi hostname not configured"
+    # The hostname is interpolated into a Prosody config path and into grep/append
+    # arguments on the Jitsi server — it must be a real FQDN and nothing else.
+    try:
+        _validate_hostname(jitsi_hostname, "Jitsi hostname")
+    except ValueError as e:
+        return False, str(e)
 
-    xmpp_password = Setting.get("jibri_xmpp_password", "")
-    recorder_password = Setting.get("jibri_recorder_password", "")
+    xmpp_password = _get_jibri_secret("jibri_xmpp_password")
+    recorder_password = _get_jibri_secret("jibri_recorder_password")
     if not xmpp_password or not recorder_password:
         return False, "XMPP credentials not generated — run Jibri install first"
 
@@ -854,7 +927,7 @@ def run_jibri_jitsi_configure(log_callback=None):
 
             # Check if Jibri config already exists
             stdout, stderr, code = ssh.execute_sudo(
-                f"grep -c 'recorder.{jitsi_hostname}' {prosody_conf_path} 2>/dev/null",
+                f"grep -c 'recorder.{jitsi_hostname}' {shlex.quote(prosody_conf_path)} 2>/dev/null",
                 timeout=10
             )
             if code == 0 and stdout and int(stdout.strip()) > 0:
@@ -880,7 +953,7 @@ VirtualHost "recorder.{jitsi_hostname}"
                 # Append Jibri config directly to Prosody via base64 pipe
                 encoded = base64.b64encode(jibri_prosody.encode("utf-8")).decode("ascii")
                 stdout, stderr, code = ssh.execute_sudo(
-                    f"printf '%s' '{encoded}' | base64 -d >> {prosody_conf_path}",
+                    f"printf '%s' '{encoded}' | base64 -d >> {shlex.quote(prosody_conf_path)}",
                     timeout=15
                 )
                 if code != 0:
@@ -1041,7 +1114,7 @@ def configure_smb_mount(log_callback=None):
 
     smb_share = config.get("smb_share", "")
     smb_username = config.get("smb_username", "")
-    smb_password = Setting.get("jibri_smb_password", "")
+    smb_password = _get_jibri_secret("jibri_smb_password")
     recording_dir = config.get("recording_dir", "/srv/recordings")
 
     if not smb_share:
@@ -1050,6 +1123,14 @@ def configure_smb_mount(log_callback=None):
         return False, f"Invalid SMB share path: {smb_share}"
     if not smb_username:
         return False, "SMB username not configured"
+    try:
+        _validate_shell_param(smb_username, "SMB username")
+    except ValueError as e:
+        return False, str(e)
+    dir_err = _validate_recording_dir(recording_dir)
+    if dir_err:
+        return False, dir_err
+    q_recording_dir = shlex.quote(recording_dir)
 
     app_guest = Guest.query.get(int(config["guest_id"]))
     if not app_guest:
@@ -1080,7 +1161,7 @@ def configure_smb_mount(log_callback=None):
                 return False, "\n".join(log_lines)
 
             # Create mount point
-            ssh.execute_sudo(f"mkdir -p {recording_dir}", timeout=10)
+            ssh.execute_sudo(f"mkdir -p {q_recording_dir}", timeout=10)
 
             # Write SMB credentials file
             log("Writing SMB credentials...")
@@ -1100,22 +1181,28 @@ def configure_smb_mount(log_callback=None):
             )
             jibri_gid = (stdout or "").strip() or "location"
 
-            # Remove existing fstab entry if present
+            # Remove any existing fstab entry for this mount point.  The pattern
+            # is anchored to the second (mount-point) field so it can only match
+            # a line that actually mounts this directory — the old unanchored
+            # `\|dir|d` matched any line containing the string anywhere.
+            fstab_re = re.escape(recording_dir).replace("/", "\\/")
             ssh.execute_sudo(
-                f"sed -i '\\|{recording_dir}|d' /etc/fstab 2>/dev/null",
+                "sed -i " + shlex.quote(f"/^[^[:space:]#][^[:space:]]*[[:space:]]\\+{fstab_re}[[:space:]]/d")
+                + " /etc/fstab 2>/dev/null",
                 timeout=10
             )
 
-            # Add fstab entry
+            # Add fstab entry (written via the base64 pipe — a quote in the share
+            # path or mount point can no longer break out of `echo '...'`)
             fstab_entry = (
                 f"{smb_share} {recording_dir} cifs "
                 f"credentials=/etc/jibri/.smbcredentials,"
                 f"uid={jibri_uid},gid={jibri_gid},"
                 f"file_mode=0775,dir_mode=0775,"
-                f"_netdev,nofail 0 0"
+                f"_netdev,nofail 0 0\n"
             )
             stdout, stderr, code = ssh.execute_sudo(
-                f"echo '{fstab_entry}' >> /etc/fstab",
+                _remote_write_cmd("/etc/fstab", fstab_entry, append=True),
                 timeout=10
             )
             log("fstab entry added")
@@ -1123,7 +1210,7 @@ def configure_smb_mount(log_callback=None):
             # Mount the share
             log("Mounting SMB share...")
             stdout, stderr, code = ssh.execute_sudo(
-                f"mount {recording_dir} 2>&1",
+                f"mount {q_recording_dir} 2>&1",
                 timeout=30
             )
             if code != 0:
@@ -1133,8 +1220,8 @@ def configure_smb_mount(log_callback=None):
 
             # Verify writable
             stdout, stderr, code = ssh.execute_sudo(
-                f"sudo -u jibri touch {recording_dir}/.mcat_test 2>&1 && "
-                f"rm -f {recording_dir}/.mcat_test",
+                f"sudo -u jibri touch {shlex.quote(recording_dir + '/.mcat_test')} 2>&1 && "
+                f"rm -f {shlex.quote(recording_dir + '/.mcat_test')}",
                 timeout=10
             )
             if code == 0:
@@ -1450,12 +1537,15 @@ def list_recordings():
         return [], "No SSH credential available"
 
     recording_dir = config.get("recording_dir", "/srv/recordings")
+    dir_err = _validate_recording_dir(recording_dir)
+    if dir_err:
+        return [], dir_err
 
     try:
         with SSHClient.from_credential(app_guest.ip_address, credential) as ssh:
             # List files with size and timestamp
             stdout, stderr, code = ssh.execute_sudo(
-                f"find {recording_dir} -maxdepth 2 -type f "
+                f"find {shlex.quote(recording_dir)} -maxdepth 2 -type f "
                 r"-name '*.mp4' -o -name '*.mkv' -o -name '*.webm' "
                 "2>/dev/null | "
                 "xargs -r stat --format='%n|%s|%Y' 2>/dev/null | "
@@ -1494,8 +1584,13 @@ def delete_recording(filename):
     if not filename:
         return False, "Filename is required"
 
-    # Prevent path traversal — allow subdirectory but no ..
-    if ".." in filename or filename.startswith("/"):
+    # Allow-list the name instead of blocklisting traversal: list_recordings()
+    # returns either "file.mp4" or "subdir/file.mp4", and every component has to
+    # match _SAFE_FILENAME_RE, which excludes '..', '/', quotes and every other
+    # shell metacharacter.
+    try:
+        _validate_safe_filename(filename, "Recording name", allow_subdir=True)
+    except ValueError:
         return False, "Invalid filename"
 
     config = _get_jibri_config()
@@ -1514,19 +1609,22 @@ def delete_recording(filename):
         return False, "No SSH credential available"
 
     recording_dir = config.get("recording_dir", "/srv/recordings")
-    full_path = f"{recording_dir}/{filename}"
+    dir_err = _validate_recording_dir(recording_dir)
+    if dir_err:
+        return False, dir_err
+    full_path = shlex.quote(f"{recording_dir}/{filename}")
 
     try:
         with SSHClient.from_credential(app_guest.ip_address, credential) as ssh:
             # Verify file exists
             stdout, stderr, code = ssh.execute_sudo(
-                f"test -f '{full_path}' && echo exists", timeout=10
+                f"test -f {full_path} && echo exists", timeout=10
             )
             if code != 0 or "exists" not in (stdout or ""):
                 return False, "Recording file not found"
 
             stdout, stderr, code = ssh.execute_sudo(
-                f"rm -f '{full_path}' 2>&1", timeout=10
+                f"rm -f {full_path} 2>&1", timeout=10
             )
             if code != 0:
                 return False, f"Failed to delete recording (exit {code})"

@@ -13,8 +13,40 @@ from datetime import datetime, timezone
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 
+from apps.utils import _validate_http_url, _validate_no_control_chars
 from auth.audit import log_action
 from models import ExporterInstance, Guest, HostExporterInstance, ProxmoxHost, Setting, db
+
+# Longest value accepted for an exporter environment variable (DSNs and URIs).
+_MAX_EXPORTER_VALUE = 1024
+
+# A Prometheus scrape target ("host:port", optionally scheme/path-qualified).  It
+# is rendered into a double-quoted YAML scalar in prometheus.yml, so a quote or a
+# newline in it would corrupt the generated config.
+_SCRAPE_TARGET_RE = _re.compile(r'^[A-Za-z0-9._\-:/]{1,255}$')
+
+
+def _parse_exporter_config(data, env_vars):
+    """Collect and validate the ``config_<VAR>`` fields for an exporter.
+
+    These values are written verbatim into ``/etc/default/<exporter>``, which
+    systemd parses line by line — a newline would smuggle in an extra variable
+    (and used to be able to terminate the heredoc the file was written with).
+    Returns ``(config_or_None, error_message_or_None)``.
+    """
+    config = {}
+    for var in env_vars:
+        val = (data.get(f"config_{var}", "") or "").strip()
+        if not val:
+            continue
+        if len(val) > _MAX_EXPORTER_VALUE:
+            return None, f"{var} is too long (max {_MAX_EXPORTER_VALUE} characters)."
+        try:
+            _validate_no_control_chars(val, var)
+        except ValueError as e:
+            return None, str(e)
+        config[var] = val
+    return (config or None), None
 
 
 def _parse_iso(value):
@@ -130,15 +162,33 @@ def manage():
 
 @bp.route("/save", methods=["POST"])
 def save():
+    # The metrics URL is rendered into prometheus.yml on the Prometheus guest;
+    # the auth token is handled unchanged (it is written as a quoted YAML scalar).
+    prometheus_url = request.form.get("prometheus_url", "").strip()
+    metrics_url = request.form.get("prometheus_mstdnca_metrics_url", "").strip()
+    auth_token = request.form.get("prometheus_auth_token", "").strip()
+    try:
+        if prometheus_url:
+            _validate_http_url(prometheus_url, "Prometheus URL")
+        if metrics_url and not _SCRAPE_TARGET_RE.match(metrics_url):
+            raise ValueError(
+                "mstdnca metrics URL must be a scrape target such as host:port "
+                f"(no quotes, spaces, or control characters): {metrics_url!r}"
+            )
+        if auth_token:
+            _validate_no_control_chars(auth_token, "Auth token")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("prometheus_app.manage"))
+
     Setting.set("prometheus_guest_id", request.form.get("prometheus_guest_id", "").strip())
-    Setting.set("prometheus_url", request.form.get("prometheus_url", "").strip())
-    Setting.set("prometheus_auth_token", request.form.get("prometheus_auth_token", "").strip())
+    Setting.set("prometheus_url", prometheus_url)
+    Setting.set("prometheus_auth_token", auth_token)
     Setting.set("prometheus_enabled",
                 "true" if "prometheus_enabled" in request.form else "false")
     Setting.set("prometheus_auto_upgrade",
                 "true" if "prometheus_auto_upgrade" in request.form else "false")
-    Setting.set("prometheus_mstdnca_metrics_url",
-                request.form.get("prometheus_mstdnca_metrics_url", "").strip())
+    Setting.set("prometheus_mstdnca_metrics_url", metrics_url)
 
     retention = request.form.get("prometheus_retention_days", "365").strip()
     try:
@@ -471,13 +521,10 @@ def exporter_add():
     # Parse env var config for exporters that require it
     config = None
     if info.get("requires_config") and info.get("env_vars"):
-        config = {}
-        for var in info["env_vars"]:
-            val = data.get(f"config_{var}", "").strip()
-            if val:
-                config[var] = val
-        if not config:
-            config = None
+        config, cfg_err = _parse_exporter_config(data, info["env_vars"])
+        if cfg_err:
+            flash(cfg_err, "error")
+            return redirect(url_for("prometheus_app.manage"))
 
     instance = ExporterInstance(
         guest_id=guest.id,
@@ -632,13 +679,12 @@ def exporter_update_config(instance_id):
         return redirect(url_for("prometheus_app.manage"))
 
     data = request.form if request.form else (request.get_json(silent=True) or {})
-    config = {}
-    for var in env_vars:
-        val = data.get(f"config_{var}", "").strip()
-        if val:
-            config[var] = val
+    config, cfg_err = _parse_exporter_config(data, env_vars)
+    if cfg_err:
+        flash(cfg_err, "error")
+        return redirect(url_for("prometheus_app.manage"))
 
-    instance.config = config if config else None
+    instance.config = config
     log_action("exporter_config", "guest", resource_id=instance.guest_id,
                resource_name=instance.guest.name,
                details={"exporter_type": instance.exporter_type, "config_set": bool(config)})
@@ -694,13 +740,10 @@ def host_exporter_add():
 
     config = None
     if info.get("requires_config") and info.get("env_vars"):
-        config = {}
-        for var in info["env_vars"]:
-            val = data.get(f"config_{var}", "").strip()
-            if val:
-                config[var] = val
-        if not config:
-            config = None
+        config, cfg_err = _parse_exporter_config(data, info["env_vars"])
+        if cfg_err:
+            flash(cfg_err, "error")
+            return redirect(url_for("prometheus_app.manage"))
 
     instance = HostExporterInstance(
         host_id=host.id,
@@ -855,13 +898,12 @@ def host_exporter_update_config(instance_id):
         return redirect(url_for("prometheus_app.manage"))
 
     data = request.form if request.form else (request.get_json(silent=True) or {})
-    config = {}
-    for var in env_vars:
-        val = data.get(f"config_{var}", "").strip()
-        if val:
-            config[var] = val
+    config, cfg_err = _parse_exporter_config(data, env_vars)
+    if cfg_err:
+        flash(cfg_err, "error")
+        return redirect(url_for("prometheus_app.manage"))
 
-    instance.config = config if config else None
+    instance.config = config
     log_action("host_exporter_config", "host", resource_id=instance.host_id,
                resource_name=instance.host.name,
                details={"exporter_type": instance.exporter_type, "config_set": bool(config)})

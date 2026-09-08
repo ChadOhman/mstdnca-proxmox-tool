@@ -9,11 +9,20 @@ config that scrapes the mstdnca app's /metrics endpoint.
 import json
 import logging
 import re
+import shlex
 import time
 import urllib.request
 from datetime import datetime
 
-from apps.utils import _log_cmd_output, _validate_shell_param, _version_gt
+from apps.utils import (
+    _cleanup_workdir,
+    _fetch_verified_tarball,
+    _log_cmd_output,
+    _remote_write_cmd,
+    _validate_release_tag,
+    _validate_shell_param,
+    _version_gt,
+)
 from clients.proxmox_api import ProxmoxClient
 from clients.ssh_client import SSHClient
 from models import Guest, Setting
@@ -25,6 +34,19 @@ logger = logging.getLogger(__name__)
 # Version check
 # ---------------------------------------------------------------------------
 
+def _prometheus_release_urls(latest, prom_arch):
+    """Return (asset_name, download_url, checksum_url, extract_dir) for a release.
+
+    The Prometheus project publishes ``sha256sums.txt`` alongside the tarballs
+    in every release, so the digest is checked on the target host before
+    anything is unpacked and installed as root.
+    """
+    extract_dir = f"prometheus-{latest}.linux-{prom_arch}"
+    asset = f"{extract_dir}.tar.gz"
+    base = f"https://github.com/prometheus/prometheus/releases/download/v{latest}"
+    return asset, f"{base}/{asset}", f"{base}/sha256sums.txt", extract_dir
+
+
 def check_prometheus_release():
     """Check GitHub for the latest Prometheus release.
 
@@ -35,11 +57,20 @@ def check_prometheus_release():
         req = urllib.request.Request(url, headers={"User-Agent": "mstdnca-proxmox-tool"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-            latest = data.get("tag_name", "").lstrip("v")
+            tag = data.get("tag_name", "")
             release_url = data.get("html_url", "")
 
-        if not latest:
+        if not tag:
             return False, "", ""
+
+        # The tag is interpolated into a download URL and an extraction path on
+        # the target host — validate it before it can reach either.
+        try:
+            _validate_release_tag(tag, "Prometheus release tag")
+        except ValueError as e:
+            logger.error("Rejected Prometheus release tag: %s", e)
+            return False, "", ""
+        latest = tag.lstrip("v")
 
         Setting.set("prometheus_latest_version", latest)
 
@@ -251,42 +282,34 @@ def run_prometheus_install(log_callback=None):
                 _log("ERROR: Failed to create directories.")
                 return False, log_lines
 
-            # Download and extract Prometheus
-            dl_url = (
-                f"https://github.com/prometheus/prometheus/releases/download/v{latest}/"
-                f"prometheus-{latest}.linux-{prom_arch}.tar.gz"
-            )
+            # Download Prometheus, verify its published SHA-256, and extract it
+            # into a private temp dir (not a predictable /tmp path).
+            asset, dl_url, sums_url, extract_dir = _prometheus_release_urls(latest, prom_arch)
             _log(f"Downloading Prometheus v{latest} ({prom_arch})...")
-            dl_cmd = (
-                f"cd /tmp && "
-                f"(curl -sSL -o prometheus.tar.gz '{dl_url}' 2>/dev/null "
-                f"|| wget -q -O prometheus.tar.gz '{dl_url}') && "
-                f"tar xzf prometheus.tar.gz"
-            )
-            stdout, stderr, code = ssh.execute_sudo(dl_cmd, timeout=120)
-            _log_cmd_output(_log, stdout, stderr, code)
-            if code != 0:
-                _log("ERROR: Failed to download Prometheus.")
+            ok, workdir, err = _fetch_verified_tarball(ssh, _log, dl_url, asset, sums_url)
+            if not ok:
+                _log(f"ERROR: Failed to download Prometheus: {err}")
                 return False, log_lines
 
             # Install binaries
-            extract_dir = f"prometheus-{latest}.linux-{prom_arch}"
+            src = shlex.quote(f"{workdir}/{extract_dir}")
             _log("Installing binaries...")
             stdout, stderr, code = ssh.execute_sudo(
-                f"cp /tmp/{extract_dir}/prometheus /usr/local/bin/ && "
-                f"cp /tmp/{extract_dir}/promtool /usr/local/bin/ && "
+                f"cp {src}/prometheus /usr/local/bin/ && "
+                f"cp {src}/promtool /usr/local/bin/ && "
                 "chown prometheus:prometheus /usr/local/bin/prometheus /usr/local/bin/promtool",
                 timeout=30,
             )
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
                 _log("ERROR: Failed to install binaries.")
+                _cleanup_workdir(ssh, workdir)
                 return False, log_lines
 
             # Copy console files
             stdout, stderr, code = ssh.execute_sudo(
-                f"cp -r /tmp/{extract_dir}/consoles /etc/prometheus/ && "
-                f"cp -r /tmp/{extract_dir}/console_libraries /etc/prometheus/ && "
+                f"cp -r {src}/consoles /etc/prometheus/ && "
+                f"cp -r {src}/console_libraries /etc/prometheus/ && "
                 "chown -R prometheus:prometheus /etc/prometheus",
                 timeout=15,
             )
@@ -303,25 +326,32 @@ def run_prometheus_install(log_callback=None):
             _log("Writing bootstrap prometheus.yml...")
             bootstrap_yml = _generate_prometheus_yml("")
             stdout, stderr, code = ssh.execute_sudo(
-                f"cat > /etc/prometheus/prometheus.yml << 'PROMEOF'\n{bootstrap_yml}\nPROMEOF\n"
-                "chown prometheus:prometheus /etc/prometheus/prometheus.yml",
+                _remote_write_cmd(
+                    "/etc/prometheus/prometheus.yml", bootstrap_yml,
+                    mode="644", owner="prometheus",
+                ),
                 timeout=15,
             )
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
                 _log("ERROR: Failed to write bootstrap prometheus.yml.")
+                _cleanup_workdir(ssh, workdir)
                 return False, log_lines
 
             # Create systemd service
             _log("Creating systemd service...")
             service_content = _generate_systemd_unit(retention_days)
             stdout, stderr, code = ssh.execute_sudo(
-                f"cat > /etc/systemd/system/prometheus.service << 'SVCEOF'\n{service_content}\nSVCEOF",
+                _remote_write_cmd(
+                    "/etc/systemd/system/prometheus.service", service_content,
+                    mode="644", owner="root",
+                ),
                 timeout=15,
             )
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
                 _log("ERROR: Failed to create systemd service.")
+                _cleanup_workdir(ssh, workdir)
                 return False, log_lines
 
             # Enable and start
@@ -344,7 +374,7 @@ def run_prometheus_install(log_callback=None):
                 _log("WARNING: Prometheus may not be running. Check logs with: journalctl -u prometheus")
 
             # Clean up
-            ssh.execute_sudo(f"rm -rf /tmp/prometheus.tar.gz /tmp/{extract_dir}", timeout=15)
+            _cleanup_workdir(ssh, workdir)
 
     except Exception as e:
         _log(f"FATAL ERROR: {e}")
@@ -439,22 +469,12 @@ def run_prometheus_upgrade(log_callback=None):
             arch = (arch_out or "amd64").strip()
             prom_arch = "arm64" if arch == "arm64" else "amd64"
 
-            # Download new version
-            dl_url = (
-                f"https://github.com/prometheus/prometheus/releases/download/v{latest}/"
-                f"prometheus-{latest}.linux-{prom_arch}.tar.gz"
-            )
+            # Download the new version and verify its published SHA-256
+            asset, dl_url, sums_url, extract_dir = _prometheus_release_urls(latest, prom_arch)
             _log(f"Downloading Prometheus v{latest}...")
-            dl_cmd = (
-                f"cd /tmp && "
-                f"(curl -sSL -o prometheus.tar.gz '{dl_url}' 2>/dev/null "
-                f"|| wget -q -O prometheus.tar.gz '{dl_url}') && "
-                f"tar xzf prometheus.tar.gz"
-            )
-            stdout, stderr, code = ssh.execute_sudo(dl_cmd, timeout=120)
-            _log_cmd_output(_log, stdout, stderr, code)
-            if code != 0:
-                _log("ERROR: Failed to download new version.")
+            ok, workdir, err = _fetch_verified_tarball(ssh, _log, dl_url, asset, sums_url)
+            if not ok:
+                _log(f"ERROR: Failed to download new version: {err}")
                 return False, log_lines
 
             # Stop service
@@ -462,17 +482,18 @@ def run_prometheus_upgrade(log_callback=None):
             ssh.execute_sudo("systemctl stop prometheus", timeout=30)
 
             # Replace binaries
-            extract_dir = f"prometheus-{latest}.linux-{prom_arch}"
+            src = shlex.quote(f"{workdir}/{extract_dir}")
             _log("Replacing binaries...")
             stdout, stderr, code = ssh.execute_sudo(
-                f"cp /tmp/{extract_dir}/prometheus /usr/local/bin/ && "
-                f"cp /tmp/{extract_dir}/promtool /usr/local/bin/ && "
+                f"cp {src}/prometheus /usr/local/bin/ && "
+                f"cp {src}/promtool /usr/local/bin/ && "
                 "chown prometheus:prometheus /usr/local/bin/prometheus /usr/local/bin/promtool",
                 timeout=30,
             )
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
                 _log("ERROR: Failed to replace binaries.")
+                _cleanup_workdir(ssh, workdir)
                 return False, log_lines
 
             # Start service
@@ -484,7 +505,7 @@ def run_prometheus_upgrade(log_callback=None):
                 return False, log_lines
 
             # Clean up
-            ssh.execute_sudo(f"rm -rf /tmp/prometheus.tar.gz /tmp/{extract_dir}", timeout=15)
+            _cleanup_workdir(ssh, workdir)
 
             _log(f"Prometheus upgraded to v{latest} successfully.")
             Setting.set("prometheus_current_version", latest)
