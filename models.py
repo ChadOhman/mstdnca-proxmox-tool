@@ -810,6 +810,49 @@ class Setting(db.Model):
             g.pop("_settings_cache", None)
         return s
 
+    @staticmethod
+    def set_no_commit(key, value):
+        """Insert or update a setting WITHOUT committing or touching the cache.
+
+        For callers that batch many setting writes into a single transaction
+        (e.g. config import) and want to commit once themselves so the whole
+        batch is atomic. Unlike ``set()``, this never calls
+        ``db.session.commit()`` or ``db.session.rollback()`` — an error here
+        is expected to propagate so the caller can roll back everything.
+        Callers must call ``Setting.invalidate_cache()`` after they commit.
+        """
+        s = Setting.query.filter_by(key=key).first()
+        if s:
+            s.value = value
+            return s
+        try:
+            stmt = sqlite_insert(Setting.__table__).values(key=key, value=value)
+            stmt = stmt.on_conflict_do_update(index_elements=["key"], set_={"value": value})
+            db.session.execute(stmt)
+            db.session.flush()
+        except CompileError:
+            # Non-SQLite backend that doesn't understand sqlite_insert.
+            s = Setting.query.filter_by(key=key).first()
+            if s:
+                s.value = value
+            else:
+                s = Setting(key=key, value=value)
+                db.session.add(s)
+            return s
+        return Setting.query.filter_by(key=key).first()
+
+    @staticmethod
+    def invalidate_cache():
+        """Clear the per-request settings cache.
+
+        Call once after committing a batch of writes made via
+        ``set_no_commit()`` — those writes don't invalidate the cache
+        themselves.
+        """
+        if _in_request_context():
+            from flask import g
+            g.pop("_settings_cache", None)
+
 
 class AuditLog(db.Model):
     __tablename__ = "audit_logs"

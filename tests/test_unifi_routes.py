@@ -292,6 +292,50 @@ class TestChartApiEndpoints:
         resp = auth_client.get("/unifi/api/site/dpi/chart")
         assert resp.status_code == 404
 
+    def test_device_chart_rejects_promql_injection_in_name(self, auth_client, app):
+        """A device name crafted to break out of the PromQL label matcher
+        (see GHSA-gj96-qjq5-q57h) must be rejected with 400, not interpolated."""
+        with app.app_context():
+            Setting.set("unpoller_enabled", "true")
+            db.session.commit()
+        resp = auth_client.get(
+            "/unifi/api/device/aa:bb:cc:dd:ee:ff/chart",
+            query_string={"name": 'evil"} or up{job=~".*'},
+        )
+        assert resp.status_code == 400
+
+    def test_radio_chart_rejects_promql_injection_in_device_name(self, auth_client, app):
+        with app.app_context():
+            Setting.set("unpoller_enabled", "true")
+            db.session.commit()
+        resp = auth_client.get(
+            "/unifi/api/device/aa:bb:cc:dd:ee:ff/radio/ra0/chart",
+            query_string={"name": 'evil"} or up{job=~".*'},
+        )
+        assert resp.status_code == 400
+
+    def test_radio_chart_rejects_overlong_name(self, auth_client, app):
+        with app.app_context():
+            Setting.set("unpoller_enabled", "true")
+            db.session.commit()
+        resp = auth_client.get(
+            "/unifi/api/device/aa:bb:cc:dd:ee:ff/radio/ra0/chart",
+            query_string={"name": "x" * 65},
+        )
+        assert resp.status_code == 400
+
+    def test_device_chart_allows_normal_name(self, auth_client, app):
+        with app.app_context():
+            Setting.set("unpoller_enabled", "false")  # skip unpoller path, just verify no 400
+            db.session.commit()
+        with patch("clients.prometheus_query.Setting") as pq_setting:
+            pq_setting.get.return_value = ""
+            resp = auth_client.get(
+                "/unifi/api/device/aa:bb:cc:dd:ee:ff/chart",
+                query_string={"name": "Office AP-01"},
+            )
+        assert resp.status_code == 404  # Prometheus not configured, but name passed validation
+
 
 class TestPermissions:
     def test_unauthenticated_redirects(self, client):

@@ -269,9 +269,12 @@ def logout():
     is_cf_user = current_user.created_via == "cloudflare"
     logout_user()
     if is_cf_user:
+        from auth.cloudflare_access import _is_valid_team_domain
         from models import Setting
         team_domain = Setting.get("cf_access_team_domain", "")
-        if team_domain and team_domain.endswith(".cloudflareaccess.com"):
+        # Strict match (not .endswith()) -- a suffix check would accept
+        # "evil.com#.cloudflareaccess.com" and turn this into an open redirect.
+        if _is_valid_team_domain(team_domain):
             return redirect(f"https://{team_domain}/cdn-cgi/access/logout")
     flash("You have been logged out.", "info")
     return redirect(url_for("auth.login"))

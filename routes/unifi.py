@@ -291,6 +291,12 @@ def refresh():
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", re.IGNORECASE)
 
+# unpoller device/radio names are interpolated into a PromQL label matcher
+# (see clients/prometheus_query.py). They're now escaped there too, but an
+# allowlist at the boundary keeps obviously-bogus/oversized values (and the
+# 400 they should get) from ever reaching the query layer.
+_UNIFI_NAME_RE = re.compile(r"^[\w .:-]{1,64}$")
+
 
 @bp.route("/device/<mac>")
 def device_detail(mac):
@@ -558,6 +564,8 @@ def device_chart_data(mac):
 
     timeframe = request.args.get("timeframe", "day")
     device_name = request.args.get("name", "")
+    if device_name and not _UNIFI_NAME_RE.match(device_name):
+        return jsonify({"error": "Invalid device name"}), 400
     try:
         from clients.prometheus_query import PrometheusQueryClient
         prom = PrometheusQueryClient()
@@ -635,6 +643,8 @@ def radio_chart_data(mac, radio_name):
     device_name = request.args.get("name", "")
     if not device_name:
         return jsonify({"error": "Device name required"}), 400
+    if not _UNIFI_NAME_RE.match(device_name) or not _UNIFI_NAME_RE.match(radio_name):
+        return jsonify({"error": "Invalid device or radio name"}), 400
 
     timeframe = request.args.get("timeframe", "day")
     try:
