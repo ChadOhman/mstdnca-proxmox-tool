@@ -450,7 +450,18 @@ def test_unifi():
         flash("UniFi controller URL, username, and password are required.", "error")
         return redirect(url_for("settings.index"))
 
-    password = decrypt(encrypted_pw)
+    try:
+        password = decrypt(encrypted_pw)
+    except Exception:
+        logger.warning("Stored UniFi password could not be decrypted", exc_info=True)
+        password = None
+    if not password:
+        flash(
+            "The stored UniFi credentials could not be decrypted; please re-enter them.",
+            "error",
+        )
+        return redirect(url_for("settings.index"))
+
     client = UniFiClient(base_url, username, password, site=site, is_udm=is_udm, verify_ssl=verify_ssl)
     ok, msg = client.test_connection()
 

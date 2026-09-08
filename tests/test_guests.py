@@ -287,3 +287,62 @@ class TestPowerAction:
             if host:
                 db.session.delete(host)
             db.session.commit()
+
+
+class TestAddGuestDuplicateVmid:
+    def test_duplicate_host_and_vmid_is_rejected(self, auth_client, app):
+        with app.app_context():
+            host = ProxmoxHost(name="_dup-vmid-host", hostname="10.7.0.1", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+            host_id = host.id
+            db.session.add(Guest(name="_dup-existing", guest_type="ct",
+                                 proxmox_host_id=host_id, vmid=7777))
+            db.session.commit()
+
+        try:
+            resp = auth_client.post(
+                "/guests/add",
+                data={"name": "_dup-new", "guest_type": "ct",
+                      "proxmox_host_id": str(host_id), "vmid": "7777"},
+                follow_redirects=True,
+            )
+            assert resp.status_code == 200
+            assert b"already exists on that host" in resp.data
+            with app.app_context():
+                assert Guest.query.filter_by(name="_dup-new").first() is None
+        finally:
+            with app.app_context():
+                h = ProxmoxHost.query.get(host_id)
+                if h:
+                    db.session.delete(h)
+                    db.session.commit()
+
+    def test_same_vmid_on_another_host_is_allowed(self, auth_client, app):
+        with app.app_context():
+            host_a = ProxmoxHost(name="_dup-vmid-host-a", hostname="10.7.0.2", host_type="pve")
+            host_b = ProxmoxHost(name="_dup-vmid-host-b", hostname="10.7.0.3", host_type="pve")
+            db.session.add_all([host_a, host_b])
+            db.session.commit()
+            a_id, b_id = host_a.id, host_b.id
+            db.session.add(Guest(name="_dup-host-a-guest", guest_type="ct",
+                                 proxmox_host_id=a_id, vmid=8888))
+            db.session.commit()
+
+        try:
+            resp = auth_client.post(
+                "/guests/add",
+                data={"name": "_dup-host-b-guest", "guest_type": "ct",
+                      "proxmox_host_id": str(b_id), "vmid": "8888"},
+                follow_redirects=True,
+            )
+            assert resp.status_code == 200
+            with app.app_context():
+                assert Guest.query.filter_by(name="_dup-host-b-guest").first() is not None
+        finally:
+            with app.app_context():
+                for hid in (a_id, b_id):
+                    h = ProxmoxHost.query.get(hid)
+                    if h:
+                        db.session.delete(h)
+                db.session.commit()

@@ -188,9 +188,24 @@ class TestDiscoverVmidReuse:
 
     def test_discover_reuse_preserves_credential(self, auth_client, app, host, vm_guest):
         """Credential assignment should survive reuse."""
+        # Foreign keys are enforced, so this has to be a credential that exists.
+        from auth import credential_store
+        from models import Credential
+
         with app.app_context():
+            cred = Credential.query.filter_by(name="_vmid-reuse-cred").first()
+            if cred is None:
+                cred = Credential(
+                    name="_vmid-reuse-cred",
+                    username="root",
+                    auth_type="password",
+                    encrypted_value=credential_store.encrypt("test-only-password"),
+                )
+                db.session.add(cred)
+                db.session.commit()
+            cred_id = cred.id
             g = Guest.query.get(vm_guest)
-            g.credential_id = 999  # fake credential id for test
+            g.credential_id = cred_id
             db.session.commit()
 
         mock_client = _mock_proxmox_client([
@@ -202,7 +217,7 @@ class TestDiscoverVmidReuse:
 
         with app.app_context():
             g = Guest.query.get(vm_guest)
-            assert g.credential_id == 999
+            assert g.credential_id == cred_id
 
     def test_discover_all_detects_reuse(self, auth_client, app, host, vm_guest):
         """discover-all path also detects VMID reuse."""

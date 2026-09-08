@@ -216,6 +216,7 @@ class TestInitScheduler:
             "ipmi_snapshot_purge",
             "revoked_token_prune",
             "moderation_check",
+            "update_history_purge",
         }
         assert expected_ids == registered_ids
 
@@ -2203,9 +2204,19 @@ class TestPollUnifiEventsBatching:
 class TestDiscoveryMacReuse:
     """A changed MAC on the same guest type also signals VMID reuse (#126)."""
 
+    CRED_NAME = "_mac-reuse-cred"
+
     def _seed(self, app, mac):
-        from models import Guest, ProxmoxHost, ScanResult, Setting, UpdatePackage, db
+        from auth import credential_store
+        from models import Credential, Guest, ProxmoxHost, ScanResult, Setting, UpdatePackage, db
         with app.app_context():
+            # FK enforcement is on (#127): the guest must reference a real credential.
+            cred = Credential.query.filter_by(name=self.CRED_NAME).first()
+            if cred is None:
+                cred = Credential(name=self.CRED_NAME, username="root", auth_type="password",
+                                  encrypted_value=credential_store.encrypt("test-only-password"))
+                db.session.add(cred)
+                db.session.flush()
             # Other suites toggle this off via POST /settings/scan and don't restore it.
             Setting.set("discovery_enabled", "true")
             host = ProxmoxHost(name="_mac-pve", hostname="10.9.9.9", host_type="pve",
@@ -2214,7 +2225,7 @@ class TestDiscoveryMacReuse:
             db.session.flush()
             guest = Guest(name="old", guest_type="ct", vmid=777, proxmox_host_id=host.id,
                           mac_address=mac, status="up-to-date", power_state="running",
-                          auto_update=True, credential_id=4242)
+                          auto_update=True, credential_id=cred.id)
             db.session.add(guest)
             db.session.flush()
             db.session.add(UpdatePackage(guest_id=guest.id, package_name="p", status="pending"))
@@ -2262,7 +2273,8 @@ class TestDiscoveryMacReuse:
                 assert len(g.scan_results) == 0
                 # Deliberately preserved — a MAC can also change legitimately.
                 assert g.auto_update is True
-                assert g.credential_id == 4242
+                from models import Credential
+                assert g.credential_id == Credential.query.filter_by(name=self.CRED_NAME).first().id
         finally:
             self._cleanup(app, host_id)
 
@@ -2290,3 +2302,97 @@ class TestDiscoveryMacReuse:
                 assert len(g.updates) == 1
         finally:
             self._cleanup(app, host_id)
+
+
+# ---------------------------------------------------------------------------
+# _purge_old_update_history (issue #127)
+# ---------------------------------------------------------------------------
+
+
+class TestPurgeOldUpdateHistory:
+    """Exercised against the real database rather than module mocks."""
+
+    def _seed(self, app):
+        from datetime import datetime, timedelta, timezone
+
+        from models import Guest, ScanResult, UpdateHistory, db
+
+        now = datetime.now(timezone.utc)
+        with app.app_context():
+            guest = Guest(name="_retention-guest", guest_type="ct")
+            db.session.add(guest)
+            db.session.commit()
+            gid = guest.id
+
+            db.session.add_all([
+                UpdateHistory(guest_id=gid, package_count=1, applied_at=now - timedelta(days=400)),
+                UpdateHistory(guest_id=gid, package_count=1, applied_at=now - timedelta(days=10)),
+                ScanResult(guest_id=gid, scanned_at=now - timedelta(days=200)),
+                ScanResult(guest_id=gid, scanned_at=now - timedelta(days=10)),
+            ])
+            db.session.commit()
+        return gid
+
+    def _cleanup(self, app, gid):
+        from models import Guest, db
+
+        with app.app_context():
+            guest = Guest.query.get(gid)
+            if guest:
+                db.session.delete(guest)
+                db.session.commit()
+
+    def test_prunes_rows_past_the_default_retention(self, app):
+        from core.scheduler import _purge_old_update_history
+        from models import ScanResult, UpdateHistory
+
+        gid = self._seed(app)
+        try:
+            _purge_old_update_history(app)
+            with app.app_context():
+                assert UpdateHistory.query.filter_by(guest_id=gid).count() == 1
+                assert ScanResult.query.filter_by(guest_id=gid).count() == 1
+        finally:
+            self._cleanup(app, gid)
+
+    def test_retention_windows_are_configurable(self, app):
+        from core.scheduler import _purge_old_update_history
+        from models import ScanResult, Setting, UpdateHistory
+
+        gid = self._seed(app)
+        try:
+            with app.app_context():
+                Setting.set("update_history_retention_days", "5")
+                Setting.set("scan_result_retention_days", "5")
+
+            _purge_old_update_history(app)
+            with app.app_context():
+                assert UpdateHistory.query.filter_by(guest_id=gid).count() == 0
+                assert ScanResult.query.filter_by(guest_id=gid).count() == 0
+        finally:
+            with app.app_context():
+                from models import Setting as _S
+                _S.set("update_history_retention_days", "365")
+                _S.set("scan_result_retention_days", "90")
+            self._cleanup(app, gid)
+
+    def test_non_numeric_retention_falls_back_to_defaults(self, app):
+        from core.scheduler import _purge_old_update_history
+        from models import ScanResult, Setting, UpdateHistory
+
+        gid = self._seed(app)
+        try:
+            with app.app_context():
+                Setting.set("update_history_retention_days", "not-a-number")
+                Setting.set("scan_result_retention_days", "")
+
+            _purge_old_update_history(app)  # must not raise
+            with app.app_context():
+                assert UpdateHistory.query.filter_by(guest_id=gid).count() == 1
+                assert ScanResult.query.filter_by(guest_id=gid).count() == 1
+        finally:
+            with app.app_context():
+                from models import Setting as _S
+                _S.set("update_history_retention_days", "365")
+                _S.set("scan_result_retention_days", "90")
+            self._cleanup(app, gid)

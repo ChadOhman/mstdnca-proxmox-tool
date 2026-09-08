@@ -871,13 +871,17 @@ JOB_TYPE_LABELS = {
 class ProxmoxJob:
     """Tracks a background Proxmox task (backup, snapshot, etc.)."""
 
-    def __init__(self, guest_id, guest_name, job_type, upid, node, host_model):
+    def __init__(self, guest_id, guest_name, job_type, upid, node, host_model=None, host_id=None):
         self.guest_id = guest_id
         self.guest_name = guest_name
         self.job_type = job_type
         self.upid = upid
         self.node = node
-        self.host_model = host_model
+        # Only the id is retained: the polling thread has its own session, and
+        # a live ORM instance would be detached/expired by the request that
+        # created it.  ``host_model`` stays accepted for callers that still
+        # pass an instance.
+        self.host_id = host_id if host_id is not None else getattr(host_model, "id", None)
         self.log = ""
         self.running = True
         self.success = None
@@ -890,6 +894,13 @@ class ProxmoxJob:
     @property
     def label(self):
         return JOB_TYPE_LABELS.get(self.job_type, self.job_type)
+
+    def get_host(self):
+        """Re-query the Proxmox host in the caller's own session/app context."""
+        if self.host_id is None:
+            return None
+        from models import ProxmoxHost
+        return ProxmoxHost.query.get(self.host_id)
 
     def append(self, text):
         with self._lock:
@@ -927,7 +938,12 @@ def _poll_proxmox_task(app, job_key):
             return
 
         try:
-            client = ProxmoxClient(job.host_model)
+            host = job.get_host()
+            if host is None:
+                job.append("\n[Error] Proxmox host is no longer available\n")
+                job.finish(False)
+                return
+            client = ProxmoxClient(host)
 
             deadline = time.monotonic() + PROXMOX_TASK_POLL_DEADLINE_SECONDS
             status_errors = 0
@@ -993,7 +1009,7 @@ def start_proxmox_job(guest, job_type, upid, node):
 
     job_key = f"{job_type}:{guest.id}"
 
-    job = ProxmoxJob(guest.id, guest.name, job_type, upid, node, guest.proxmox_host)
+    job = ProxmoxJob(guest.id, guest.name, job_type, upid, node, host_id=guest.proxmox_host_id)
     with _proxmox_jobs_lock:
         _proxmox_jobs[job_key] = job
 
@@ -1054,7 +1070,10 @@ def task_cancel(guest_id, job_type):
     job.cancel_requested = True
     try:
         from clients.proxmox_api import ProxmoxClient
-        client = ProxmoxClient(job.host_model)
+        host = job.get_host()
+        if host is None:
+            return jsonify({"ok": False, "error": "Proxmox host is no longer available"})
+        client = ProxmoxClient(host)
         client.cancel_task(job.node, job.upid)
     except Exception:
         logger.exception("Error cancelling task for guest %s", guest_id)

@@ -403,3 +403,100 @@ class TestCredentialStore:
         ct1 = encrypt(plaintext)
         ct2 = encrypt(plaintext)
         assert ct1 != ct2
+
+
+# ---------------------------------------------------------------------------
+# Delete guard and auth_type validation (issue #127)
+# ---------------------------------------------------------------------------
+
+
+class TestCredentialDeleteInUse:
+    def test_delete_refused_while_a_guest_uses_it(self, auth_client, app, credential):
+        from models import Guest
+
+        with app.app_context():
+            guest = Guest(name="_cred-inuse-guest", guest_type="ct", credential_id=credential)
+            db.session.add(guest)
+            db.session.commit()
+            guest_id = guest.id
+
+        try:
+            resp = auth_client.post(f"/credentials/{credential}/delete", follow_redirects=True)
+            assert resp.status_code == 200
+            assert b"still used by" in resp.data
+            with app.app_context():
+                assert Credential.query.get(credential) is not None
+        finally:
+            with app.app_context():
+                g = Guest.query.get(guest_id)
+                if g:
+                    db.session.delete(g)
+                    db.session.commit()
+
+    def test_delete_refused_while_a_host_uses_it(self, auth_client, app, credential):
+        from models import ProxmoxHost
+
+        with app.app_context():
+            host = ProxmoxHost(name="_cred-inuse-host", hostname="10.8.0.1",
+                               host_type="pve", ssh_credential_id=credential)
+            db.session.add(host)
+            db.session.commit()
+            host_id = host.id
+
+        try:
+            resp = auth_client.post(f"/credentials/{credential}/delete", follow_redirects=True)
+            assert resp.status_code == 200
+            assert b"host(s)" in resp.data
+            with app.app_context():
+                assert Credential.query.get(credential) is not None
+        finally:
+            with app.app_context():
+                h = ProxmoxHost.query.get(host_id)
+                if h:
+                    db.session.delete(h)
+                    db.session.commit()
+
+    def test_delete_succeeds_when_unreferenced(self, auth_client, app, credential):
+        resp = auth_client.post(f"/credentials/{credential}/delete", follow_redirects=True)
+        assert resp.status_code == 200
+        with app.app_context():
+            assert Credential.query.get(credential) is None
+
+
+class TestCredentialAuthTypeValidation:
+    def test_add_rejects_unknown_auth_type(self, auth_client, app):
+        resp = auth_client.post(
+            "/credentials/add",
+            data={"name": "_bad-authtype", "username": "root",
+                  "auth_type": "kerberos", "password": "test-only-password"},
+            follow_redirects=True,
+        )
+        assert resp.status_code == 200
+        with app.app_context():
+            assert Credential.query.filter_by(name="_bad-authtype").first() is None
+
+    def test_add_accepts_key_auth_type(self, auth_client, app):
+        resp = auth_client.post(
+            "/credentials/add",
+            data={"name": "_good-authtype", "username": "root",
+                  "auth_type": "key", "private_key": "test-only-key-material"},
+            follow_redirects=True,
+        )
+        assert resp.status_code == 200
+        with app.app_context():
+            cred = Credential.query.filter_by(name="_good-authtype").first()
+            assert cred is not None
+            assert cred.auth_type == "key"
+            db.session.delete(cred)
+            db.session.commit()
+
+    def test_edit_rejects_unknown_auth_type(self, auth_client, app, credential):
+        resp = auth_client.post(
+            f"/credentials/{credential}/edit",
+            data={"name": "_test-cred", "username": "root",
+                  "auth_type": "kerberos", "password": "test-only-password"},
+            follow_redirects=True,
+        )
+        assert resp.status_code == 200
+        with app.app_context():
+            assert Credential.query.get(credential).auth_type == "password"

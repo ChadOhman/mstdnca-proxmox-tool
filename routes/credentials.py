@@ -3,9 +3,12 @@ from flask_login import current_user, login_required
 
 from auth.audit import log_action
 from auth.credential_store import encrypt
-from models import Credential, db
+from models import Credential, Guest, ProxmoxHost, db
 
 bp = Blueprint("credentials", __name__)
+
+# The only values SSHClient.from_credential() knows how to use.
+VALID_AUTH_TYPES = ("password", "key")
 
 
 @bp.before_request
@@ -30,6 +33,10 @@ def add():
 
     if not name:
         flash("Name is required.", "error")
+        return redirect(url_for("security.index"))
+
+    if auth_type not in VALID_AUTH_TYPES:
+        flash("Authentication type must be 'password' or 'key'.", "error")
         return redirect(url_for("security.index"))
 
     if auth_type == "password":
@@ -82,6 +89,9 @@ def edit(cred_id):
 
     # Only update auth type and value if a new value is provided
     if auth_type:
+        if auth_type not in VALID_AUTH_TYPES:
+            flash("Authentication type must be 'password' or 'key'.", "error")
+            return redirect(url_for("security.index"))
         if auth_type == "password":
             new_value = request.form.get("password", "")
         else:
@@ -124,6 +134,24 @@ def set_default(cred_id):
 def delete(cred_id):
     cred = Credential.query.get_or_404(cred_id)
     name = cred.name
+
+    # Refuse while anything still points at it: guests would silently fall back
+    # to the default credential and hosts would keep a dangling FK.
+    guest_count = Guest.query.filter_by(credential_id=cred.id).count()
+    host_count = ProxmoxHost.query.filter_by(ssh_credential_id=cred.id).count()
+    if guest_count or host_count:
+        parts = []
+        if guest_count:
+            parts.append(f"{guest_count} guest(s)")
+        if host_count:
+            parts.append(f"{host_count} host(s)")
+        flash(
+            f"Credential '{name}' is still used by {' and '.join(parts)}. "
+            "Reassign them before deleting it.",
+            "error",
+        )
+        return redirect(url_for("security.index"))
+
     log_action("credential_delete", "credential", resource_id=cred.id, resource_name=name)
     db.session.delete(cred)
     db.session.commit()

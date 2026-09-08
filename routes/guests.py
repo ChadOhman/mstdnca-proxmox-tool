@@ -192,6 +192,19 @@ def add():
             flash("Invalid VM ID.", "error")
             return redirect(url_for("guests.index"))
 
+    # A host cannot carry the same VMID twice (enforced by the
+    # uq_guest_host_vmid unique index); report it instead of 500ing.
+    if guest.proxmox_host_id is not None and guest.vmid is not None:
+        duplicate = Guest.query.filter_by(
+            proxmox_host_id=guest.proxmox_host_id, vmid=guest.vmid
+        ).first()
+        if duplicate:
+            flash(
+                f"VMID {guest.vmid} already exists on that host as '{duplicate.name}'.",
+                "error",
+            )
+            return redirect(url_for("guests.index"))
+
     cred_id = request.form.get("credential_id")
     if cred_id:
         try:
