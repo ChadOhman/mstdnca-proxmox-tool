@@ -6,7 +6,7 @@ Flask-based Proxmox datacenter administration tool (Python 3.13). Manages VMs/LX
 
 ```bash
 make install-dev   # Install dev dependencies
-make test          # Full test suite (~1600 tests, in-memory SQLite)
+make test          # Full test suite (~2050 tests, file-backed temp SQLite)
 make lint          # ruff check .
 make security      # bandit + pip-audit
 make all           # lint + security + test

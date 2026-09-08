@@ -2,7 +2,7 @@
 
 ## Environment
 
-Tests use in-memory SQLite and a session-scoped app fixture (`tests/conftest.py`).
+Tests use a file-backed SQLite database in a per-session temp directory (so background threads get their own connections, with the same WAL/busy_timeout/foreign_keys pragmas as production) and a session-scoped app fixture (`tests/conftest.py`). `DATABASE_URL` is ignored by the suite.
 
 Required env vars for manual runs:
 ```bash

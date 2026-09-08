@@ -4,8 +4,8 @@ install-dev:
 	pip install -r requirements.txt -r requirements-dev.txt
 
 test:
-	# DATABASE_URL is intentionally not set here: tests/conftest.py forces
-	# SQLALCHEMY_DATABASE_URI to sqlite:///:memory: regardless of this env var,
+	# DATABASE_URL is intentionally not set here: tests/conftest.py sets
+	# SQLALCHEMY_DATABASE_URI to a per-session temp file regardless of this env var,
 	# so setting it here would be misleading dead configuration.
 	FLASK_SECRET_KEY=dev-secret \
 	MSTDNCA_DATA_DIR=/tmp/mstdnca-dev \
