@@ -222,15 +222,25 @@ def _check_mastodon_release(app):
         if Setting.get("mastodon_auto_upgrade", "false") == "true":
             logger.info("Auto-upgrade enabled, starting Mastodon upgrade...")
             from apps.mastodon import run_mastodon_upgrade
+            from apps.utils import upgrade_lock
             from auth.audit import log_action
             from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
             from models import db
-            send_upgrade_started_notification("mastodon", latest, "auto")
-            try:
-                ok, log_output = run_mastodon_upgrade()
-            except Exception as exc:
-                logger.exception("Mastodon auto-upgrade crashed")
-                ok, log_output = False, f"Auto-upgrade crashed: {exc}"
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("mastodon") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Mastodon auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("mastodon", latest, "auto")
+                try:
+                    ok, log_output = run_mastodon_upgrade()
+                except Exception as exc:
+                    logger.exception("Mastodon auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {exc}"
             log_action("mastodon_upgrade", "settings", resource_name="mastodon",
                        details={"status": "success" if ok else "error", "trigger": "auto"})
             db.session.commit()
@@ -275,15 +285,25 @@ def _check_ghost_release(app):
         if Setting.get("ghost_auto_upgrade", "false") == "true":
             logger.info("Auto-upgrade enabled, starting Ghost upgrade...")
             from apps.ghost import run_ghost_upgrade
+            from apps.utils import upgrade_lock
             from auth.audit import log_action
             from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
             from models import db
-            send_upgrade_started_notification("ghost", latest, "auto")
-            try:
-                ok, log_output = run_ghost_upgrade()
-            except Exception as exc:
-                logger.exception("Ghost auto-upgrade crashed")
-                ok, log_output = False, f"Auto-upgrade crashed: {exc}"
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("ghost") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Ghost auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("ghost", latest, "auto")
+                try:
+                    ok, log_output = run_ghost_upgrade()
+                except Exception as exc:
+                    logger.exception("Ghost auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {exc}"
             log_action("ghost_upgrade", "settings", resource_name="ghost",
                        details={"status": "success" if ok else "error", "trigger": "auto"})
             db.session.commit()
@@ -328,15 +348,25 @@ def _check_peertube_release(app):
         if Setting.get("peertube_auto_upgrade", "false") == "true":
             logger.info("Auto-upgrade enabled, starting PeerTube upgrade...")
             from apps.peertube import run_peertube_upgrade
+            from apps.utils import upgrade_lock
             from auth.audit import log_action
             from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
             from models import db
-            send_upgrade_started_notification("peertube", latest, "auto")
-            try:
-                ok, log_output = run_peertube_upgrade()
-            except Exception as exc:
-                logger.exception("PeerTube auto-upgrade crashed")
-                ok, log_output = False, f"Auto-upgrade crashed: {exc}"
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("peertube") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "PeerTube auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("peertube", latest, "auto")
+                try:
+                    ok, log_output = run_peertube_upgrade()
+                except Exception as exc:
+                    logger.exception("PeerTube auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {exc}"
             log_action("peertube_upgrade", "settings", resource_name="peertube",
                        details={"status": "success" if ok else "error", "trigger": "auto"})
             db.session.commit()
@@ -383,15 +413,25 @@ def _check_elk_release(app):
         if Setting.get("elk_auto_upgrade", "false") == "true":
             logger.info("Auto-upgrade enabled, starting Elk upgrade...")
             from apps.elk import run_elk_upgrade
+            from apps.utils import upgrade_lock
             from auth.audit import log_action
             from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
             from models import db
-            send_upgrade_started_notification("elk", latest, "auto")
-            try:
-                ok, log_output = run_elk_upgrade()
-            except Exception as exc:
-                logger.exception("Elk auto-upgrade crashed")
-                ok, log_output = False, f"Auto-upgrade crashed: {exc}"
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("elk") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Elk auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("elk", latest, "auto")
+                try:
+                    ok, log_output = run_elk_upgrade()
+                except Exception as exc:
+                    logger.exception("Elk auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {exc}"
             log_action("elk_upgrade", "settings", resource_name="elk",
                        details={"status": "success" if ok else "error", "trigger": "auto"})
             db.session.commit()
@@ -438,15 +478,25 @@ def _check_jitsi_release(app):
         if Setting.get("jitsi_auto_upgrade", "false") == "true":
             logger.info("Auto-upgrade enabled, starting Jitsi upgrade...")
             from apps.jitsi import run_jitsi_upgrade
+            from apps.utils import upgrade_lock
             from auth.audit import log_action
             from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
             from models import db
-            send_upgrade_started_notification("jitsi", latest, "auto")
-            try:
-                ok, log_output = run_jitsi_upgrade()
-            except Exception as exc:
-                logger.exception("Jitsi auto-upgrade crashed")
-                ok, log_output = False, f"Auto-upgrade crashed: {exc}"
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("jitsi") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Jitsi auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("jitsi", latest, "auto")
+                try:
+                    ok, log_output = run_jitsi_upgrade()
+                except Exception as exc:
+                    logger.exception("Jitsi auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {exc}"
             log_action("jitsi_upgrade", "settings", resource_name="jitsi",
                        details={"status": "success" if ok else "error", "trigger": "auto"})
             db.session.commit()

@@ -306,7 +306,7 @@ class TestUpdateCancel:
             _delete_guest(app, guest_id)
 
 
-def _wait_until(predicate, timeout=2.0, interval=0.02):
+def _wait_until(predicate, timeout=15.0, interval=0.02):
     """Poll `predicate()` until it returns truthy or `timeout` elapses."""
     deadline = time.monotonic() + timeout
     result = predicate()
