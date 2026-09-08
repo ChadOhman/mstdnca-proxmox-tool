@@ -18,7 +18,7 @@ def host(app):
     with app.app_context():
         h = ProxmoxHost(
             name="lock-pve",
-            hostname="10.0.4.9",
+            hostname="10.0.0.9",
             port=8006,
             auth_type="token",
             api_token_id="test@pam!tok",
@@ -58,7 +58,7 @@ def _mock_proxmox_client(node_guests, complete=True):
     mock_client.get_node_guests.side_effect = _get_node_guests
     mock_client.get_all_guests.side_effect = _get_all_guests
     mock_client.get_replication_map.return_value = {}
-    mock_client.get_guest_ip.return_value = "10.0.4.50"
+    mock_client.get_guest_ip.return_value = "10.0.0.50"
     mock_client.get_guest_mac.return_value = "AA:BB:CC:DD:EE:FF"
     return mock_client
 
