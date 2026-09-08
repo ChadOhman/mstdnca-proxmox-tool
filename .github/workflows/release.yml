@@ -58,8 +58,11 @@ jobs:
 
       - name: Create release archive
         run: |
-          tar -czf mstdnca-proxmox-tool-${{ steps.version.outputs.version }}.tar.gz \
+          # Build the archive outside the tree: writing it into '.' while tar reads '.'
+          # makes tar report "file changed as we read it" and exit 1.
+          tar -czf "$RUNNER_TEMP/mstdnca-proxmox-tool-${{ steps.version.outputs.version }}.tar.gz" \
             --exclude='.git' \
+            --exclude='.worktrees' \
             --exclude='__pycache__' \
             --exclude='*.pyc' \
             --exclude='.github' \
@@ -100,6 +103,6 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           body_path: release_notes.md
-          files: mstdnca-proxmox-tool-${{ steps.version.outputs.version }}.tar.gz
+          files: ${{ runner.temp }}/mstdnca-proxmox-tool-${{ steps.version.outputs.version }}.tar.gz
           draft: false
           prerelease: false
