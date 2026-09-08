@@ -38,8 +38,14 @@ class CollaborationHub:
         self._users: dict = {}  # user_id -> {username, display_name, page, last_seen, queue}
 
     def connect(self, user_id: int, username: str, display_name: str,
-                page: str = "/") -> queue.Queue:
-        """Register an SSE connection and return the event queue for this user."""
+                page: str = "/", is_admin: bool = False,
+                tag_ids: set | list | None = None) -> queue.Queue:
+        """Register an SSE connection and return the event queue for this user.
+
+        ``is_admin``/``tag_ids`` are captured here (while a request context still
+        exists) so :meth:`broadcast` can filter guest-scoped events per recipient
+        without touching the database on the fan-out path.
+        """
         q: queue.Queue = queue.Queue(maxsize=200)
         with self._lock:
             self._users[user_id] = {
@@ -49,6 +55,8 @@ class CollaborationHub:
                 "following": None,
                 "last_seen": time.time(),
                 "queue": q,
+                "is_admin": bool(is_admin),
+                "tag_ids": set(tag_ids or ()),
             }
         self._push_presence()
         return q
@@ -78,10 +86,23 @@ class CollaborationHub:
         self._push_presence()
 
     def broadcast(self, event: dict):
-        """Push an event dict to every connected user's SSE queue."""
+        """Push an event dict to every connected user's SSE queue.
+
+        An event carrying ``guest_tag_ids`` describes a specific guest and is
+        delivered only to admins and to users holding one of those tags; the key
+        itself is stripped before delivery.  Events without it (presence, host
+        activity) go to everyone as before.
+        """
+        tag_ids = event.get("guest_tag_ids")
+        if tag_ids is not None:
+            event = {k: v for k, v in event.items() if k != "guest_tag_ids"}
+            tag_ids = set(tag_ids)
         with self._lock:
-            queues = [u["queue"] for u in self._users.values()]
-        for q in queues:
+            targets = [(u.get("is_admin", False), u.get("tag_ids") or set(), u["queue"])
+                       for u in self._users.values()]
+        for is_admin, user_tags, q in targets:
+            if tag_ids is not None and not is_admin and not (tag_ids & user_tags):
+                continue
             try:
                 q.put_nowait(event)
             except queue.Full:

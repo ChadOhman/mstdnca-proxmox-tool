@@ -39,6 +39,45 @@ def _get_tag_backup_defaults(guest):
 bp = Blueprint("guests", __name__)
 
 
+def _require_guest_access(guest):
+    """Return a redirect response when the current user may not act on `guest`.
+
+    Every ``/<int:guest_id>`` route must call this in addition to its
+    permission-flag check: a permission flag says *what* a user may do, the tag
+    scope says *which guests* they may do it to.
+    """
+    if current_user.may_access_guest(guest):
+        return None
+    flash("You don't have permission to access this guest.", "error")
+    return redirect(url_for("guests.index"))
+
+
+def _resolve_guest_backup(guest, client, node, volid):
+    """Return the storage holding `volid` if that archive belongs to `guest`, else None.
+
+    The Proxmox storage API happily accepts any volid, so a volid taken from the
+    URL must be matched against the archives that actually belong to this guest
+    before it is used for restore/delete/protect/notes.
+    """
+    tag_cfg = _get_tag_backup_defaults(guest)
+    default_storage = guest.backup_storage or tag_cfg.get("storage") or Setting.get("backup_storage", "")
+    try:
+        if default_storage:
+            backups = client.list_backups(node, guest.vmid, default_storage) or []
+            for vol in backups:
+                vol.setdefault("storage", default_storage)
+        else:
+            backups = client.list_all_backups(node, guest.vmid) or []
+    except Exception as e:
+        logger.warning(f"Could not list backups for guest {guest.name}: {e}")
+        return None
+
+    for vol in backups:
+        if vol.get("volid") == volid:
+            return vol.get("storage") or default_storage or (volid.split(":")[0] if ":" in volid else "")
+    return None
+
+
 def _get_unifi_mac_map():
     """Fetch UniFi clients and return a MAC -> client dict. Returns empty dict if UniFi is disabled."""
     if Setting.get("unifi_enabled", "false") != "true":
@@ -237,10 +276,9 @@ def add():
 @login_required
 def detail(guest_id):
     guest = Guest.query.get_or_404(guest_id)
-
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
-        flash("You don't have permission to view this guest.", "error")
-        return redirect(url_for("guests.index"))
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
 
     credentials = Credential.query.all()
     tags = Tag.query.order_by(Tag.name).all()
@@ -312,6 +350,9 @@ def detail(guest_id):
 @login_required
 def edit(guest_id):
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
 
     if not current_user.can_manage_guests:
         flash("Permission denied.", "error")
@@ -352,6 +393,9 @@ def edit(guest_id):
 def reset(guest_id):
     """Clear stale scan results, packages, and services for a guest."""
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
 
     if not current_user.can_manage_guests:
         flash("Permission denied.", "error")
@@ -372,6 +416,9 @@ def create_replication(guest_id):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -405,6 +452,9 @@ def delete_replication(guest_id, job_id):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host:
         flash("Guest must be linked to a Proxmox host.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -431,6 +481,9 @@ def unifi_reconnect(guest_id):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.mac_address:
         flash("No MAC address available for this guest.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -460,6 +513,9 @@ def unifi_block(guest_id):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.mac_address:
         flash("No MAC address available for this guest.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -489,6 +545,9 @@ def unifi_unblock(guest_id):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.mac_address:
         flash("No MAC address available for this guest.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -522,6 +581,9 @@ def power_action(guest_id, action):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -569,6 +631,9 @@ def clone_guest(guest_id):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -622,6 +687,9 @@ def migrate_guest(guest_id):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -669,6 +737,9 @@ def create_snapshot(guest_id):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -708,6 +779,9 @@ def delete_snapshot(guest_id, snapname):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -740,6 +814,9 @@ def rollback_snapshot(guest_id, snapname):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -772,6 +849,9 @@ def save_backup_defaults(guest_id):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     guest.backup_storage = request.form.get("backup_storage", "").strip() or None
     guest.backup_mode = request.form.get("backup_mode", "").strip() or None
     guest.backup_compress = request.form.get("backup_compress", "").strip() or None
@@ -792,6 +872,9 @@ def create_backup(guest_id):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
@@ -844,16 +927,22 @@ def delete_backup(guest_id, volid):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
-
-    storage = volid.split(":")[0] if ":" in volid else (guest.backup_storage or _get_tag_backup_defaults(guest).get("storage") or Setting.get("backup_storage", ""))
 
     client = ProxmoxClient(guest.proxmox_host)
     node = client.find_guest_node(guest.vmid)
     if not node:
         flash(f"Could not find {guest.guest_type}/{guest.vmid} on any node.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    storage = _resolve_guest_backup(guest, client, node, volid)
+    if storage is None:
+        flash("That backup archive does not belong to this guest.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
 
     ok, msg = client.delete_backup(node, storage, volid)
@@ -876,17 +965,24 @@ def toggle_backup_protection(guest_id, volid):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
 
-    storage = volid.split(":")[0] if ":" in volid else (guest.backup_storage or _get_tag_backup_defaults(guest).get("storage") or Setting.get("backup_storage", ""))
     protect = request.form.get("protected", "1") == "1"
 
     client = ProxmoxClient(guest.proxmox_host)
     node = client.find_guest_node(guest.vmid)
     if not node:
         flash(f"Could not find {guest.guest_type}/{guest.vmid} on any node.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    storage = _resolve_guest_backup(guest, client, node, volid)
+    if storage is None:
+        flash("That backup archive does not belong to this guest.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
 
     ok, msg = client.update_backup_protection(node, storage, volid, protect)
@@ -909,17 +1005,24 @@ def update_backup_notes(guest_id, volid):
         return redirect(url_for("guests.detail", guest_id=guest_id))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
 
-    storage = volid.split(":")[0] if ":" in volid else (guest.backup_storage or _get_tag_backup_defaults(guest).get("storage") or Setting.get("backup_storage", ""))
     notes = request.form.get("notes", "").strip()
 
     client = ProxmoxClient(guest.proxmox_host)
     node = client.find_guest_node(guest.vmid)
     if not node:
         flash(f"Could not find {guest.guest_type}/{guest.vmid} on any node.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    storage = _resolve_guest_backup(guest, client, node, volid)
+    if storage is None:
+        flash("That backup archive does not belong to this guest.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
 
     ok, msg = client.update_backup_notes(node, storage, volid, notes)
@@ -939,6 +1042,9 @@ def update_backup_notes(guest_id, volid):
 def restore_backup_confirm(guest_id, volid):
     """Render the type-to-confirm page for a destructive restore."""
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
 
     if not current_user.can_manage_guests:
         flash("Permission denied.", "error")
@@ -946,6 +1052,12 @@ def restore_backup_confirm(guest_id, volid):
 
     if not guest.proxmox_host or not guest.vmid:
         flash("Guest must be linked to a Proxmox host with a VMID.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    client = ProxmoxClient(guest.proxmox_host)
+    node = client.find_guest_node(guest.vmid)
+    if not node or _resolve_guest_backup(guest, client, node, volid) is None:
+        flash("That backup archive does not belong to this guest.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
 
     return render_template("guest_restore_confirm.html", guest=guest, volid=volid)
@@ -959,6 +1071,9 @@ def restore_backup(guest_id, volid):
     Requires the user to type the guest's exact name to confirm.
     """
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
 
     if not current_user.can_manage_guests:
         flash("Permission denied.", "error")
@@ -974,14 +1089,15 @@ def restore_backup(guest_id, volid):
         flash("Confirmation text did not match the guest name. Restore cancelled.", "error")
         return redirect(url_for("guests.restore_backup_confirm", guest_id=guest.id, volid=volid))
 
-    storage = volid.split(":")[0] if ":" in volid else (
-        guest.backup_storage or _get_tag_backup_defaults(guest).get("storage") or Setting.get("backup_storage", "")
-    )
-
     client = ProxmoxClient(guest.proxmox_host)
     node = client.find_guest_node(guest.vmid)
     if not node:
         flash(f"Could not find {guest.guest_type}/{guest.vmid} on any node.", "error")
+        return redirect(url_for("guests.detail", guest_id=guest.id))
+
+    storage = _resolve_guest_backup(guest, client, node, volid)
+    if storage is None:
+        flash("That backup archive does not belong to this guest.", "error")
         return redirect(url_for("guests.detail", guest_id=guest.id))
 
     ok, upid = client.restore_backup(node, guest.vmid, guest.guest_type, volid, storage=storage)
@@ -1006,6 +1122,9 @@ def delete(guest_id):
         return redirect(url_for("guests.index"))
 
     guest = Guest.query.get_or_404(guest_id)
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
     name = guest.name
     log_action("guest_delete", "guest", resource_id=guest.id, resource_name=name)
     db.session.delete(guest)
