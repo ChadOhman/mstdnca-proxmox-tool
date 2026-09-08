@@ -3,7 +3,7 @@
 import ipaddress
 
 from auth.local_network import _get_client_ip, _is_trusted
-from models import Setting, db
+from models import AuditLog, Setting, UserSession, db
 
 # ---------------------------------------------------------------------------
 # Helpers: _is_trusted
@@ -56,53 +56,53 @@ class TestIsTrusted:
 # ---------------------------------------------------------------------------
 
 class TestGetClientIp:
-    """Test _get_client_ip() inside a Flask request context."""
+    """_get_client_ip() with the default configuration (TRUSTED_PROXY_COUNT=0).
 
-    # -- loopback REMOTE_ADDR: proxy headers ARE trusted --------------------
+    ProxyFix is not installed, so ``request.remote_addr`` is the real TCP peer
+    and *no* client-supplied header may influence the answer.  Trusting them
+    based on the peer being private was circular: once ProxyFix had rewritten
+    REMOTE_ADDR from X-Forwarded-For, the "is this a proxy?" check was reading
+    the attacker's own value.  See tests/test_proxy_trust.py for the
+    through-the-WSGI-stack proof and for TRUSTED_PROXY_COUNT=1 behaviour.
+    """
 
     def test_loopback_remote_addr_no_headers_returns_remote_addr(self, app):
         with app.test_request_context(environ_base={"REMOTE_ADDR": "127.0.0.1"}):
             assert _get_client_ip() == "127.0.0.1"
 
-    def test_loopback_trusts_cf_connecting_ip(self, app):
+    def test_public_remote_addr_no_headers_returns_remote_addr(self, app):
+        with app.test_request_context(environ_base={"REMOTE_ADDR": "8.8.8.8"}):
+            assert _get_client_ip() == "8.8.8.8"
+
+    # -- loopback/private REMOTE_ADDR: headers are STILL not trusted ---------
+
+    def test_loopback_ignores_cf_connecting_ip(self, app):
         with app.test_request_context(
             environ_base={"REMOTE_ADDR": "127.0.0.1"},
             headers={"CF-Connecting-IP": "203.0.113.42"},
         ):
-            assert _get_client_ip() == "203.0.113.42"
+            assert _get_client_ip() == "127.0.0.1"
 
-    def test_loopback_trusts_x_real_ip(self, app):
+    def test_loopback_ignores_x_real_ip(self, app):
         with app.test_request_context(
             environ_base={"REMOTE_ADDR": "127.0.0.1"},
             headers={"X-Real-IP": "198.51.100.7"},
         ):
-            assert _get_client_ip() == "198.51.100.7"
+            assert _get_client_ip() == "127.0.0.1"
 
-    def test_loopback_trusts_x_forwarded_for_first_entry(self, app):
+    def test_loopback_ignores_x_forwarded_for(self, app):
         with app.test_request_context(
             environ_base={"REMOTE_ADDR": "127.0.0.1"},
             headers={"X-Forwarded-For": "203.0.113.1, 10.0.0.2, 10.0.0.3"},
         ):
-            assert _get_client_ip() == "203.0.113.1"
+            assert _get_client_ip() == "127.0.0.1"
 
-    def test_loopback_cf_takes_priority_over_x_real_ip(self, app):
-        """CF-Connecting-IP should be preferred over X-Real-IP."""
-        with app.test_request_context(
-            environ_base={"REMOTE_ADDR": "127.0.0.1"},
-            headers={
-                "CF-Connecting-IP": "203.0.113.10",
-                "X-Real-IP": "203.0.113.99",
-            },
-        ):
-            assert _get_client_ip() == "203.0.113.10"
-
-    def test_private_remote_addr_trusts_forwarded_header(self, app):
-        """Private (RFC-1918) REMOTE_ADDR should also trust proxy headers."""
+    def test_private_remote_addr_ignores_forwarded_header(self, app):
         with app.test_request_context(
             environ_base={"REMOTE_ADDR": "10.0.0.1"},
             headers={"X-Forwarded-For": "203.0.113.55"},
         ):
-            assert _get_client_ip() == "203.0.113.55"
+            assert _get_client_ip() == "10.0.0.1"
 
     # -- public REMOTE_ADDR: proxy headers are NOT trusted ------------------
 
@@ -127,16 +127,17 @@ class TestGetClientIp:
         ):
             assert _get_client_ip() == "1.2.3.4"
 
-    def test_public_remote_addr_no_headers_returns_remote_addr(self, app):
-        with app.test_request_context(environ_base={"REMOTE_ADDR": "8.8.8.8"}):
-            assert _get_client_ip() == "8.8.8.8"
-
-    def test_forwarded_for_header_whitespace_stripped(self, app):
+    def test_public_remote_addr_ignores_private_looking_spoof(self, app):
+        """The exact bypass shape from the advisory: a public peer claiming a LAN IP."""
         with app.test_request_context(
-            environ_base={"REMOTE_ADDR": "127.0.0.1"},
-            headers={"X-Forwarded-For": "  203.0.113.77  , 10.0.0.1"},
+            environ_base={"REMOTE_ADDR": "203.0.113.9"},
+            headers={
+                "X-Forwarded-For": "10.0.0.5",
+                "X-Real-IP": "10.0.0.5",
+                "CF-Connecting-IP": "10.0.0.5",
+            },
         ):
-            assert _get_client_ip() == "203.0.113.77"
+            assert _get_client_ip() == "203.0.113.9"
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +229,12 @@ class TestLocalBypassMiddleware:
             assert resp.status_code == 302
             assert "/login" in resp.headers["Location"]
 
-    def test_bypass_via_forwarded_header_from_loopback_proxy(self, app):
-        """A trusted real IP arriving via X-Forwarded-For from a loopback proxy triggers bypass."""
+    def test_forwarded_header_cannot_bypass_without_trusted_proxy(self, app):
+        """With TRUSTED_PROXY_COUNT=0, X-Forwarded-For must not decide the bypass.
+
+        The loopback peer here is not the point -- what matters is that the
+        header is ignored, so an untrusted peer stays untrusted.
+        """
         with app.app_context():
             Setting.set("local_bypass_enabled", "true")
             Setting.set("trusted_subnets", "10.0.0.0/8")
@@ -242,7 +247,29 @@ class TestLocalBypassMiddleware:
                 headers={"X-Forwarded-For": "10.0.0.99"},
                 follow_redirects=False,
             )
-            assert resp.status_code == 200
+            assert resp.status_code == 302
+            assert "/login" in resp.headers["Location"]
+
+    def test_public_peer_spoofing_trusted_ip_is_not_authenticated(self, app):
+        """A public client claiming a LAN IP in every forwarded header gets nothing."""
+        with app.app_context():
+            Setting.set("local_bypass_enabled", "true")
+            Setting.set("trusted_subnets", "10.0.0.0/8")
+            db.session.commit()
+
+        with app.test_client() as c:
+            resp = c.get(
+                "/",
+                environ_base={"REMOTE_ADDR": "203.0.113.9"},
+                headers={
+                    "X-Forwarded-For": "10.0.0.5",
+                    "X-Real-IP": "10.0.0.5",
+                    "CF-Connecting-IP": "10.0.0.5",
+                },
+                follow_redirects=False,
+            )
+            assert resp.status_code == 302
+            assert "/login" in resp.headers["Location"]
 
     def test_untrusted_forwarded_ip_from_loopback_proxy_redirects(self, app):
         """A public IP forwarded through loopback proxy must not trigger bypass."""
@@ -260,3 +287,115 @@ class TestLocalBypassMiddleware:
             )
             assert resp.status_code == 302
             assert "/login" in resp.headers["Location"]
+
+
+# ---------------------------------------------------------------------------
+# Bypass sessions are tracked, audited and revocable
+# ---------------------------------------------------------------------------
+
+class TestBypassSessionTracking:
+    """A bypass session must behave like any other login: listed and revocable."""
+
+    @staticmethod
+    def _enable(app, subnets="10.0.0.0/8"):
+        with app.app_context():
+            Setting.set("local_bypass_enabled", "true")
+            Setting.set("trusted_subnets", subnets)
+            db.session.commit()
+
+    @staticmethod
+    def _disable(app):
+        with app.app_context():
+            Setting.set("local_bypass_enabled", "false")
+            db.session.commit()
+
+    def test_bypass_creates_a_user_session_row(self, app):
+        self._enable(app)
+        with app.app_context():
+            before = UserSession.query.filter_by(revoked=False).count()
+
+        with app.test_client() as c:
+            assert c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.5"}).status_code == 200
+
+        with app.app_context():
+            after = UserSession.query.filter_by(revoked=False).count()
+            assert after == before + 1
+        self._disable(app)
+
+    def test_bypass_is_audited(self, app):
+        self._enable(app)
+        with app.test_client() as c:
+            c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.6"})
+
+        with app.app_context():
+            entry = (AuditLog.query
+                     .filter_by(action="login_local_bypass")
+                     .order_by(AuditLog.id.desc())
+                     .first())
+            assert entry is not None
+            assert entry.ip_address == "10.0.0.6"
+        self._disable(app)
+
+    def test_revoking_the_session_row_ends_the_bypass_session(self, app):
+        """Revoking the tracked row logs the client out of that session."""
+        self._enable(app)
+        with app.test_client() as c:
+            assert c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.7"}).status_code == 200
+            with app.app_context():
+                record = (UserSession.query
+                          .filter_by(revoked=False)
+                          .order_by(UserSession.id.desc())
+                          .first())
+                record_id = record.id
+                record.revoked = True
+                db.session.commit()
+
+            # The revoked row no longer authorises anything.
+            resp = c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.7"}, follow_redirects=False)
+            assert resp.status_code == 302
+            assert "/login" in resp.headers["Location"]
+
+            # Still on a trusted IP with the bypass enabled, so the next request
+            # establishes a *new* tracked session rather than reusing the old one.
+            assert c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.7"}).status_code == 200
+            with app.app_context():
+                newest = (UserSession.query
+                          .filter_by(revoked=False)
+                          .order_by(UserSession.id.desc())
+                          .first())
+                assert newest.id != record_id
+        self._disable(app)
+
+    def test_disabling_bypass_invalidates_the_existing_session(self, app):
+        self._enable(app)
+        with app.test_client() as c:
+            assert c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.8"}).status_code == 200
+            self._disable(app)
+            resp = c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.8"}, follow_redirects=False)
+            assert resp.status_code == 302
+            assert "/login" in resp.headers["Location"]
+
+    def test_narrowing_trusted_subnets_invalidates_the_existing_session(self, app):
+        self._enable(app)
+        with app.test_client() as c:
+            assert c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.9"}).status_code == 200
+            self._enable(app, subnets="192.168.1.0/24")
+            resp = c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.9"}, follow_redirects=False)
+            assert resp.status_code == 302
+            assert "/login" in resp.headers["Location"]
+        self._disable(app)
+
+    def test_invalidated_bypass_session_row_is_revoked(self, app):
+        self._enable(app)
+        with app.test_client() as c:
+            c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.10"})
+            with app.app_context():
+                record_id = (UserSession.query
+                             .filter_by(revoked=False)
+                             .order_by(UserSession.id.desc())
+                             .first().id)
+            self._disable(app)
+            c.get("/", environ_base={"REMOTE_ADDR": "10.0.0.10"})
+
+        with app.app_context():
+            assert db.session.get(UserSession, record_id).revoked is True

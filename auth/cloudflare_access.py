@@ -198,9 +198,17 @@ def init_cf_access(app):
         if email:
             user = _get_or_create_cf_user(email, name)
             if user and user.is_active:
+                from auth.audit import log_action
+                from auth.session_manager import start_session
+
                 session.clear()
                 login_user(user)
                 user.last_login_at = datetime.now(timezone.utc)
+                # Track server-side so the session is listed and revocable like a
+                # normal login instead of living only in the signed cookie.
+                start_session(user)
+                log_action("login_cloudflare", "user", resource_id=user.id,
+                           resource_name=user.username)
                 db.session.commit()
                 g.cf_access_user = True
             elif not user:
