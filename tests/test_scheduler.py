@@ -211,6 +211,7 @@ class TestInitScheduler:
             "ipmi_snapshot_purge",
             "revoked_token_prune",
             "moderation_check",
+            "update_history_purge",
         }
         assert expected_ids == registered_ids
 
@@ -1674,3 +1675,97 @@ class TestPersistHostPackages:
             assert pkgs["pkg2"] == "important"
             assert pkgs["pkg3"] == "normal"
             assert pkgs["pkg4"] == "normal"
+
+
+# ---------------------------------------------------------------------------
+# _purge_old_update_history (issue #127)
+# ---------------------------------------------------------------------------
+
+
+class TestPurgeOldUpdateHistory:
+    """Exercised against the real database rather than module mocks."""
+
+    def _seed(self, app):
+        from datetime import datetime, timedelta, timezone
+
+        from models import Guest, ScanResult, UpdateHistory, db
+
+        now = datetime.now(timezone.utc)
+        with app.app_context():
+            guest = Guest(name="_retention-guest", guest_type="ct")
+            db.session.add(guest)
+            db.session.commit()
+            gid = guest.id
+
+            db.session.add_all([
+                UpdateHistory(guest_id=gid, package_count=1, applied_at=now - timedelta(days=400)),
+                UpdateHistory(guest_id=gid, package_count=1, applied_at=now - timedelta(days=10)),
+                ScanResult(guest_id=gid, scanned_at=now - timedelta(days=200)),
+                ScanResult(guest_id=gid, scanned_at=now - timedelta(days=10)),
+            ])
+            db.session.commit()
+        return gid
+
+    def _cleanup(self, app, gid):
+        from models import Guest, db
+
+        with app.app_context():
+            guest = Guest.query.get(gid)
+            if guest:
+                db.session.delete(guest)
+                db.session.commit()
+
+    def test_prunes_rows_past_the_default_retention(self, app):
+        from core.scheduler import _purge_old_update_history
+        from models import ScanResult, UpdateHistory
+
+        gid = self._seed(app)
+        try:
+            _purge_old_update_history(app)
+            with app.app_context():
+                assert UpdateHistory.query.filter_by(guest_id=gid).count() == 1
+                assert ScanResult.query.filter_by(guest_id=gid).count() == 1
+        finally:
+            self._cleanup(app, gid)
+
+    def test_retention_windows_are_configurable(self, app):
+        from core.scheduler import _purge_old_update_history
+        from models import ScanResult, Setting, UpdateHistory
+
+        gid = self._seed(app)
+        try:
+            with app.app_context():
+                Setting.set("update_history_retention_days", "5")
+                Setting.set("scan_result_retention_days", "5")
+
+            _purge_old_update_history(app)
+            with app.app_context():
+                assert UpdateHistory.query.filter_by(guest_id=gid).count() == 0
+                assert ScanResult.query.filter_by(guest_id=gid).count() == 0
+        finally:
+            with app.app_context():
+                from models import Setting as _S
+                _S.set("update_history_retention_days", "365")
+                _S.set("scan_result_retention_days", "90")
+            self._cleanup(app, gid)
+
+    def test_non_numeric_retention_falls_back_to_defaults(self, app):
+        from core.scheduler import _purge_old_update_history
+        from models import ScanResult, Setting, UpdateHistory
+
+        gid = self._seed(app)
+        try:
+            with app.app_context():
+                Setting.set("update_history_retention_days", "not-a-number")
+                Setting.set("scan_result_retention_days", "")
+
+            _purge_old_update_history(app)  # must not raise
+            with app.app_context():
+                assert UpdateHistory.query.filter_by(guest_id=gid).count() == 1
+                assert ScanResult.query.filter_by(guest_id=gid).count() == 1
+        finally:
+            with app.app_context():
+                from models import Setting as _S
+                _S.set("update_history_retention_days", "365")
+                _S.set("scan_result_retention_days", "90")
+            self._cleanup(app, gid)

@@ -309,3 +309,37 @@ class TestPermissions:
     def test_unauthenticated_device_detail(self, client):
         resp = client.get("/unifi/device/aa:bb:cc:dd:ee:ff", follow_redirects=False)
         assert resp.status_code == 302
+
+
+class TestUnifiDecryptFailure:
+    """A password that cannot be decrypted must not 500 the UniFi pages (#127)."""
+
+    def test_get_unifi_client_returns_none_on_garbage_ciphertext(self, app):
+        from routes.unifi import _get_unifi_client
+
+        with app.app_context():
+            Setting.set("unifi_password", "not-a-valid-fernet-token")
+            client = _get_unifi_client()
+        assert client is None
+
+    def test_unifi_index_does_not_500_on_garbage_ciphertext(self, auth_client, app):
+        with app.app_context():
+            Setting.set("unifi_password", "not-a-valid-fernet-token")
+
+        resp = auth_client.get("/unifi/", follow_redirects=False)
+        assert resp.status_code in (200, 302)
+
+    def test_settings_test_unifi_flashes_a_clear_message(self, auth_client, app):
+        with app.app_context():
+            Setting.set("unifi_base_url", "https://unifi.local")
+            Setting.set("unifi_username", "admin")
+            Setting.set("unifi_password", "not-a-valid-fernet-token")
+
+        resp = auth_client.post(
+            "/settings/unifi/test",
+            data={"unifi_base_url": "https://unifi.local", "unifi_username": "admin",
+                  "unifi_site": "default"},
+            follow_redirects=True,
+        )
+        assert resp.status_code == 200
+        assert b"could not be decrypted" in resp.data

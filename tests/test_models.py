@@ -176,3 +176,190 @@ class TestPushWebhookValidEvents:
 
     def test_service_down_still_valid_for_backwards_compat(self):
         assert "service_down" in PushWebhook.VALID_EVENTS
+
+
+# ---------------------------------------------------------------------------
+# Delete cascades (issue #127)
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteCascades:
+    def test_deleting_host_removes_its_exporter_instances(self, app):
+        """host_exporter_instances.host_id is NOT NULL -- the delete must cascade."""
+        from models import HostExporterInstance
+
+        with app.app_context():
+            host = ProxmoxHost(name="_casc-exporter-host", hostname="10.9.0.1", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+
+            inst = HostExporterInstance(host_id=host.id, exporter_type="ipmi_exporter", port=9290)
+            db.session.add(inst)
+            db.session.commit()
+            inst_id = inst.id
+
+            db.session.delete(host)
+            db.session.commit()  # used to raise IntegrityError
+
+            assert HostExporterInstance.query.get(inst_id) is None
+
+    def test_deleting_tag_removes_its_unifi_networks(self, app):
+        from models import Tag, TagUnifiNetwork
+
+        with app.app_context():
+            tag = Tag(name="_casc-unifi-tag")
+            db.session.add(tag)
+            db.session.commit()
+            tag_id = tag.id
+
+            db.session.add(TagUnifiNetwork(tag_id=tag_id, network_name="LAN"))
+            db.session.commit()
+
+            db.session.delete(tag)
+            db.session.commit()
+
+            assert TagUnifiNetwork.query.filter_by(tag_id=tag_id).count() == 0
+
+    def test_deleting_host_removes_its_metric_snapshots(self, app):
+        from models import HostMetricSnapshot
+
+        with app.app_context():
+            host = ProxmoxHost(name="_casc-metric-host", hostname="10.9.0.2", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+            host_id = host.id
+
+            db.session.add(HostMetricSnapshot(host_id=host_id, data="{}"))
+            db.session.commit()
+
+            db.session.delete(ProxmoxHost.query.get(host_id))
+            db.session.commit()
+
+            assert HostMetricSnapshot.query.filter_by(host_id=host_id).count() == 0
+
+    def test_deleting_guest_removes_service_metric_snapshots(self, app):
+        from models import GuestService, ServiceMetricSnapshot
+
+        with app.app_context():
+            guest = Guest(name="_casc-svc-guest", guest_type="ct")
+            db.session.add(guest)
+            db.session.commit()
+
+            svc = GuestService(guest_id=guest.id, service_name="postgresql",
+                               unit_name="postgresql.service")
+            db.session.add(svc)
+            db.session.commit()
+            svc_id = svc.id
+
+            db.session.add(ServiceMetricSnapshot(service_id=svc_id, data="{}"))
+            db.session.commit()
+
+            db.session.delete(guest)
+            db.session.commit()
+
+            assert ServiceMetricSnapshot.query.filter_by(service_id=svc_id).count() == 0
+
+    def test_deleting_guest_removes_update_history(self, app):
+        from models import UpdateHistory
+
+        with app.app_context():
+            guest = Guest(name="_casc-history-guest", guest_type="ct")
+            db.session.add(guest)
+            db.session.commit()
+            guest_id = guest.id
+
+            db.session.add(UpdateHistory(guest_id=guest_id, package_count=3))
+            db.session.commit()
+
+            db.session.delete(Guest.query.get(guest_id))
+            db.session.commit()
+
+            assert UpdateHistory.query.filter_by(guest_id=guest_id).count() == 0
+
+
+class TestSqliteForeignKeysAreEnforced:
+    def test_dangling_foreign_key_is_rejected(self, app):
+        from sqlalchemy.exc import IntegrityError
+
+        with app.app_context():
+            db.session.add(Guest(name="_fk-dangling", guest_type="ct", credential_id=987654))
+            with pytest.raises(IntegrityError):
+                db.session.commit()
+            db.session.rollback()
+
+
+class TestGuestVmidUniqueness:
+    def test_same_host_and_vmid_is_rejected(self, app):
+        from sqlalchemy.exc import IntegrityError
+
+        with app.app_context():
+            host = ProxmoxHost(name="_uniq-vmid-host", hostname="10.9.0.3", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+            host_id = host.id
+
+            db.session.add(Guest(name="_uniq-a", guest_type="ct", proxmox_host_id=host_id, vmid=4242))
+            db.session.commit()
+
+            db.session.add(Guest(name="_uniq-b", guest_type="ct", proxmox_host_id=host_id, vmid=4242))
+            with pytest.raises(IntegrityError):
+                db.session.commit()
+            db.session.rollback()
+
+            db.session.delete(ProxmoxHost.query.get(host_id))
+            db.session.commit()
+
+    def test_guests_without_a_vmid_are_not_constrained(self, app):
+        """The index is partial (vmid IS NOT NULL), so VMID-less rows stack up."""
+        with app.app_context():
+            host = ProxmoxHost(name="_uniq-novmid-host", hostname="10.9.0.4", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+            host_id = host.id
+
+            db.session.add_all([
+                Guest(name="_uniq-novmid-a", guest_type="ct", proxmox_host_id=host_id),
+                Guest(name="_uniq-novmid-b", guest_type="ct", proxmox_host_id=host_id),
+            ])
+            db.session.commit()  # must not raise
+
+            assert Guest.query.filter_by(proxmox_host_id=host_id).count() == 2
+
+            db.session.delete(ProxmoxHost.query.get(host_id))
+            db.session.commit()
+
+
+class TestSettingSetUpsert:
+    def test_creates_then_updates_a_key(self, app):
+        with app.app_context():
+            Setting.set("_upsert-key", "first")
+            assert Setting.get("_upsert-key") == "first"
+
+            Setting.set("_upsert-key", "second")
+            assert Setting.get("_upsert-key") == "second"
+            assert Setting.query.filter_by(key="_upsert-key").count() == 1
+
+    def test_row_inserted_behind_the_session_is_updated_not_duplicated(self, app):
+        """Simulates the check-then-act race: the row appears after the SELECT."""
+        with app.app_context():
+            Setting.query.filter_by(key="_upsert-race").delete()
+            db.session.commit()
+
+            # Write the row via raw SQL so the identity map has never seen it.
+            db.session.execute(
+                db.text("INSERT INTO settings (key, value) VALUES ('_upsert-race', 'from-other-writer')")
+            )
+            db.session.commit()
+            db.session.expunge_all()
+
+            Setting.set("_upsert-race", "mine")
+
+            assert Setting.query.filter_by(key="_upsert-race").count() == 1
+            assert Setting.get("_upsert-race") == "mine"
+
+    def test_returns_the_persisted_row(self, app):
+        with app.app_context():
+            row = Setting.set("_upsert-return", "value")
+            assert row is not None
+            assert row.key == "_upsert-return"
+            assert row.value == "value"

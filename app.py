@@ -1,14 +1,45 @@
 import logging
 import os
+import sqlite3
 from urllib.parse import urlparse
 
 from flask import Flask
 from flask_login import LoginManager
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
 
 from config import BASE_DIR, DATA_DIR, Config
-from models import DEFAULT_ROLES, Role, User, db
+from models import DEFAULT_ROLES, GUEST_VMID_UNIQUE_INDEX, Role, User, db
 
 logger = logging.getLogger(__name__)
+
+
+@event.listens_for(Engine, "connect")
+def _set_sqlite_pragmas(dbapi_connection, connection_record):
+    """Apply per-connection SQLite tuning.
+
+    * ``foreign_keys=ON`` makes the ``ondelete="CASCADE"`` clauses in models.py
+      actually do something -- SQLite does not enforce foreign keys by default.
+    * ``journal_mode=WAL`` lets scheduler threads read while a request writes.
+      It is a persistent, file-level setting, so it is skipped for in-memory
+      databases where it is meaningless.
+    * ``busy_timeout`` replaces the 5s default so a slow writer produces a wait
+      rather than an immediate "database is locked".
+    """
+    if not isinstance(dbapi_connection, sqlite3.Connection):
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        row = cursor.execute("PRAGMA database_list").fetchone()
+        main_file = row[2] if row and len(row) > 2 else ""
+        if main_file:  # empty for :memory: and temporary databases
+            cursor.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        logger.warning("Failed to apply SQLite connection pragmas", exc_info=True)
+    finally:
+        cursor.close()
 
 
 def create_app(test_config=None):
@@ -44,6 +75,7 @@ def create_app(test_config=None):
         _migrate_moderation_columns()
         _migrate_smcipmi_to_ipmi_exporter()
         _migrate_guest_lock_column()
+        _ensure_guest_vmid_unique_index()
         _seed_roles()
         _ensure_default_admin()
 
@@ -307,16 +339,24 @@ def create_app(test_config=None):
 
 
 def _add_column_if_missing(table, column, col_type="BOOLEAN DEFAULT 0"):
-    """Add a column to an existing SQLite table if it doesn't exist yet."""
+    """Add a column to an existing SQLite table if it doesn't exist yet.
+
+    Returns True when the column was actually added so callers can run a
+    one-time backfill.  Failures are logged at WARNING (they used to be
+    invisible at DEBUG) but never re-raised: a failed migration must not stop
+    the app from booting.
+    """
     try:
         existing = {row[1] for row in db.session.execute(db.text(f"PRAGMA table_info({table})")).fetchall()}
         if column not in existing:
             db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
             db.session.commit()
             logger.info("Added column %s.%s", table, column)
-    except Exception as e:
+            return True
+    except Exception:
         db.session.rollback()
-        logger.debug("Migration check for %s.%s: %s", table, column, e)
+        logger.warning("Migration check for %s.%s failed", table, column, exc_info=True)
+    return False
 
 
 def _migrate_moderation_columns():
@@ -332,16 +372,38 @@ def _migrate_moderation_columns():
             db.session.execute(db.text("ALTER TABLE roles ADD COLUMN can_moderate BOOLEAN DEFAULT 0"))
             db.session.execute(db.text("UPDATE roles SET can_moderate = 1 WHERE name IN ('super_admin', 'admin')"))
             db.session.commit()
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        logger.debug("Migration check for roles.can_moderate: %s", e)
+        logger.warning("Migration check for roles.can_moderate failed", exc_info=True)
 
 
 def _migrate_ipmi_columns():
-    """Add IPMI-related columns to existing tables that were created before this feature."""
+    """Add IPMI-related columns to tables created before this feature.
+
+    When the role permission columns are newly added, grant them to the
+    admin-tier built-in roles so upgraded deployments match DEFAULT_ROLES --
+    the same one-time backfill _migrate_moderation_columns performs.  It runs
+    only on the upgrade that adds the column, so later customisation of a
+    built-in role is never reverted.
+    """
     # Role permissions
-    _add_column_if_missing("roles", "can_view_ipmi", "BOOLEAN DEFAULT 0")
-    _add_column_if_missing("roles", "can_manage_ipmi", "BOOLEAN DEFAULT 0")
+    added_view = _add_column_if_missing("roles", "can_view_ipmi", "BOOLEAN DEFAULT 0")
+    added_manage = _add_column_if_missing("roles", "can_manage_ipmi", "BOOLEAN DEFAULT 0")
+    if added_view or added_manage:
+        try:
+            if added_view:
+                db.session.execute(
+                    db.text("UPDATE roles SET can_view_ipmi = 1 WHERE name IN ('super_admin', 'admin')")
+                )
+            if added_manage:
+                db.session.execute(
+                    db.text("UPDATE roles SET can_manage_ipmi = 1 WHERE name IN ('super_admin', 'admin')")
+                )
+            db.session.commit()
+            logger.info("Backfilled IPMI permissions on the built-in admin roles")
+        except Exception:
+            db.session.rollback()
+            logger.warning("Failed to backfill IPMI role permissions", exc_info=True)
     # ProxmoxHost IPMI config
     _add_column_if_missing("proxmox_hosts", "ipmi_enabled", "BOOLEAN DEFAULT 0")
     _add_column_if_missing("proxmox_hosts", "ipmi_address", "VARCHAR(256)")
@@ -353,6 +415,30 @@ def _migrate_ipmi_columns():
 def _migrate_guest_lock_column():
     """Add the guests.lock_reason column to databases created before lock display."""
     _add_column_if_missing("guests", "lock_reason", "VARCHAR(32)")
+
+
+def _ensure_guest_vmid_unique_index():
+    """Create the (proxmox_host_id, vmid) unique index on pre-existing databases.
+
+    create_all() does not add indexes to tables it did not create, so this
+    mirrors the model-level index for upgraded installs.  If the database
+    already holds duplicate host/VMID pairs the CREATE fails; that is logged at
+    WARNING and the app still boots so an admin can clean the rows up.
+    """
+    try:
+        db.session.execute(db.text(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {GUEST_VMID_UNIQUE_INDEX} "
+            "ON guests (proxmox_host_id, vmid) WHERE vmid IS NOT NULL"
+        ))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logger.warning(
+            "Could not create the unique index %s on guests(proxmox_host_id, vmid); "
+            "duplicate rows probably exist and must be removed manually",
+            GUEST_VMID_UNIQUE_INDEX,
+            exc_info=True,
+        )
 
 
 def _migrate_smcipmi_to_ipmi_exporter():
@@ -369,7 +455,10 @@ def _migrate_smcipmi_to_ipmi_exporter():
             db.session.commit()
             logger.info("Migrated %d smcipmi_exporter instance(s) to ipmi_exporter.", len(rows))
     except Exception:
-        pass  # Table may not exist yet on fresh installs
+        # The table may not exist yet on fresh installs; log it so a genuine
+        # failure is visible instead of silently swallowed.
+        db.session.rollback()
+        logger.warning("Migration of smcipmi_exporter instances failed", exc_info=True)
 
 
 def _seed_roles():

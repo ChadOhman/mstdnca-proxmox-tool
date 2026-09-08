@@ -112,6 +112,11 @@ def validate_cf_token(token, team_domain, audience):
 
 def _get_or_create_cf_user(email, name=None):
     """Get or auto-provision a user from CF Access identity."""
+    # Usernames are stored lower-cased; a differently-cased claim must map to
+    # the same account rather than provisioning a duplicate.
+    email = (email or "").strip().lower()
+    if not email:
+        return None
     user = User.query.filter_by(username=email).first()
     if user:
         return user
