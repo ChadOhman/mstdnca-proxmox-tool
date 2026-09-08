@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from clients.proxmox_api import ProxmoxClient
 from clients.ssh_client import SSHClient
+from core.pg_identifiers import validate_pg_db_name
 from models import Guest, GuestService, ScanResult, UpdatePackage, db
 
 logger = logging.getLogger(__name__)
@@ -1465,14 +1466,32 @@ def _stats_postgresql(guest):
 
     # Table stats — pg_stat_user_tables is per-database, so target the largest
     # non-system database (most likely to have application tables).
+    #
+    # Database names come from `pg_stat_database` on the monitored guest, which
+    # is a trust boundary: anyone who can CREATE DATABASE (or has compromised the
+    # postgres service account) can make `datname` an arbitrary string containing
+    # shell metacharacters. Validate against the same allowlist used for
+    # user-supplied database names (routes/services.py) before it is ever
+    # interpolated into a command, and skip (falling back to the next candidate)
+    # any name that doesn't match.
     _system_dbs = {"postgres", "template0", "template1"}
-    _table_target_db = next(
-        (db["name"] for db in stats.get("databases", []) if db["name"] not in _system_dbs),
-        None,
-    )
+    _table_target_db = None
+    for _db in stats.get("databases", []):
+        _name = _db.get("name", "")
+        if _name in _system_dbs:
+            continue
+        if not validate_pg_db_name(_name):
+            logger.warning(
+                "Skipping PostgreSQL database with invalid name for table stats on %s: %r",
+                guest.name, _name[:80],
+            )
+            continue
+        _table_target_db = _name
+        break
     if _table_target_db:
+        _safe_table_db = shlex.quote(_table_target_db)  # defence in depth; already allowlist-validated
         out, _ = _execute_command(guest,
-            f"sudo -u postgres psql -d {_table_target_db} -t -A -c \""  # noqa: S608 — db name sourced from pg_database, not user input
+            f"sudo -u postgres psql -d {_safe_table_db} -t -A -c \""  # noqa: S608 — db name allowlist-validated above
             "SELECT schemaname, relname, "
             "coalesce(n_live_tup,0), coalesce(n_dead_tup,0), "
             "coalesce(to_char(greatest(last_vacuum, last_autovacuum), 'YYYY-MM-DD HH24:MI'), '-'), "
@@ -1509,14 +1528,22 @@ def _stats_postgresql(guest):
     # pg_stat_statements must be queried from the database where the extension is
     # installed — typically the application DB, not the default "postgres" DB.
     # Use the largest non-template DB we already collected; fall back to "postgres".
+    # Same trust-boundary concern as _table_target_db above: validate before use.
     _ss_db = "postgres"
     for _db in stats.get("databases", []):
         _db_name = _db.get("name", "")
         if _db_name and _db_name not in ("postgres", "template0", "template1"):
+            if not validate_pg_db_name(_db_name):
+                logger.warning(
+                    "Skipping PostgreSQL database with invalid name for pg_stat_statements on %s: %r",
+                    guest.name, _db_name[:80],
+                )
+                continue
             _ss_db = _db_name
             break
+    _safe_ss_db = shlex.quote(_ss_db)  # defence in depth; already allowlist-validated (or the "postgres" literal)
     out, _ = _execute_command(guest,
-        f"sudo -u postgres psql -d {_ss_db} -t -A -c \""  # noqa: S608
+        f"sudo -u postgres psql -d {_safe_ss_db} -t -A -c \""  # noqa: S608 — db name allowlist-validated above
         "SELECT round(mean_exec_time::numeric,2), calls, "
         "round(total_exec_time::numeric,2), rows, "
         "replace(replace(left(query,4096),chr(10),' '),chr(13),' ') "
