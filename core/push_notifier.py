@@ -81,13 +81,28 @@ def dispatch_push_alerts(guest, event_type, details=None):
         }
 
         try:
+            # allow_redirects=False: the validation above only vets the URL we
+            # are about to request, not wherever a 3xx might redirect to. An
+            # attacker-controlled public host could otherwise answer with
+            # "307 Location: http://169.254.169.254/..." (or any internal
+            # address) and have the server follow it, defeating the guard
+            # entirely (SSRF via redirect). A DNS-rebinding window between
+            # the validate_webhook_url() check above and this request still
+            # remains -- pinning the TCP connection to the resolved IP would
+            # close it, but is not done here; treat that as a residual risk.
             resp = http_requests.post(
                 wh.url,
                 json=payload,
                 timeout=_TIMEOUT,
                 headers={"Content-Type": "application/json"},
+                allow_redirects=False,
             )
-            if resp.status_code >= 400:
+            if 300 <= resp.status_code < 400:
+                logger.warning(
+                    "Push webhook %d for user %s attempted a redirect (%d); not following",
+                    wh.id, user.username, resp.status_code,
+                )
+            elif resp.status_code >= 400:
                 logger.warning(
                     "Push webhook %d returned %d for user %s",
                     wh.id, resp.status_code, user.username,

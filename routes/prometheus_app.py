@@ -67,7 +67,7 @@ def _get_settings():
     return {
         "guest_id": Setting.get("prometheus_guest_id", ""),
         "url": Setting.get("prometheus_url", ""),
-        "auth_token": Setting.get("prometheus_auth_token", ""),
+        "auth_token_set": bool(Setting.get("prometheus_auth_token")),
         "enabled": Setting.get("prometheus_enabled", "false") == "true",
         "auto_upgrade": Setting.get("prometheus_auto_upgrade", "false"),
         "current_version": Setting.get("prometheus_current_version", ""),
@@ -148,7 +148,12 @@ def manage():
 def save():
     Setting.set("prometheus_guest_id", request.form.get("prometheus_guest_id", "").strip())
     Setting.set("prometheus_url", request.form.get("prometheus_url", "").strip())
-    Setting.set("prometheus_auth_token", request.form.get("prometheus_auth_token", "").strip())
+    auth_token = request.form.get("prometheus_auth_token", "").strip()
+    if auth_token:
+        # Blank submission keeps the currently stored token — the field is
+        # never rendered with its real value, so an empty field means
+        # "unchanged", not "clear the token".
+        Setting.set("prometheus_auth_token", auth_token)
     Setting.set("prometheus_enabled",
                 "true" if "prometheus_enabled" in request.form else "false")
     Setting.set("prometheus_auto_upgrade",

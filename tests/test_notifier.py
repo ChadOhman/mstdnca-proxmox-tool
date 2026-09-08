@@ -44,6 +44,7 @@ from core.notifier import (
     send_upgrade_result_notification,
     send_upgrade_started_notification,
     summarize_applied_packages,
+    validate_discord_webhook_url,
 )
 from models import Setting, db
 
@@ -112,6 +113,107 @@ def _make_scan_result(
     result.total_updates = total_updates
     result.security_updates = security_updates
     return result
+
+
+# ---------------------------------------------------------------------------
+# validate_discord_webhook_url
+# ---------------------------------------------------------------------------
+
+class TestValidateDiscordWebhookUrl:
+    """SSRF guard for the Discord webhook URL (GHSA-gj96-qjq5-q57h): must be
+    https, land on a real Discord host, and use the standard webhook path --
+    otherwise a saved 'webhook URL' is an arbitrary outbound request primitive
+    (urlopen also follows file://, ftp://, internal http(s), etc.)."""
+
+    def _patch_dns(self, ip="162.159.137.232"):
+        return patch(
+            "core.url_safety.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", (ip, 443))],
+        )
+
+    def test_accepts_real_looking_discord_url(self):
+        with self._patch_dns():
+            ok, reason = validate_discord_webhook_url(
+                "https://discord.com/api/webhooks/1/test-only-token"
+            )
+        assert ok is True
+        assert reason is None
+
+    def test_accepts_all_known_discord_hosts(self):
+        for host in ("discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"):
+            with self._patch_dns():
+                ok, _ = validate_discord_webhook_url(f"https://{host}/api/webhooks/1/tok")
+            assert ok is True, f"expected {host} to be accepted"
+
+    def test_rejects_http_scheme(self):
+        ok, reason = validate_discord_webhook_url("http://discord.com/api/webhooks/1/tok")
+        assert ok is False
+        assert "https" in reason
+
+    def test_rejects_other_hosts(self):
+        with self._patch_dns():
+            ok, reason = validate_discord_webhook_url("https://evil.example.com/api/webhooks/1/tok")
+        assert ok is False
+        assert "host" in reason
+
+    def test_rejects_file_scheme(self):
+        ok, reason = validate_discord_webhook_url("file:///etc/passwd")
+        assert ok is False
+
+    def test_rejects_wrong_path(self):
+        with self._patch_dns():
+            ok, reason = validate_discord_webhook_url("https://discord.com/not-a-webhook")
+        assert ok is False
+        assert "path" in reason
+
+    def test_rejects_malformed_url_without_raising(self):
+        """An out-of-range port must not raise -- urlparse(...).port raises
+        ValueError for e.g. :99999, which used to bubble up as a 500."""
+        ok, reason = validate_discord_webhook_url("https://discord.com:99999/api/webhooks/1/tok")
+        assert ok is False
+        assert reason
+
+
+# ---------------------------------------------------------------------------
+# _send_discord retries on 429 (Retry-After)
+# ---------------------------------------------------------------------------
+
+class TestSendDiscordRetryAfter:
+    def test_honours_retry_after_and_retries_once(self, app):
+        with app.app_context():
+            Setting.set("discord_enabled", "true")
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+
+        rate_limited = _make_http_error(code=429, reason="Too Many Requests")
+        rate_limited.headers = {"Retry-After": "0"}
+        success_resp = _make_urlopen_mock(status=204)
+
+        with patch("urllib.request.urlopen", side_effect=[rate_limited, success_resp]), \
+                patch("core.notifier.time.sleep") as mock_sleep:
+            with app.app_context():
+                ok, msg = _send_discord([{"title": "Hello"}])
+
+        assert ok is True
+        mock_sleep.assert_called_once()
+
+    def test_does_not_retry_more_than_once(self, app):
+        """A second 429 must be treated as a normal failure, not retried again."""
+        with app.app_context():
+            Setting.set("discord_enabled", "true")
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/tok")
+
+        def _make_429():
+            err = _make_http_error(code=429, reason="Too Many Requests")
+            err.headers = {"Retry-After": "0"}
+            return err
+
+        with patch("urllib.request.urlopen", side_effect=[_make_429(), _make_429()]), \
+                patch("core.notifier.time.sleep"):
+            with app.app_context():
+                ok, msg = _send_discord([{"title": "Hello"}])
+
+        assert ok is False
+        assert "429" in msg
 
 
 # ---------------------------------------------------------------------------

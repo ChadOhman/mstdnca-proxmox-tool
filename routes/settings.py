@@ -51,7 +51,7 @@ def _require_login():
 
 def _get_settings_dict():
     return {
-        "discord_webhook_url": Setting.get("discord_webhook_url"),
+        "discord_webhook_url_set": bool(Setting.get("discord_webhook_url")),
         "discord_enabled": Setting.get("discord_enabled", "false"),
         "discord_notify_updates": Setting.get("discord_notify_updates", "true"),
         "discord_notify_updates_security_only": Setting.get("discord_notify_updates_security_only", "false"),
@@ -214,6 +214,11 @@ def save_discord():
     selected_tag_ids = [t for t in raw_tag_ids if t in valid_tag_ids]
 
     if webhook_url:
+        from core.notifier import validate_discord_webhook_url
+        ok, reason = validate_discord_webhook_url(webhook_url)
+        if not ok:
+            flash(f"Invalid Discord webhook URL: {reason}.", "error")
+            return redirect(url_for("settings.index"))
         Setting.set("discord_webhook_url", webhook_url)
     Setting.set("discord_enabled", "true" if enabled else "false")
     Setting.set("discord_notify_updates", "true" if notify_updates else "false")

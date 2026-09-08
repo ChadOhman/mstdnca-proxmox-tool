@@ -77,6 +77,102 @@ class TestDiscordSettings:
             # The route only saves webhook_url when it is non-empty
             assert Setting.get("discord_webhook_url") == "https://discord.com/api/webhooks/existing/url"
 
+    def test_save_discord_rejects_non_discord_host(self, app, auth_client):
+        """A webhook URL pointed at a non-Discord host must be rejected on save
+        (GHSA-gj96-qjq5-q57h): otherwise urlopen() would happily POST to it."""
+        with app.app_context():
+            Setting.set("discord_webhook_url", "")
+
+        resp = auth_client.post(
+            "/settings/discord",
+            data={"discord_webhook_url": "https://evil.example.com/api/webhooks/1/tok"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            assert Setting.get("discord_webhook_url") != "https://evil.example.com/api/webhooks/1/tok"
+
+    def test_save_discord_rejects_non_https_scheme(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_webhook_url", "")
+
+        resp = auth_client.post(
+            "/settings/discord",
+            data={"discord_webhook_url": "http://discord.com/api/webhooks/1/tok"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            assert Setting.get("discord_webhook_url") != "http://discord.com/api/webhooks/1/tok"
+
+    def test_save_discord_rejects_file_scheme(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_webhook_url", "")
+
+        resp = auth_client.post(
+            "/settings/discord",
+            data={"discord_webhook_url": "file:///etc/passwd"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            assert Setting.get("discord_webhook_url") != "file:///etc/passwd"
+
+    def test_save_discord_rejects_wrong_path(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_webhook_url", "")
+
+        resp = auth_client.post(
+            "/settings/discord",
+            data={"discord_webhook_url": "https://discord.com/not-a-webhook"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            assert Setting.get("discord_webhook_url") != "https://discord.com/not-a-webhook"
+
+
+class TestDiscordWebhookMasking:
+    """GHSA-qq45-f2h2-9j4q: the Discord webhook URL must never be rendered into
+    the settings page — neither in a visible field nor in a hidden input used
+    to preserve the value under safety mode."""
+
+    def test_webhook_not_leaked_when_set(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/999/TOPSECRET")
+        resp = auth_client.get("/settings/")
+        assert resp.status_code == 200
+        assert b"TOPSECRET" not in resp.data
+        assert b'name="discord_webhook_url"' in resp.data
+        assert b'type="password"' in resp.data
+
+    def test_webhook_not_leaked_in_safety_mode(self, app, auth_client):
+        """Safety mode used to render the real value into a hidden <input>."""
+        with app.app_context():
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/999/TOPSECRET")
+        auth_client.post("/toggle-safety-mode", follow_redirects=False)
+        resp = auth_client.get("/settings/")
+        assert resp.status_code == 200
+        assert b"TOPSECRET" not in resp.data
+        # Turn safety mode back off so it doesn't leak into other tests.
+        auth_client.post("/toggle-safety-mode", follow_redirects=False)
+
+    def test_placeholder_indicates_set_state(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/999/abc")
+        resp = auth_client.get("/settings/")
+        assert b"leave blank to keep" in resp.data
+
+    def test_placeholder_when_unset(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_webhook_url", "")
+        resp = auth_client.get("/settings/")
+        assert b"https://discord.com/api/webhooks/..." in resp.data
+
 
 class TestScanSettings:
     def test_save_scan_settings(self, app, auth_client):
@@ -354,7 +450,12 @@ class TestUnpollerSettings:
             assert Setting.get("unpoller_metric_prefix") == "unpoller"  # defaults
             assert Setting.get("unpoller_site_name") == "default"
 
-    def test_test_unpoller_no_prometheus(self, auth_client):
+    def test_test_unpoller_no_prometheus(self, app, auth_client):
+        # Explicitly clear prometheus_url rather than relying on it being
+        # unset by default: this is a session-scoped, file-backed DB shared
+        # with tests/test_prometheus.py, which persists a real URL.
+        with app.app_context():
+            Setting.set("prometheus_url", "")
         resp = auth_client.post(
             "/settings/unpoller/test",
             data={

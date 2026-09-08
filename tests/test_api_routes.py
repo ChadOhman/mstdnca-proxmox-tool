@@ -21,6 +21,8 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from models import Guest, UpdatePackage, db
 from routes.api import (
     ProxmoxJob,
@@ -28,6 +30,7 @@ from routes.api import (
     UpdateJob,
     _bulk_scan,
     _bulk_scan_lock,
+    _is_safe_relative_page,
     _proxmox_jobs,
     _scan_jobs,
     _update_jobs,
@@ -730,6 +733,98 @@ class TestCollabPresence:
             json={"page": "/", "following": None},
         )
         assert resp.status_code == 200
+
+    # -- GHSA-qq45-f2h2-9j4q: `page` must be a same-site relative path -------
+    # (it is broadcast to other users' browsers and used as a link href /
+    # navigation target in base.html's presence popover).
+
+    @pytest.mark.parametrize("bad_page", [
+        "javascript:alert(1)",
+        "//evil.com/phish",
+        "\\evil.com",
+        "https://evil.com",
+        "/ok\\backslash",
+        "",
+        "relative/no/leading/slash",
+    ])
+    def test_presence_rejects_unsafe_page(self, auth_client, bad_page):
+        resp = auth_client.post(
+            "/api/collab/presence",
+            json={"page": bad_page},
+        )
+        assert resp.status_code == 400
+
+    def test_presence_rejects_overlong_page(self, auth_client):
+        resp = auth_client.post(
+            "/api/collab/presence",
+            json={"page": "/" + ("a" * 600)},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.parametrize("good_page", ["/", "/guests/", "/guests/1", "/terminal/5/follow/abc-123"])
+    def test_presence_accepts_safe_page(self, auth_client, good_page):
+        resp = auth_client.post(
+            "/api/collab/presence",
+            json={"page": good_page},
+        )
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /api/collab/stream
+# ---------------------------------------------------------------------------
+
+class TestCollabStreamPageValidation:
+    """GET /api/collab/stream — the `page` query param feeds the same
+    unvalidated-navigation-target sink as /api/collab/presence, so it must be
+    validated too."""
+
+    @pytest.mark.parametrize("bad_page", [
+        "javascript:alert(1)",
+        "//evil.com/phish",
+        "\\evil.com",
+        "https://evil.com",
+    ])
+    def test_stream_rejects_unsafe_page(self, auth_client, bad_page):
+        resp = auth_client.get("/api/collab/stream", query_string={"page": bad_page})
+        assert resp.status_code == 400
+
+    def test_stream_rejects_overlong_page(self, auth_client):
+        resp = auth_client.get(
+            "/api/collab/stream", query_string={"page": "/" + ("a" * 600)}
+        )
+        assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# _is_safe_relative_page — the validator itself
+# ---------------------------------------------------------------------------
+
+class TestIsSafeRelativePage:
+    @pytest.mark.parametrize("page", [
+        "/",
+        "/guests/",
+        "/guests/1",
+        "/terminal/5/follow/abc-123",
+        "/a" * 250,  # well under the 512 cap
+    ])
+    def test_accepts_safe_paths(self, page):
+        assert _is_safe_relative_page(page) is True
+
+    @pytest.mark.parametrize("page", [
+        None,
+        123,
+        "",
+        "javascript:alert(1)",
+        "//evil.com/phish",
+        "\\evil.com",
+        "/\\evil.com",
+        "https://evil.com",
+        "relative/no/leading/slash",
+        "/" + ("a" * 600),  # over the 512 cap
+    ])
+    def test_rejects_unsafe_values(self, page):
+        assert _is_safe_relative_page(page) is False
 
 
 # ---------------------------------------------------------------------------

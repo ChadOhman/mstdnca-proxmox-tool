@@ -571,7 +571,7 @@ function loadRecordings() {
         .then(r => r.json())
         .then(data => {
             if (data.error) {
-                container.innerHTML = '<p class="text-warning">' + data.error + '</p>';
+                container.innerHTML = '<p class="text-warning">' + escHtml(data.error) + '</p>';
                 return;
             }
             if (!data.recordings || data.recordings.length === 0) {
@@ -582,14 +582,18 @@ function loadRecordings() {
                 + '<thead><tr><th>Filename</th><th>Size</th><th>Date</th><th>Actions</th></tr></thead><tbody>';
             data.recordings.forEach(rec => {
                 const date = rec.created_at ? new Date(rec.created_at * 1000).toLocaleString() : '—';
+                const filenameEsc = escHtml(rec.filename);
+                // Use the app-wide data-confirm modal (base.html) instead of an inline
+                // onsubmit="confirm(...)" string, which can't safely embed an arbitrary
+                // filename inside a JS string literal.
                 html += '<tr>'
-                    + '<td class="font-monospace small">' + rec.filename + '</td>'
+                    + '<td class="font-monospace small">' + filenameEsc + '</td>'
                     + '<td>' + formatBytes(rec.size_bytes) + '</td>'
                     + '<td>' + date + '</td>'
                     + '<td>'
                     + '<form method="post" action="/jibri/recordings/delete" class="d-inline" '
-                    + 'onsubmit="return confirm(\'Delete ' + rec.filename + '?\')">'
-                    + '<input type="hidden" name="filename" value="' + rec.filename + '">'
+                    + 'data-confirm="Delete ' + filenameEsc + '?">'
+                    + '<input type="hidden" name="filename" value="' + filenameEsc + '">'
                     + '<button type="submit" class="btn btn-outline-danger btn-sm"><i class="bi bi-trash"></i></button>'
                     + '</form>'
                     + '</td>'

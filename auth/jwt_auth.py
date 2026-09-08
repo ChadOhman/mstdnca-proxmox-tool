@@ -28,22 +28,44 @@ REFRESH_TOKEN_EXPIRES = timedelta(days=30)
 # ---------------------------------------------------------------------------
 _API_FAIL_WINDOW = 300  # 5-minute sliding window
 _API_FAIL_LIMIT = 5     # stricter than web login (10)
+_API_FAIL_MAX_KEYS = 4096  # hard cap so a flood of distinct IPs cannot grow the dict
 
 _api_failed_attempts: dict = collections.defaultdict(list)
 _api_failed_lock = threading.Lock()
+
+
+def _prune_api_failed_attempts(cutoff: float) -> None:
+    """Drop buckets with no attempt newer than ``cutoff``. Caller holds the lock.
+
+    Without this the dict only ever grows: every distinct source IP that fails an
+    API login leaves a permanent (eventually empty) entry behind.
+    """
+    for key in [k for k, v in _api_failed_attempts.items() if not v or v[-1] <= cutoff]:
+        del _api_failed_attempts[key]
+    if len(_api_failed_attempts) > _API_FAIL_MAX_KEYS:
+        # Still over the cap after pruning: evict the least recently active keys.
+        stale = sorted(_api_failed_attempts, key=lambda k: _api_failed_attempts[k][-1])
+        for key in stale[: len(_api_failed_attempts) - _API_FAIL_MAX_KEYS]:
+            del _api_failed_attempts[key]
 
 
 def check_api_rate_limit(ip: str) -> bool:
     """Return True if this IP is currently locked out."""
     cutoff = time.time() - _API_FAIL_WINDOW
     with _api_failed_lock:
-        _api_failed_attempts[ip] = [t for t in _api_failed_attempts[ip] if t > cutoff]
-        return len(_api_failed_attempts[ip]) >= _API_FAIL_LIMIT
+        _prune_api_failed_attempts(cutoff)
+        recent = [t for t in _api_failed_attempts.get(ip, []) if t > cutoff]
+        if recent:
+            _api_failed_attempts[ip] = recent
+        else:
+            _api_failed_attempts.pop(ip, None)
+        return len(recent) >= _API_FAIL_LIMIT
 
 
 def record_api_failed_login(ip: str) -> None:
     with _api_failed_lock:
         _api_failed_attempts[ip].append(time.time())
+        _prune_api_failed_attempts(time.time() - _API_FAIL_WINDOW)
 
 
 # ---------------------------------------------------------------------------

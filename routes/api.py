@@ -16,6 +16,34 @@ from models import Guest, ProxmoxHost, Setting, Tag, db
 logger = logging.getLogger(__name__)
 
 
+_MAX_COLLAB_PAGE_LEN = 512
+
+
+def _is_safe_relative_page(page):
+    """Return True if `page` is safe to store/broadcast as a collab presence target.
+
+    Only same-site relative paths are allowed: must start with a single "/"
+    (no "//", which browsers treat as protocol-relative and can point at a
+    different host), no backslashes (some browsers normalize "\" to "/",
+    enabling scheme/host-relative bypasses), and no ":" before the first "/"
+    (blocks "javascript:" and other schemes). This is deliberately strict —
+    collab presence "page" values are broadcast to other users' browsers and
+    used as link hrefs / navigation targets.
+    """
+    if not isinstance(page, str):
+        return False
+    if not (0 < len(page) <= _MAX_COLLAB_PAGE_LEN):
+        return False
+    if page[0] != "/" or page[1:2] == "/":
+        return False
+    if "\\" in page:
+        return False
+    first_slash = page.index("/")
+    if ":" in page[:first_slash]:
+        return False
+    return True
+
+
 def _user_tz():
     """Return the current user's ZoneInfo or UTC as fallback."""
     try:
@@ -1612,6 +1640,8 @@ def collab_stream():
     display_name = current_user.display_name or username
 
     page = request.args.get("page", "/")
+    if not _is_safe_relative_page(page):
+        return jsonify({"error": "invalid_page"}), 400
     # Captured now so the hub can filter guest-scoped events per recipient
     # without a database round-trip on the fan-out path.
     is_admin = current_user.is_admin
@@ -1655,6 +1685,8 @@ def collab_presence():
     from core.collaboration import collab_hub
     data = request.get_json(silent=True) or {}
     page = data.get("page", "/")
+    if not _is_safe_relative_page(page):
+        return jsonify({"error": "invalid_page"}), 400
     following = data.get("following") or None  # username string or null
     collab_hub.update_presence(current_user.id, page, following=following)
     return jsonify({"ok": True})

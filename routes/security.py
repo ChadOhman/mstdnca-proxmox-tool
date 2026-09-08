@@ -4,10 +4,18 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 
 from auth.audit import log_action
+from auth.local_network import DEFAULT_TRUSTED_SUBNETS
 from models import AuditLog, Credential, Role, ScanResult, Setting, Tag, TagUnifiNetwork, User, UserSession, db
 
 # Strict hex-color validation: #RRGGBB only
 _HEX_COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
+
+# Cloudflare Access team domain: must be exactly "<team>.cloudflareaccess.com",
+# lowercase alphanumeric/hyphen team name only. A naive .endswith() check here
+# would accept "evil.com#.cloudflareaccess.com" or "evil.com.cloudflareaccess.com.evil.com"-
+# style values, which are then used to build both a logout redirect and a
+# JWKS fetch URL (open redirect + SSRF primitive).
+_CF_TEAM_DOMAIN_RE = re.compile(r'^[a-z0-9-]+\.cloudflareaccess\.com$')
 
 bp = Blueprint("security", __name__)
 
@@ -53,7 +61,7 @@ def _get_access_settings():
         "cf_access_bypass_local_auth": Setting.get("cf_access_bypass_local_auth", "false"),
         "local_bypass_enabled": Setting.get("local_bypass_enabled", "false"),
         "local_bypass_explicitly_set": Setting.query.filter_by(key="local_bypass_enabled").first() is not None,
-        "trusted_subnets": Setting.get("trusted_subnets", "10.0.0.0/8"),
+        "trusted_subnets": Setting.get("trusted_subnets", DEFAULT_TRUSTED_SUBNETS),
         "require_snapshot_before_action": Setting.get("require_snapshot_before_action", "false"),
     }
 
@@ -421,6 +429,10 @@ def save_cloudflare():
             flash("Team domain and audience tag are required to enable CF Access-only mode.", "error")
             return redirect(url_for("security.index"))
 
+    if team_domain and not _CF_TEAM_DOMAIN_RE.match(team_domain.lower()):
+        flash("Invalid Cloudflare team domain. Expected format: <team>.cloudflareaccess.com", "error")
+        return redirect(url_for("security.index"))
+
     Setting.set("cf_access_enabled", "true" if cf_enabled else "false")
     Setting.set("cf_access_team_domain", team_domain)
     Setting.set("cf_access_audience", audience)
@@ -438,26 +450,43 @@ def save_local_bypass():
     import ipaddress
 
     enabled = "local_bypass_enabled" in request.form
-    subnets = request.form.get("trusted_subnets", "10.0.0.0/8").strip()
+    subnets = request.form.get("trusted_subnets", DEFAULT_TRUSTED_SUBNETS).strip()
 
+    overly_broad = []
     if subnets:
         for entry in subnets.split(","):
             entry = entry.strip()
             if not entry:
                 continue
             try:
-                ipaddress.ip_network(entry, strict=False)
+                network = ipaddress.ip_network(entry, strict=False)
             except ValueError:
                 flash(f"Invalid subnet: {entry}", "error")
                 return redirect(url_for("security.index"))
+            # A zero-length prefix (0.0.0.0/0, ::/0) trusts the entire internet
+            # and would hand every visitor an admin session. Never accept it.
+            if network.prefixlen == 0:
+                flash(f"Refusing to trust {entry}: that matches every address on the internet.", "error")
+                return redirect(url_for("security.index"))
+            if network.prefixlen < 8 or not network.is_private:
+                overly_broad.append(entry)
 
     Setting.set("local_bypass_enabled", "true" if enabled else "false")
     Setting.set("trusted_subnets", subnets)
 
     log_action("settings_local_bypass_save", "settings", resource_name="local_bypass",
-               details={"enabled": enabled})
+               details={"enabled": enabled, "subnets": subnets})
     db.session.commit()
     flash("Local network access settings saved.", "success")
+    if overly_broad:
+        flash(
+            "Warning: " + ", ".join(overly_broad) + " "
+            + ("is" if len(overly_broad) == 1 else "are")
+            + " very broad or not a private range. Anyone in "
+            + ("that range" if len(overly_broad) == 1 else "those ranges")
+            + " who can reach this app gets an admin session without a password.",
+            "warning",
+        )
     return redirect(url_for("security.index"))
 
 
