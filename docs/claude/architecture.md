@@ -73,7 +73,7 @@ SQLite via SQLAlchemy. Schema migrations run at startup in `_migrate_schema()` (
 
 ## Auth Layers
 
-Local login → Cloudflare Access JWT (`auth/cloudflare_access.py`) → Local network auto-login (`auth/local_network.py`, trusted CIDRs). Role-based permissions: super_admin > admin > operator > viewer with 13 permission flags on the `Role` model.
+Local login → Cloudflare Access JWT (`auth/cloudflare_access.py`) → Local network auto-login (`auth/local_network.py`, trusted CIDRs). Role-based permissions: super_admin > admin > operator > viewer; see `Role.PERMISSION_FIELDS` for the full flag list.
 
 ## Credentials
 
@@ -81,4 +81,4 @@ Fernet symmetric encryption (`auth/credential_store.py`), key at `/etc/mstdnca/s
 
 ## Frontend
 
-Jinja2 templates with Bootstrap 5.3.3 dark theme + htmx 2.0.4 + xterm.js, all from CDN. Single `static/style.css`.
+Jinja2 templates with Bootstrap 5.3.3 dark theme + xterm.js, all from CDN. Single `static/style.css` plus `static/esc.js` (shared `escHtml` helper).

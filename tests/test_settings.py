@@ -617,6 +617,79 @@ class TestRefreshBackupStorages:
             )
         assert resp.status_code == 302
 
+    def test_all_hosts_failing_keeps_previous_cache(self, app, auth_client):
+        """If every configured PVE host errors out, the previous cache must
+        survive instead of being blanked, and a warning should be flashed."""
+        with app.app_context():
+            Setting.set("backup_storages_cache", json.dumps([{"storage": "old-storage"}]))
+            Setting.set("backup_storages_cache_time", "2020-01-01T00:00:00+00:00")
+
+        mock_host = MagicMock()
+        mock_host.name = "pve1"
+        with patch("models.ProxmoxHost") as MockHost, \
+             patch("clients.proxmox_api.ProxmoxClient") as MockClient:
+            MockHost.query.filter.return_value.all.return_value = [mock_host]
+            MockClient.return_value.api.nodes.get.side_effect = Exception("connection refused")
+            resp = auth_client.post(
+                "/settings/backups/refresh-storages",
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+
+        assert resp.status_code == 502
+        data = resp.get_json()
+        assert data["ok"] is False
+
+        with app.app_context():
+            cache = json.loads(Setting.get("backup_storages_cache"))
+            assert cache == [{"storage": "old-storage"}]
+            assert Setting.get("backup_storages_cache_time") == "2020-01-01T00:00:00+00:00"
+
+    def test_all_hosts_failing_form_post_flashes_warning(self, app, auth_client):
+        """Non-AJAX POST with all hosts failing should flash a warning and redirect."""
+        mock_host = MagicMock()
+        mock_host.name = "pve1"
+        with patch("models.ProxmoxHost") as MockHost, \
+             patch("clients.proxmox_api.ProxmoxClient") as MockClient:
+            MockHost.query.filter.return_value.all.return_value = [mock_host]
+            MockClient.return_value.api.nodes.get.side_effect = Exception("connection refused")
+            resp = auth_client.post(
+                "/settings/backups/refresh-storages",
+                follow_redirects=True,
+            )
+
+        assert resp.status_code == 200
+        assert b"no Proxmox host responded" in resp.data
+
+    def test_one_host_responding_saves_cache(self, app, auth_client):
+        """If at least one host responds, the cache is refreshed even if
+        other hosts in the same pass errored out."""
+        good_host = MagicMock()
+        good_host.name = "pve-good"
+        bad_host = MagicMock()
+        bad_host.name = "pve-bad"
+
+        def client_factory(host):
+            client = MagicMock()
+            if host is good_host:
+                client.api.nodes.get.return_value = [{"node": "pve-good"}]
+                client.list_node_storages.return_value = [{"storage": "backup-nfs"}]
+            else:
+                client.api.nodes.get.side_effect = Exception("connection refused")
+            return client
+
+        with patch("models.ProxmoxHost") as MockHost, \
+             patch("clients.proxmox_api.ProxmoxClient", side_effect=client_factory):
+            MockHost.query.filter.return_value.all.return_value = [good_host, bad_host]
+            resp = auth_client.post(
+                "/settings/backups/refresh-storages",
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["storages"] == [{"storage": "backup-nfs"}]
+
 
 class TestBackupTagDefaults:
     def test_save_tag_overrides(self, app, auth_client):

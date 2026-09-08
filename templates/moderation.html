@@ -186,17 +186,23 @@
     const logArea = document.getElementById('moderation-log-area');
     const logPre = document.getElementById('moderation-log');
     let polling = {{ 'true' if job.running else 'false' }};
+    // Offset into the job's log the server has already sent us; passed back
+    // on each poll so /status only returns lines appended since last time
+    // instead of re-sending the whole (capped) log every 2s.
+    let logOffset = 0;
 
     function pollStatus() {
         if (!polling) return;
-        fetch('/moderation/status')
+        fetch('/moderation/status?offset=' + logOffset)
             .then(r => r.json())
             .then(data => {
                 if (data.log && data.log.length) {
                     logArea.style.display = 'block';
-                    logPre.textContent = data.log.join('\n');
-                    logPre.scrollTop = logPre.scrollHeight;
+                    const atBottom = logPre.scrollTop + logPre.clientHeight >= logPre.scrollHeight - 10;
+                    logPre.textContent += (logPre.textContent ? '\n' : '') + data.log.join('\n');
+                    if (atBottom) logPre.scrollTop = logPre.scrollHeight;
                 }
+                if (typeof data.log_offset === 'number') logOffset = data.log_offset;
                 if (data.running) {
                     setTimeout(pollStatus, 2000);
                 } else {

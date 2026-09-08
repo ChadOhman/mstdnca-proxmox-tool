@@ -1,0 +1,158 @@
+import socket, urllib.parse as up, json, time
+
+def rc(s, *args):
+    p = ["*{}\r\n".format(len(args))]
+    for a in args:
+        a = str(a)
+        p.append("${}\r\n{}\r\n".format(len(a.encode()), a))
+    s.sendall("".join(p).encode())
+
+def rr(s, bf):
+    while b"\r\n" not in bf[0]:
+        d = s.recv(65536)
+        if not d: break
+        bf[0] += d
+    if not bf[0]: return None
+    i = bf[0].index(b"\r\n")
+    ln = bf[0][:i].decode("utf-8", "replace")
+    bf[0] = bf[0][i+2:]
+    t, rest = ln[0], ln[1:]
+    if t == "+": return rest
+    if t == "-": return None
+    if t == ":": return int(rest) if rest.lstrip("-").isdigit() else 0
+    if t == "$":
+        n = int(rest)
+        if n < 0: return None
+        while len(bf[0]) < n + 2:
+            d = s.recv(65536)
+            if not d: break
+            bf[0] += d
+        v = bf[0][:n].decode("utf-8", "replace")
+        bf[0] = bf[0][n+2:]
+        return v
+    if t == "*":
+        n = int(rest)
+        return [rr(s, bf) for _ in range(max(n, 0))]
+    return None
+
+env = {}
+for f in ["/home/mastodon/live/.env.production", "/var/www/mastodon/.env.production", "/opt/mastodon/.env.production"]:
+    try:
+        for line in open(f):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                env[k.strip()] = v.strip().strip(chr(34)+chr(39))
+        break
+    except: pass
+
+url = env.get("REDIS_URL", "")
+if url:
+    u = up.urlparse(url)
+    host = u.hostname or "127.0.0.1"
+    port = u.port or 6379
+    pw = u.password or env.get("REDIS_PASSWORD", "")
+    db = int((u.path or "/0").lstrip("/") or "0")
+else:
+    host = env.get("REDIS_HOST", "127.0.0.1")
+    port = int(env.get("REDIS_PORT", "6379") or "6379")
+    pw = env.get("REDIS_PASSWORD", "")
+    db = int(env.get("REDIS_DB", "0") or "0")
+
+try:
+    s = socket.socket()
+    s.settimeout(5)
+    s.connect((host, port))
+    bf = [b""]
+    if pw:
+        rc(s, "AUTH", pw)
+        rr(s, bf)
+    rc(s, "SELECT", str(db))
+    rr(s, bf)
+    print("---queues---")
+    rc(s, "SMEMBERS", "queues")
+    qs = rr(s, bf) or []
+    _lat_dbg = ''
+    def _parse_ea(ea):
+        try:
+            ts = float(ea)
+            if ts > 1e11: ts /= 1000.0
+            return ts
+        except (TypeError, ValueError): pass
+        try:
+            from datetime import datetime as _dt
+            return _dt.fromisoformat(str(ea).replace('Z', '+00:00')).timestamp()
+        except Exception: return None
+    for q in qs:
+        rc(s, "LLEN", "queue:"+q)
+        size = rr(s, bf) or 0
+        lat = 0.0
+        if size > 0:
+            rc(s, "LINDEX", "queue:"+q, "-1")
+            rc(s, "LINDEX", "queue:"+q, "0")
+            for _item in [rr(s, bf), rr(s, bf)]:
+                if _item:
+                    try:
+                        _job = json.loads(_item)
+                        _ea = _job.get("enqueued_at") or _job.get("created_at")
+                        if _ea is not None:
+                            _ts = _parse_ea(_ea)
+                            if _ts is not None:
+                                _l = time.time() - _ts
+                                if _l > lat: lat = _l
+                            if not _lat_dbg:
+                                _lat_dbg = '{}|{}|{}'.format(q, type(_ea).__name__, str(_ea)[:30])
+                        elif not _lat_dbg:
+                            _lat_dbg = '{}|no_ea|keys:{}'.format(q, ','.join(list(_job.keys())[:5]))
+                    except Exception as _ex:
+                        if not _lat_dbg: _lat_dbg = '{}|ex|{}'.format(q, str(_ex)[:60])
+        print("{}={}|{:.2f}".format(q, size, lat))
+    print("---stats---")
+    for k, c in [("processed", ("GET", "stat:processed")), ("failed", ("GET", "stat:failed")),
+                 ("retry", ("ZCARD", "retry")), ("dead", ("ZCARD", "dead")),
+                 ("scheduled", ("ZCARD", "schedule"))]:
+        rc(s, *c)
+        print("{}={}".format(k, rr(s, bf) or 0))
+    print("---workers---")
+    rc(s, "SMEMBERS", "processes")
+    procs = rr(s, bf) or []
+    for pid_key in procs:
+        rc(s, "HGETALL", pid_key)
+        fields = rr(s, bf) or []
+        h = {}
+        it = iter(fields)
+        for fk in it:
+            try:
+                fv = next(it)
+            except StopIteration:
+                break
+            h[fk] = fv
+        print("worker={}|{}|{}|{}|{}|{}".format(
+            h.get("hostname", ""),
+            h.get("pid", ""),
+            h.get("concurrency", "0"),
+            h.get("busy", "0"),
+            h.get("beat", ""),
+            h.get("queues", "[]"),
+        ))
+    print("---paused---")
+    rc(s, "SMEMBERS", "paused")
+    paused_set = rr(s, bf) or []
+    for pq in paused_set:
+        print(pq)
+    s.close()
+    print("---debug---")
+    print("host={}".format(host))
+    print("port={}".format(port))
+    print("db={}".format(db))
+    print("auth_set={}".format("yes" if pw else "no"))
+    print("redis_cli=python3-ok")
+    print("lat_dbg={}".format(_lat_dbg or 'none'))
+except Exception as e:
+    print("---debug---")
+    print("host={}".format(host))
+    print("port={}".format(port))
+    print("db={}".format(db))
+    print("auth_set={}".format("yes" if pw else "no"))
+    print("redis_cli=python3-err")
+    print("errmsg={}".format(str(e)[:120]))

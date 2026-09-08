@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 
 from proxmoxer import ProxmoxAPI
@@ -6,6 +7,16 @@ from proxmoxer import ProxmoxAPI
 from auth.credential_store import decrypt
 
 logger = logging.getLogger(__name__)
+
+# Short-TTL vmid -> node cache for find_guest_node(), keyed by (host id, vmid).
+# The Guest model has no stored "last known node" column, so this in-process
+# cache avoids enumerating the whole cluster on nearly every guest request.
+# Populated for every guest seen during a full-cluster lookup, not just the
+# one being searched for, so a burst of lookups across different guests on
+# the same host only pays the enumeration cost once per TTL window.
+_NODE_CACHE_TTL_SECONDS = 30
+_node_cache_lock = threading.Lock()
+_node_cache = {}  # (host_id, vmid) -> (node_name, expires_at_monotonic)
 
 
 class ProxmoxClient:
@@ -560,11 +571,33 @@ class ProxmoxClient:
             return False, str(e)
 
     def find_guest_node(self, vmid):
-        """Find which node a guest (VM or CT) is running on. Returns node name or None."""
+        """Find which node a guest (VM or CT) is running on. Returns node name or None.
+
+        Tries a short-TTL (30s) per-process vmid->node cache first, and only
+        falls back to a full cluster enumeration on a cache miss or expiry.
+        Same return contract as before: node name string, or None if the
+        guest isn't found (or the lookup failed).
+        """
+        host_id = self.host_model.id
+        cache_key = (host_id, vmid)
+        now = time.monotonic()
+
+        with _node_cache_lock:
+            cached = _node_cache.get(cache_key)
+            if cached is not None and cached[1] > now:
+                return cached[0]
+
         try:
-            for guest in self.get_all_guests():
-                if guest.get("vmid") == vmid:
-                    return guest.get("node")
+            found = None
+            expires_at = now + _NODE_CACHE_TTL_SECONDS
+            guests = self.get_all_guests()
+            with _node_cache_lock:
+                for guest in guests:
+                    node = guest.get("node")
+                    _node_cache[(host_id, guest.get("vmid"))] = (node, expires_at)
+                    if found is None and guest.get("vmid") == vmid:
+                        found = node
+            return found
         except Exception as e:
             logger.error(f"Failed to find guest node for vmid {vmid}: {e}")
         return None
