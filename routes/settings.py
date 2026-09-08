@@ -864,8 +864,14 @@ def export_config():
 def import_config():
     """Upload a config JSON and upsert hosts/guests/tags/roles/settings.
 
-    Secrets are never imported.  Malformed input is rejected with a clear
-    error; the endpoint never returns a 500 for bad user input.
+    Secrets and auth-critical settings (trusted subnets, local-bypass,
+    Cloudflare Access, self-update source) are never imported.  Importing
+    role permissions and host connection fields requires the explicit
+    ``import_roles`` / ``import_hosts`` opt-in checkboxes (default unchecked).
+    The whole import is applied atomically: on any failure nothing is
+    committed, and the flash message reflects that truthfully.  Malformed
+    input is rejected with a clear error; the endpoint never returns a 500
+    for bad user input.
     """
     _require_super_admin()
     from core.config_backup import ImportError_, apply_import
@@ -892,8 +898,11 @@ def import_config():
         flash(f"Invalid JSON: {e}", "error")
         return redirect(url_for("settings.index"))
 
+    import_roles = "import_roles" in request.form
+    import_hosts = "import_hosts" in request.form
+
     try:
-        counts = apply_import(doc)
+        counts = apply_import(doc, import_roles=import_roles, import_hosts=import_hosts)
     except ImportError_ as e:
         db.session.rollback()
         flash(f"Import rejected: {e}", "error")
@@ -907,12 +916,29 @@ def import_config():
     log_action("settings_config_import", "settings", resource_name="config_import",
                details=counts)
     db.session.commit()
-    flash(
+    # Setting.set_no_commit() left the per-request settings cache untouched so
+    # the batch could be committed atomically — invalidate it now that the
+    # commit has actually happened.
+    Setting.invalidate_cache()
+
+    message = (
         f"Config imported: {counts['hosts']} host(s), {counts['guests']} guest(s), "
         f"{counts['tags']} tag(s), {counts['roles']} role(s), {counts['settings']} setting(s). "
-        "Secrets were not imported — re-enter any credentials.",
-        "success",
+        "Secrets were not imported — re-enter any credentials."
     )
+    if counts.get("skipped_settings"):
+        message += f" Skipped auth-critical/secret setting(s): {', '.join(sorted(counts['skipped_settings']))}."
+    if not import_hosts and counts.get("skipped_hosts"):
+        message += (
+            f" {len(counts['skipped_hosts'])} existing host(s) not updated "
+            "(check 'Import host connection fields' to overwrite — this also clears their stored credential)."
+        )
+    if not import_roles and counts.get("skipped_roles"):
+        message += (
+            f" {counts['skipped_roles']} role(s) not imported "
+            "(check 'Import role permissions' to apply them)."
+        )
+    flash(message, "success")
     return redirect(url_for("settings.index"))
 
 

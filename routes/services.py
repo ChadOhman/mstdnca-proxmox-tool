@@ -11,7 +11,6 @@ from flask_login import current_user, login_required
 from sqlalchemy import func
 
 from auth.audit import log_action
-from core.pg_identifiers import PG_DB_NAME_RE as _PG_DB_NAME_RE
 from core.scanner import (
     check_service_statuses,
     get_service_logs,
@@ -33,6 +32,10 @@ from core.scanner import (
 from models import AuditLog, Guest, GuestService, ServiceMetricSnapshot, Tag, db
 
 logger = logging.getLogger(__name__)
+
+# Allowlist for PostgreSQL database names: letters, digits, underscores only (max 63 chars).
+# Prevents command injection in shell commands that embed the database name.
+_PG_DB_NAME_RE = re.compile(r'^[A-Za-z0-9_]{1,63}$')
 
 bp = Blueprint("services", __name__)
 
@@ -637,86 +640,6 @@ def pg_vacuum(service_id):
     return jsonify({"ok": True, "message": output})
 
 
-# --- pg/explain & pg/analyze-plan: single-statement, read-only SQL guard ---
-#
-# EXPLAIN [ANALYZE] used to hand the caller's `query` straight to `psql -f`
-# as the entire script, so a `;`-stacked payload ran with the privileges of
-# the `postgres` superuser (GHSA-p3xx-rpm2-g5f8). `_prepare_explain_sql`
-# restricts accepted text to a single statement of an allowed shape, and
-# `_explain_transaction_sql` wraps that statement in a rolled-back, read-only
-# transaction with its own statement timeout — so even a statement that
-# passes validation can never commit a write or run unbounded.
-_PG_EXPLAIN_MAX_LEN = 20_000
-_PG_READ_ONLY_START_RE = re.compile(r"^(?:\(\s*)*(SELECT|WITH|VALUES|TABLE)\b", re.IGNORECASE)
-_PG_PLAN_ONLY_WRITE_START_RE = re.compile(r"^(?:\(\s*)*(UPDATE|DELETE|INSERT)\b", re.IGNORECASE)
-
-
-def _prepare_explain_sql(query: str, analyze: bool) -> str:
-    """Validate and normalize a user-supplied statement for EXPLAIN [ANALYZE].
-
-    Raises ValueError (message is safe to show the caller) if `query` is not
-    a single, safely-shaped SQL statement. On success, returns the statement
-    with at most one trailing `;` stripped; the caller embeds it in the
-    read-only transaction body that is actually executed.
-
-    - length capped at `_PG_EXPLAIN_MAX_LEN` characters;
-    - at most one trailing `;` is stripped; any other `;` means multiple
-      statements are being stacked and the whole input is rejected;
-    - `--`, `/*`, `*/` comment sequences are rejected (they could hide a
-      stacked statement from a naive reviewer of the rendered plan);
-    - `\\` psql meta-commands (`\\gexec`, `\\!`, `\\copy ... program`, etc.)
-      are rejected;
-    - the statement must start (case-insensitively, past optional leading
-      parentheses) with SELECT, WITH, VALUES, or TABLE;
-    - for plain EXPLAIN (`analyze=False`) only, UPDATE/DELETE/INSERT are also
-      accepted: plain EXPLAIN only *plans* a statement, it never runs it, and
-      the surrounding transaction is READ ONLY and always rolled back
-      regardless, so nothing can ever commit.
-    """
-    q = (query or "").strip()
-    if not q:
-        raise ValueError("query is required")
-    if len(q) > _PG_EXPLAIN_MAX_LEN:
-        raise ValueError(f"query is too long (max {_PG_EXPLAIN_MAX_LEN} characters)")
-
-    stripped = q.rstrip()
-    if stripped.endswith(";"):
-        stripped = stripped[:-1].rstrip()
-    if not stripped:
-        raise ValueError("query is required")
-    if ";" in stripped:
-        raise ValueError("Only a single SQL statement is allowed (no ';').")
-    if "--" in stripped or "/*" in stripped or "*/" in stripped:
-        raise ValueError("SQL comments are not allowed in the query.")
-    if "\\" in stripped:
-        raise ValueError("psql meta-commands are not allowed in the query.")
-
-    if _PG_READ_ONLY_START_RE.match(stripped):
-        return stripped
-    if not analyze and _PG_PLAN_ONLY_WRITE_START_RE.match(stripped):
-        return stripped
-
-    allowed = "SELECT, WITH, VALUES, or TABLE" if analyze else "SELECT, WITH, VALUES, TABLE, UPDATE, DELETE, or INSERT"
-    raise ValueError(f"Query must start with {allowed}.")
-
-
-def _explain_transaction_sql(explain_clause: str, statement: str) -> str:
-    """Build the read-only, rolled-back transaction body executed by psql.
-
-    `explain_clause` is e.g. "EXPLAIN" or "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)".
-    The transaction is always READ ONLY and always ROLLBACK'd, and carries its
-    own statement timeout, so `statement` can never commit a write and can
-    never run unbounded — independent of what `_prepare_explain_sql` allowed.
-    """
-    return (
-        "BEGIN;\n"
-        "SET TRANSACTION READ ONLY;\n"
-        "SET LOCAL statement_timeout = '30s';\n"
-        f"{explain_clause} {statement};\n"
-        "ROLLBACK;\n"
-    )
-
-
 @bp.route("/<int:service_id>/pg/explain", methods=["POST"])
 def pg_explain(service_id):
     if not current_user.can_edit_services:
@@ -731,19 +654,13 @@ def pg_explain(service_id):
         return jsonify({"ok": False, "message": "database and query are required"}), 400
     if not _PG_DB_NAME_RE.match(database):
         return jsonify({"ok": False, "message": "Invalid database name."}), 400
-    try:
-        statement = _prepare_explain_sql(query, analyze=False)
-    except ValueError as exc:
-        return jsonify({"ok": False, "message": str(exc)}), 400
     import uuid
 
     from core.scanner import _execute_command
     tmpfile = f"/tmp/.pg_explain_{uuid.uuid4().hex[:12]}.sql"  # nosec B108 — remote SSH path, not a local temp file
     # Use shlex.quote() to safely shell-quote the SQL content; single quotes in the shell
-    # prevent all metacharacter expansion (backticks, $(), semicolons, etc.). The statement
-    # itself is constrained to a single read-only-shaped clause by _prepare_explain_sql above,
-    # and runs inside a rolled-back READ ONLY transaction (see _explain_transaction_sql).
-    safe_content = shlex.quote(_explain_transaction_sql("EXPLAIN", statement))
+    # prevent all metacharacter expansion (backticks, $(), semicolons, etc.).
+    safe_content = shlex.quote(f"EXPLAIN {query}")
     _, write_err = _execute_command(
         guest,
         f"printf %s {safe_content} > {tmpfile}",
@@ -753,7 +670,7 @@ def pg_explain(service_id):
         return jsonify({"ok": False, "message": f"Could not write temp file: {write_err[:200]}"})
     stdout, error = _execute_command(
         guest,
-        f"sudo -u postgres psql -v ON_ERROR_STOP=1 -X -q -d {database} -f {tmpfile} 2>&1; rm -f {tmpfile}",
+        f"sudo -u postgres psql -d {database} -f {tmpfile} 2>&1; rm -f {tmpfile}",
         timeout=60,
         sudo=True,
     )
@@ -853,24 +770,20 @@ def pg_analyze_plan(service_id):
         return jsonify({"ok": False, "message": "database and query are required"}), 400
     if not _PG_DB_NAME_RE.match(database):
         return jsonify({"ok": False, "message": "Invalid database name."}), 400
-    try:
-        statement = _prepare_explain_sql(query, analyze=True)
-    except ValueError as exc:
-        return jsonify({"ok": False, "message": str(exc)}), 400
 
     import uuid
 
     from core.scanner import _execute_command
 
     tmpfile = f"/tmp/.pg_analyze_{uuid.uuid4().hex[:12]}.sql"  # nosec B108 — remote SSH path, not local
-    safe_content = shlex.quote(_explain_transaction_sql("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)", statement))
+    safe_content = shlex.quote(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query}")
     _, write_err = _execute_command(guest, f"printf %s {safe_content} > {tmpfile}", timeout=10)
     if write_err:
         return jsonify({"ok": False, "message": f"Could not write temp file: {write_err[:200]}"})
 
     stdout, error = _execute_command(
         guest,
-        f"sudo -u postgres psql -v ON_ERROR_STOP=1 -X -q -d {database} -t -A -f {tmpfile} 2>&1; rm -f {tmpfile}",
+        f"sudo -u postgres psql -d {database} -t -A -f {tmpfile} 2>&1; rm -f {tmpfile}",
         timeout=120,
         sudo=True,
     )

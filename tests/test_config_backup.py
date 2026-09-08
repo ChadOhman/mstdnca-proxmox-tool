@@ -145,12 +145,12 @@ class TestImport:
     def _export(self, auth_client):
         return json.loads(auth_client.get("/settings/config/export").data)
 
-    def _upload(self, client, doc):
+    def _upload(self, client, doc, **extra_form):
         import io
         payload = json.dumps(doc).encode("utf-8")
         return client.post(
             "/settings/config/import",
-            data={"config_file": (io.BytesIO(payload), "config.json")},
+            data={"config_file": (io.BytesIO(payload), "config.json"), **extra_form},
             content_type="multipart/form-data",
             follow_redirects=True,
         )
@@ -198,12 +198,17 @@ class TestImport:
         for h in doc["hosts"]:
             if h["name"] == "pve1":
                 h["hostname"] = "pve1-new.example.com"
-        self._upload(auth_client, doc)
+        # Overwriting an existing host's connection fields is opt-in
+        # (GHSA-8mgh-j8r7-7rf2 finding 3) -- exercise that opt-in here.
+        self._upload(auth_client, doc, import_hosts="on")
         with app.app_context():
             host = ProxmoxHost.query.filter_by(name="pve1").first()
             assert host.hostname == "pve1-new.example.com"
             # No duplicate host created
             assert ProxmoxHost.query.filter_by(name="pve1").count() == 1
+            # Opting into host import clears the stored credential so a
+            # repointed host can't send the old secret to a new endpoint.
+            assert host.encrypted_password is None
 
     def test_import_rejects_non_json(self, auth_client):
         import io
@@ -269,6 +274,286 @@ class TestImport:
             follow_redirects=False,
         )
         assert resp.status_code in (302, 403)
+
+
+class TestExportRuleBasedRedaction:
+    """GHSA-8mgh-j8r7-7rf2 finding 4: the old denylist missed jibri/prometheus/
+    peertube/moderation secrets. Redaction is now rule-based (key pattern or
+    Fernet-looking value), so these are caught without needing a code change.
+    """
+
+    # key -> is_encrypted; the placeholder value is derived from the key so no
+    # line pairs a secret-shaped key with a literal (keeps secret scanners quiet).
+    _EXTRA_SECRET_KEYS = {
+        "jibri_smb_password": False,
+        "jibri_xmpp_password": False,
+        "jibri_recorder_password": False,
+        "prometheus_auth_token": False,
+        "moderation_peertube_api_token": True,
+        "peertube_db_password": True,
+    }
+    _EXTRA_SECRET_SETTINGS = {
+        key: ("test-only-" + key.replace("_", "-"), enc) for key, enc in _EXTRA_SECRET_KEYS.items()
+    }
+
+    def test_export_redacts_jibri_prometheus_peertube_moderation_secrets(self, app, auth_client, seeded_config):
+        with app.app_context():
+            for key, (plain, is_encrypted) in self._EXTRA_SECRET_SETTINGS.items():
+                Setting.set(key, encrypt(plain) if is_encrypted else plain)
+            db.session.commit()
+        try:
+            raw = auth_client.get("/settings/config/export").data.decode("utf-8")
+            for plain, _is_encrypted in self._EXTRA_SECRET_SETTINGS.values():
+                assert plain not in raw, f"secret {plain!r} leaked into export"
+            doc = json.loads(raw)
+            for key in self._EXTRA_SECRET_SETTINGS:
+                assert doc["settings"].get(key) == "***REDACTED***", f"{key} was not redacted"
+        finally:
+            with app.app_context():
+                for key in self._EXTRA_SECRET_SETTINGS:
+                    Setting.query.filter_by(key=key).delete()
+                db.session.commit()
+
+    def test_export_redacts_any_fernet_looking_value_regardless_of_key_name(self, app, auth_client, seeded_config):
+        """A key with no secret-shaped name is still redacted if its value is
+        Fernet ciphertext -- the value-based signal is a backstop for keys the
+        pattern doesn't catch."""
+        with app.app_context():
+            Setting.set("totally_innocuous_setting", encrypt("test-only-hidden-value"))
+            db.session.commit()
+        try:
+            raw = auth_client.get("/settings/config/export").data.decode("utf-8")
+            assert "test-only-hidden-value" not in raw
+            doc = json.loads(raw)
+            assert doc["settings"].get("totally_innocuous_setting") == "***REDACTED***"
+        finally:
+            with app.app_context():
+                Setting.query.filter_by(key="totally_innocuous_setting").delete()
+                db.session.commit()
+
+
+class TestImportAuthCriticalBlocklist:
+    """GHSA-8mgh-j8r7-7rf2 finding 1: auth-critical settings must never be
+    importable, and skipped keys must be reported to the user."""
+
+    def _upload(self, client, doc, **extra_form):
+        import io
+        data = {"config_file": (io.BytesIO(json.dumps(doc).encode()), "config.json"), **extra_form}
+        return client.post(
+            "/settings/config/import",
+            data=data,
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+
+    def test_auth_critical_settings_are_skipped_and_reported(self, app, auth_client):
+        with app.app_context():
+            before_trusted = Setting.get("trusted_subnets")
+            before_bypass = Setting.get("local_bypass_enabled")
+            before_cf = Setting.get("cf_access_enabled")
+
+        doc = {
+            "version": 1, "hosts": [], "tags": [], "guests": [], "roles": [],
+            "settings": {
+                "trusted_subnets": "0.0.0.0/0",
+                "local_bypass_enabled": "true",
+                "cf_access_enabled": "true",
+                "cf_access_bypass_local_auth": "true",
+                "app_update_branch": "attacker/evil-fork:main",
+                "scan_interval": "7",  # a legitimate, non-auth-critical setting
+            },
+        }
+        resp = self._upload(auth_client, doc)
+        assert resp.status_code == 200
+        assert b"Config imported" in resp.data
+        from core import config_backup as _cb
+        blocked = [k for k in doc["settings"] if k in _cb._AUTH_CRITICAL_SETTING_KEYS]
+        assert len(blocked) >= 3
+        for key in (k.encode() for k in blocked):
+            assert key in resp.data, f"{key!r} not reported as skipped in flash message"
+
+        with app.app_context():
+            assert Setting.get("trusted_subnets") == before_trusted
+            assert Setting.get("local_bypass_enabled") == before_bypass
+            assert Setting.get("cf_access_enabled") == before_cf
+            assert Setting.get("app_update_branch") != "attacker/evil-fork:main"
+            # The non-auth-critical setting in the same document still applies.
+            assert Setting.get("scan_interval") == "7"
+
+    def test_out_of_range_interval_setting_is_skipped_not_trusted_verbatim(self, app, auth_client):
+        with app.app_context():
+            before = Setting.get("service_check_interval")
+        doc = {
+            "version": 1, "hosts": [], "tags": [], "guests": [], "roles": [],
+            "settings": {"service_check_interval": "999999"},  # bounds: 1-1440 minutes
+        }
+        resp = self._upload(auth_client, doc)
+        assert resp.status_code == 200
+        with app.app_context():
+            assert Setting.get("service_check_interval") == before
+
+
+class TestImportRolesOptIn:
+    """GHSA-8mgh-j8r7-7rf2 finding 2: role permissions must not change unless
+    the admin explicitly opts in."""
+
+    ROLE_NAME = "test-only-custom-role"
+
+    @pytest.fixture()
+    def custom_role(self, app):
+        with app.app_context():
+            role = Role.query.filter_by(name=self.ROLE_NAME).first()
+            if role is None:
+                role = Role(name=self.ROLE_NAME, display_name="Test Only Custom Role", level=1,
+                            is_builtin=False, base_tier="viewer")
+                db.session.add(role)
+                db.session.commit()
+            role_id = role.id
+        yield role_id
+        with app.app_context():
+            role = db.session.get(Role, role_id)
+            if role is not None:
+                db.session.delete(role)
+                db.session.commit()
+
+    def _upload(self, client, doc, **extra_form):
+        import io
+        data = {"config_file": (io.BytesIO(json.dumps(doc).encode()), "config.json"), **extra_form}
+        return client.post(
+            "/settings/config/import",
+            data=data,
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+
+    def _doc(self):
+        return {
+            "version": 1, "hosts": [], "tags": [], "guests": [],
+            "roles": [{
+                "name": self.ROLE_NAME, "display_name": "Test Only Custom Role",
+                "level": 1, "is_builtin": False, "base_tier": "viewer",
+                "can_manage_users": True,
+            }],
+            "settings": {},
+        }
+
+    def test_role_permissions_not_applied_without_opt_in(self, app, auth_client, custom_role):
+        resp = self._upload(auth_client, self._doc())
+        assert resp.status_code == 200
+        with app.app_context():
+            role = db.session.get(Role, custom_role)
+            assert role.can_manage_users is False
+
+    def test_role_permissions_applied_with_opt_in(self, app, auth_client, custom_role):
+        resp = self._upload(auth_client, self._doc(), import_roles="on")
+        assert resp.status_code == 200
+        with app.app_context():
+            role = db.session.get(Role, custom_role)
+            assert role.can_manage_users is True
+
+
+class TestImportHostsOptIn:
+    """GHSA-8mgh-j8r7-7rf2 finding 3: an import must not repoint an existing
+    host's connection fields while leaving its stored credential intact."""
+
+    def _upload(self, client, doc, **extra_form):
+        import io
+        data = {"config_file": (io.BytesIO(json.dumps(doc).encode()), "config.json"), **extra_form}
+        return client.post(
+            "/settings/config/import",
+            data=data,
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+
+    def _doc(self):
+        return {
+            "version": 1, "tags": [], "guests": [], "roles": [],
+            "hosts": [{
+                "name": "pve1", "hostname": "collector.attacker.invalid", "port": 8006,
+                "auth_type": "token", "username": "root@pam", "api_token_id": "root@pam!mytoken",
+                "verify_ssl": False, "host_type": "pve",
+                "ipmi_enabled": True, "ipmi_address": "10.0.0.5", "ipmi_username": "ADMIN",
+                "ipmi_verify_ssl": True,
+            }],
+            "settings": {},
+        }
+
+    def test_existing_host_hostname_unchanged_without_opt_in(self, app, auth_client, seeded_config):
+        resp = self._upload(auth_client, self._doc())
+        assert resp.status_code == 200
+        with app.app_context():
+            host = ProxmoxHost.query.filter_by(name="pve1").first()
+            # The doc tries to repoint this host to an attacker-controlled
+            # hostname; without import_hosts it must be silently ignored.
+            assert host.hostname == "pve1.example.com"
+            # Credential is untouched (still present) because nothing changed.
+            assert host.encrypted_password is not None
+            assert host.api_token_secret is not None
+
+    def test_existing_host_hostname_changed_with_opt_in_clears_credential(self, app, auth_client, seeded_config):
+        resp = self._upload(auth_client, self._doc(), import_hosts="on")
+        assert resp.status_code == 200
+        with app.app_context():
+            host = ProxmoxHost.query.filter_by(name="pve1").first()
+            assert host.hostname == "collector.attacker.invalid"
+            # Stored credentials were cleared in the same transaction so the
+            # repointed host cannot send the old secret to the new endpoint.
+            assert host.encrypted_password is None
+            assert host.api_token_secret is None
+            assert host.ipmi_password is None
+
+
+class TestImportAtomicity:
+    """GHSA-8mgh-j8r7-7rf2 finding 5: Setting.set() used to commit per call,
+    so a mid-import failure left a partial write while the flash message
+    claimed nothing was applied. apply_import() now writes through the
+    session without per-row commits so a failure rolls back everything."""
+
+    def test_mid_import_failure_leaves_zero_changes(self, app, auth_client, monkeypatch):
+        from core import config_backup
+
+        original_set_no_commit = config_backup.Setting.set_no_commit
+        calls = {"n": 0}
+
+        def flaky_set_no_commit(key, value):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("simulated failure mid-import")
+            return original_set_no_commit(key, value)
+
+        monkeypatch.setattr(config_backup.Setting, "set_no_commit", flaky_set_no_commit)
+
+        with app.app_context():
+            before_scan_interval = Setting.get("scan_interval")
+            before_discovery_interval = Setting.get("discovery_interval")
+
+        doc = {
+            "version": 1,
+            "hosts": [{
+                "name": "test-only-atomic-host", "hostname": "atomic.example.invalid", "port": 8006,
+                "auth_type": "token", "username": "root@pam", "verify_ssl": True, "host_type": "pve",
+            }],
+            "tags": [{"name": "test-only-atomic-tag", "color": "#123456", "unifi_networks": []}],
+            "guests": [],
+            "roles": [],
+            "settings": {"scan_interval": "5", "discovery_interval": "3"},
+        }
+        import io
+        resp = auth_client.post(
+            "/settings/config/import",
+            data={"config_file": (io.BytesIO(json.dumps(doc).encode()), "c.json")},
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        assert resp.status_code == 200
+        assert b"No changes were applied" in resp.data
+
+        with app.app_context():
+            assert ProxmoxHost.query.filter_by(name="test-only-atomic-host").first() is None
+            assert Tag.query.filter_by(name="test-only-atomic-tag").first() is None
+            assert Setting.get("scan_interval") == before_scan_interval
+            assert Setting.get("discovery_interval") == before_discovery_interval
 
 
 class TestDatabaseBackup:
