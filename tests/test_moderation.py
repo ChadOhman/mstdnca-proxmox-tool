@@ -123,6 +123,99 @@ class TestModerationRouteAuthed:
             assert Setting.get("moderation_auto_ban_enabled") == "false"
 
 
+class TestModerationLogCapAndOffset:
+    """_moderation_job['log'] is capped, and /status supports offset-based polling."""
+
+    def _reset_job(self):
+        from collections import deque
+
+        from routes.moderation import _MODERATION_LOG_MAXLEN, _moderation_job
+        _moderation_job["running"] = False
+        _moderation_job["success"] = None
+        _moderation_job["log"] = deque(maxlen=_MODERATION_LOG_MAXLEN)
+        _moderation_job["log_total"] = 0
+
+    def test_log_is_capped_at_maxlen(self, auth_client):
+        from routes.moderation import _MODERATION_LOG_MAXLEN, _append_moderation_log
+        self._reset_job()
+        try:
+            for i in range(_MODERATION_LOG_MAXLEN + 250):
+                _append_moderation_log(f"line {i}")
+
+            from routes.moderation import _moderation_job
+            assert len(_moderation_job["log"]) == _MODERATION_LOG_MAXLEN
+            # The oldest surviving entry should be the 250th appended (0-indexed),
+            # since the first 250 were evicted once the cap was reached.
+            assert _moderation_job["log"][0] == "line 250"
+            assert _moderation_job["log"][-1] == f"line {_MODERATION_LOG_MAXLEN + 249}"
+            # log_total tracks every line ever appended, not just what's retained.
+            assert _moderation_job["log_total"] == _MODERATION_LOG_MAXLEN + 250
+        finally:
+            self._reset_job()
+
+    def test_status_offset_zero_returns_everything_retained(self, auth_client):
+        from routes.moderation import _append_moderation_log
+        self._reset_job()
+        try:
+            _append_moderation_log("first")
+            _append_moderation_log("second")
+            resp = auth_client.get("/moderation/status?offset=0")
+            data = resp.get_json()
+            assert data["log"] == ["first", "second"]
+            assert data["log_offset"] == 2
+        finally:
+            self._reset_job()
+
+    def test_status_offset_returns_only_new_lines(self, auth_client):
+        from routes.moderation import _append_moderation_log
+        self._reset_job()
+        try:
+            _append_moderation_log("first")
+            _append_moderation_log("second")
+            resp1 = auth_client.get("/moderation/status?offset=0")
+            offset = resp1.get_json()["log_offset"]
+
+            _append_moderation_log("third")
+            resp2 = auth_client.get(f"/moderation/status?offset={offset}")
+            data2 = resp2.get_json()
+            assert data2["log"] == ["third"]
+            assert data2["log_offset"] == 3
+        finally:
+            self._reset_job()
+
+    def test_status_offset_equal_to_total_returns_empty(self, auth_client):
+        from routes.moderation import _append_moderation_log
+        self._reset_job()
+        try:
+            _append_moderation_log("only line")
+            resp = auth_client.get("/moderation/status?offset=1")
+            data = resp.get_json()
+            assert data["log"] == []
+            assert data["log_offset"] == 1
+        finally:
+            self._reset_job()
+
+    def test_status_offset_behind_evicted_window_returns_retained_lines(self, auth_client):
+        """If the client's offset points at a line that's since been evicted by
+        the deque's maxlen, /status should still return whatever is currently
+        retained rather than erroring or silently dropping everything."""
+        from routes.moderation import _MODERATION_LOG_MAXLEN, _append_moderation_log
+        self._reset_job()
+        try:
+            for i in range(_MODERATION_LOG_MAXLEN + 10):
+                _append_moderation_log(f"line {i}")
+
+            # offset=0 is long since evicted (only the last _MODERATION_LOG_MAXLEN
+            # lines remain) -- must fall back to everything currently retained.
+            resp = auth_client.get("/moderation/status?offset=0")
+            data = resp.get_json()
+            assert len(data["log"]) == _MODERATION_LOG_MAXLEN
+            assert data["log"][0] == "line 10"
+            assert data["log_offset"] == _MODERATION_LOG_MAXLEN + 10
+        finally:
+            self._reset_job()
+
+
 # ---------------------------------------------------------------------------
 # Core logic tests
 # ---------------------------------------------------------------------------

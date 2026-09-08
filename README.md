@@ -282,13 +282,15 @@ Background Services (APScheduler)
 └── Discord notifier ─ webhook alerts for updates & upgrades
 ```
 
+A lightweight `/health` endpoint is available for load balancers and uptime monitoring.
+
 ## Requirements
 
 ### System Dependencies
 
 Installed automatically by `setup.sh`:
 
-- **Python 3.11+** with `pip` and `venv`
+- **Python 3.13** with `pip` and `venv`
 - **git** (for cloning and self-update)
 - **curl** (for template downloads)
 - **Debian 12** or **Ubuntu 22.04+** (LXC container or VM)
@@ -318,7 +320,6 @@ Pinned versions live in [requirements.txt](requirements.txt).
 
 - **Bootstrap 5.3.3** — UI framework (dark theme)
 - **Bootstrap Icons 1.11.3** — Icon set
-- **htmx 2.0.4** — Dynamic HTML updates
 - **xterm.js** — Terminal emulator for web SSH
 
 ### Optional
@@ -327,8 +328,8 @@ Pinned versions live in [requirements.txt](requirements.txt).
 
 ## Tech Stack
 
-- **Backend:** Python 3.11+, Flask, SQLAlchemy, APScheduler
-- **Frontend:** Bootstrap 5 (dark theme), htmx, xterm.js
+- **Backend:** Python 3.13, Flask, SQLAlchemy, APScheduler
+- **Frontend:** Bootstrap 5 (dark theme), xterm.js
 - **Database:** SQLite
 - **Connections:** proxmoxer (Proxmox API), paramiko (SSH), UniFi Controller API
 - **Security:** Fernet encryption, PyJWT (Cloudflare Access), 4-tier RBAC
