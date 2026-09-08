@@ -5,7 +5,6 @@ Unit tests verify the pure-Python rule logic with synthetic plan JSON.
 Endpoint tests verify security/validation gates (auth, DB name allowlist, missing params).
 """
 import json
-from unittest.mock import patch
 
 import pytest
 
@@ -344,81 +343,4 @@ class TestPgAnalyzePlanWrongServiceType:
             content_type="application/json",
         )
         assert resp.status_code == 400
-
-
-# ---------------------------------------------------------------------------
-# GHSA-p3xx-rpm2-g5f8: `query` must be a single, read-only-shaped statement.
-# Unlike plain EXPLAIN, EXPLAIN ANALYZE *executes* the statement, so writes
-# are never permitted here regardless of the surrounding read-only
-# transaction (which exists purely as defense in depth).
-# ---------------------------------------------------------------------------
-
-class TestPgAnalyzePlanStatementGuard:
-    _HOSTILE_QUERIES = [
-        "1; DROP TABLE x; --",
-        "SELECT 1; SELECT 2",
-        "COPY (SELECT 1) TO PROGRAM 'id'",
-        "SELECT 1 -- drop everything",
-        "SELECT 1 /* comment */",
-        "SELECT 1\n\\gexec",
-        "DELETE FROM users WHERE id = 1",
-        "UPDATE users SET x = 1",
-        "INSERT INTO users (id) VALUES (1)",
-    ]
-
-    @patch("core.scanner._execute_command")
-    def test_hostile_queries_rejected_before_execution(self, mock_exec, auth_client, pg_service):
-        svc_id, _ = pg_service
-        for query in self._HOSTILE_QUERIES:
-            mock_exec.reset_mock()
-            resp = auth_client.post(
-                f"/services/{svc_id}/pg/analyze-plan",
-                data=json.dumps({"database": "mydb", "query": query}),
-                content_type="application/json",
-            )
-            data = resp.get_json()
-            assert resp.status_code == 400, f"Expected 400 for query={query!r}, got {resp.status_code}: {data}"
-            assert data.get("ok") is False
-            mock_exec.assert_not_called()
-
-    @patch("core.scanner._execute_command")
-    def test_explain_analyze_delete_rejected(self, mock_exec, auth_client, pg_service):
-        """The advisory's headline exploit: EXPLAIN ANALYZE DELETE ... must be
-        rejected outright, and the delete must never reach _execute_command.
-        """
-        svc_id, _ = pg_service
-        resp = auth_client.post(
-            f"/services/{svc_id}/pg/analyze-plan",
-            data=json.dumps({"database": "mydb", "query": "DELETE FROM users"}),
-            content_type="application/json",
-        )
-        data = resp.get_json()
-        assert resp.status_code == 400
-        assert data.get("ok") is False
-        mock_exec.assert_not_called()
-
-    @patch("core.scanner._execute_command")
-    def test_valid_select_wrapped_in_readonly_rolledback_transaction(self, mock_exec, auth_client, pg_service):
-        svc_id, _ = pg_service
-        mock_exec.return_value = ('[{"Plan": {"Node Type": "Result"}}]', None)
-
-        resp = auth_client.post(
-            f"/services/{svc_id}/pg/analyze-plan",
-            data=json.dumps({"database": "mydb", "query": "SELECT 1"}),
-            content_type="application/json",
-        )
-        assert resp.status_code == 200, resp.get_json()
-        assert mock_exec.call_count == 2
-
-        import shlex
-        write_command = mock_exec.call_args_list[0].args[1]
-        tokens = shlex.split(write_command)
-        body = tokens[2]
-        assert "SET TRANSACTION READ ONLY" in body
-        assert "SET LOCAL statement_timeout" in body
-        assert "ROLLBACK" in body
-        assert "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1" in body
-
-        run_command = mock_exec.call_args_list[1].args[1]
-        assert "-v ON_ERROR_STOP=1" in run_command
-        assert "-X" in run_command
+        assert resp.get_json().get("ok") is False

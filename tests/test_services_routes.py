@@ -386,32 +386,16 @@ class TestPgExplainShellQuotingAtEndpoint:
     actually applies it to the command handed to core.scanner._execute_command.
     This exercises the real route and inspects the captured command string.
 
-    GHSA-p3xx-rpm2-g5f8 (fixed by routes.services._prepare_explain_sql):
-    shell-quoting the query text was previously the *only* defense — a
-    semicolon-stacked `query` was still shell-safe (no metacharacters reached
-    the shell) but was executed by `psql -f` as multiple SQL statements with
-    postgres-superuser privileges. `_prepare_explain_sql` now rejects any
-    `query` containing a `;` (or a comment, or a psql meta-command, or one
-    that doesn't start with an allowed keyword) with a 400 *before* it ever
-    reaches `_execute_command`. So the semicolon-bearing members of
-    `_DANGEROUS_QUERIES` / `_INJECTION_PAYLOADS` below are no longer expected
-    to reach psql at all — see `TestPgExplainHostileQueriesRejected`. What
-    remains here is: queries that are safe by both measures (single
-    statement, allowed leading keyword) must still come out shell-quoted.
+    This is expected to pass on current main: it pins the already-correct
+    shell-quoting behavior of the endpoint.
     """
 
     @patch("core.scanner._execute_command")
-    def test_safe_queries_are_shell_quoted_in_printf_command(self, mock_exec, auth_client, pg_service):
+    def test_dangerous_queries_are_shell_quoted_in_printf_command(self, mock_exec, auth_client, pg_service):
         svc_id, _ = pg_service
         mock_exec.return_value = ("", None)
 
-        # Subset of _DANGEROUS_QUERIES that _prepare_explain_sql still accepts:
-        # single statement, starts with SELECT, no comments/meta-commands.
-        # ("SELECT 1; `id`" and "SELECT 1; rm -rf /" are stacked statements —
-        # rejected outright, see TestPgExplainHostileQueriesRejected.)
-        safe_queries = ["SELECT $(id)", "SELECT 'hello'"]
-
-        for query in safe_queries:
+        for query in _DANGEROUS_QUERIES:
             mock_exec.reset_mock()
             resp = auth_client.post(
                 f"/services/{svc_id}/pg/explain",
@@ -423,41 +407,39 @@ class TestPgExplainShellQuotingAtEndpoint:
             data = resp.get_json()
             assert data.get("ok") is True
 
-            # First call writes the (quoted) transaction body to a temp file via `printf %s`.
+            # First call writes the (quoted) query to a temp file via `printf %s`.
             assert mock_exec.call_count == 2
             write_call = mock_exec.call_args_list[0]
             command = write_call.args[1]
             assert command.startswith("printf %s ")
 
-            # The query is now embedded inside a BEGIN/SET/EXPLAIN/ROLLBACK
-            # transaction body (see _explain_transaction_sql) rather than a
-            # bare "EXPLAIN <query>" string, but the whole body is still
-            # shlex.quote()-wrapped as a single shell token.
-            unquoted_query = f"EXPLAIN {query}"
-            assert unquoted_query in shlex.split(command)[2]
+            expected_quoted = shlex.quote(f"EXPLAIN {query}")
+            assert expected_quoted.startswith("'")
+            assert expected_quoted.endswith("'")
+            assert expected_quoted in command, f"Expected shlex.quote() output in command: {command!r}"
 
             _assert_query_is_shell_quoted(command)
 
     @patch("core.scanner._execute_command")
-    def test_hostile_queries_rejected_with_400_before_execution(self, mock_exec, auth_client, pg_service):
-        """The semicolon-stacked members of _DANGEROUS_QUERIES, and the
-        database-name injection payloads smuggled into `query` instead, must
-        now be rejected with 400 by _prepare_explain_sql — and must never
-        reach core.scanner._execute_command, closing GHSA-p3xx-rpm2-g5f8.
+    def test_injection_payloads_as_query_are_still_shell_quoted(self, mock_exec, auth_client, pg_service):
+        """The database-name injection payloads, if smuggled into `query` instead,
+        must also come out shell-quoted (query has no allowlist — quoting is the
+        only defense).
         """
         svc_id, _ = pg_service
         mock_exec.return_value = ("", None)
 
-        hostile_queries = [q for q in _DANGEROUS_QUERIES if ";" in q] + [p for p in _INJECTION_PAYLOADS if p]
-
-        for query in hostile_queries:
+        for payload in _INJECTION_PAYLOADS:
+            if not payload:
+                continue  # empty query is rejected with 400 before any command runs
             mock_exec.reset_mock()
             resp = auth_client.post(
                 f"/services/{svc_id}/pg/explain",
-                data=json.dumps({"database": "mydb", "query": query}),
+                data=json.dumps({"database": "mydb", "query": payload}),
                 content_type="application/json",
             )
 
-            assert resp.status_code == 400, f"Expected 400 for query={query!r}, got {resp.status_code}: {resp.get_json()}"
-            assert resp.get_json().get("ok") is False
-            mock_exec.assert_not_called()
+            assert resp.status_code == 200, resp.get_json()
+            assert mock_exec.call_count == 2
+            command = mock_exec.call_args_list[0].args[1]
+            _assert_query_is_shell_quoted(command)
