@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask_login import UserMixin
 from flask_sqlalchemy import SQLAlchemy
@@ -172,12 +172,36 @@ class User(UserMixin, db.Model):
     timezone = db.Column(db.String(64), nullable=True)  # IANA tz name, e.g. "America/Chicago"; None = browser auto-detect
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     last_login_at = db.Column(db.DateTime, nullable=True)
+    # Stamp of the last password change.  JWT access/refresh tokens and the
+    # signed "remember me" marker each carry the stamp that was current when
+    # they were minted (see auth.jwt_auth.credential_epoch) and are refused once
+    # it no longer matches, so a self-service change or an admin reset signs the
+    # account out of the mobile API and of every remembered browser.
+    tokens_valid_after = db.Column(db.DateTime, nullable=True)
+    # Set on the bootstrap admin account; forces a redirect to /change-password
+    # until the initial random password has been rotated.
+    must_change_password = db.Column(db.Boolean, default=False, nullable=False)
 
     # Tags this user has access to
     allowed_tags = db.relationship("Tag", secondary=user_tags, backref="users")
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
+        # Invalidate every credential minted before this change.  Truncated to
+        # whole seconds so the integer stamp derived from it (auth.jwt_auth's
+        # ``credential_epoch``) is exact; JWTs and remember-me markers carry
+        # that stamp and are refused once it no longer matches.  The stamp is
+        # forced to advance so two changes inside the same second still produce
+        # different generations.
+        stamp = datetime.now(timezone.utc).replace(microsecond=0)
+        previous = self.tokens_valid_after
+        if previous is not None:
+            if previous.tzinfo is None:
+                previous = previous.replace(tzinfo=timezone.utc)
+            if stamp <= previous:
+                stamp = previous + timedelta(seconds=1)
+        self.tokens_valid_after = stamp
+        self.must_change_password = False
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)

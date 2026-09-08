@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("MSTDNCA_DATA_DIR", "/var/lib/mstdnca")
@@ -50,6 +51,17 @@ class Config:
     SESSION_COOKIE_SAMESITE = "Lax"
     _debug = os.environ.get("FLASK_DEBUG", "0") == "1"
     SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "0" if _debug else "1") == "1"
+
+    # "Remember me" cookie hardening.  Flask-Login's defaults are a 365-day
+    # cookie with Secure=False and no SameSite, which lets a stolen cookie
+    # restore a login for a year over plain HTTP and across sites.  Mirror the
+    # session cookie's transport flags and cut the lifetime to 14 days.  The
+    # cookie is additionally bound to a signed issued-at marker and a tracked
+    # UserSession row -- see routes/auth.py.
+    REMEMBER_COOKIE_HTTPONLY = True
+    REMEMBER_COOKIE_SAMESITE = "Lax"
+    REMEMBER_COOKIE_SECURE = SESSION_COOKIE_SECURE
+    REMEMBER_COOKIE_DURATION = timedelta(days=int(os.environ.get("REMEMBER_COOKIE_DAYS", "14")))
 
     # Default scan interval in hours
     SCAN_INTERVAL_HOURS = int(os.environ.get("SCAN_INTERVAL_HOURS", "6"))

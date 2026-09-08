@@ -251,7 +251,7 @@ CT ID: $CTID
 Hostname: $HOSTNAME
 Web UI: ${WEB_URL}
 App Username: admin
-App Password: generated on first start (see: journalctl -u mstdnca-proxmox-tool | grep -A3 'DEFAULT ADMIN')
+App Password: generated on first start (read with: cat /var/lib/mstdnca/initial-admin-password; must be changed at first login)
 App Directory: /opt/mstdnca
 Data Directory: /var/lib/mstdnca
 Provisioned: $(date '+%Y-%m-%d %H:%M:%S')
