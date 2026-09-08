@@ -15,7 +15,7 @@ cryptography==50.0.0
 APScheduler==3.11.3
 Werkzeug==3.1.8
 PyJWT[crypto]==2.13.0
-gunicorn==26.0.0
+gunicorn==26.2.0
 # gevent is the gunicorn worker class (see scripts/setup.sh ExecStart) and is
 # imported directly by seven route modules (routes/elk.py, ghost.py, jibri.py,
 # jitsi.py, mastodon.py, peertube.py, prometheus_app.py) to spawn background
