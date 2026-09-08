@@ -126,13 +126,7 @@
         return Math.floor(diff / 3600) + 'h ago';
     }
 
-    function escHtml(str) {
-        return String(str)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;');
-    }
+    // escHtml is provided by static/esc.js
 
     function refreshLiveSessions() {
         fetch('/api/collab/terminal-sessions', { cache: 'no-store' })

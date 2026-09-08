@@ -24,5 +24,4 @@ ignore = [
 ]
 
 [lint.per-file-ignores]
-"routes/terminal.py" = ["S602"]   # shell=True needed for SSH terminal
 "tests/**/*.py" = ["S101"]        # assert is standard pytest syntax

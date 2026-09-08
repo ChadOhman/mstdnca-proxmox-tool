@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import shlex
+import threading
 from datetime import datetime, timezone
 
 from clients.proxmox_api import ProxmoxClient
@@ -14,10 +15,22 @@ logger = logging.getLogger(__name__)
 # Valid systemd unit names: alphanumeric, hyphens, underscores, dots, @, *
 _VALID_UNIT_RE = re.compile(r'^[\w.\-@*]+$')
 
-# Pure-Python3 Redis client script for Sidekiq stats.
-# Uses only stdlib socket + urllib — no redis-cli required.
-# \\r\\n in this bytes literal → \r\n in the inner Python source → CR+LF at runtime.
-_SIDEKIQ_REDIS_SCRIPT = b"""\
+# Shared pure-Python3 Redis client prelude used by every inline Sidekiq/Redis
+# script below. Provides rc()/rr() (minimal RESP protocol client using only
+# stdlib socket -- no redis-cli required), .env.production credential
+# discovery, and the CONNECT/AUTH/SELECT handshake. Each script constant is
+# `_REDIS_PRELUDE + b"""..."""` with its own body appended inside the same
+# `try:` block opened here.
+#
+# \\r\\n in this bytes literal -> \r\n in the inner Python source -> CR+LF at runtime.
+#
+# NOTE: normalised during de-duplication (see PR description for the full list):
+#   - socket timeout is 8s for every script (previously 5s for the non-job-list
+#     scripts, 8s for the list/delete/retry-job scripts) -- strictly more lenient,
+#     never tighter, so it cannot newly time out a call that used to succeed.
+#   - the import line now always imports `json, time` even for scripts that don't
+#     use them (cheap stdlib imports; keeps the prelude byte-identical everywhere).
+_REDIS_PRELUDE = b"""\
 import socket, urllib.parse as up, json, time
 
 def rc(s, *args):
@@ -81,7 +94,7 @@ else:
 
 try:
     s = socket.socket()
-    s.settimeout(5)
+    s.settimeout(8)
     s.connect((host, port))
     bf = [b""]
     if pw:
@@ -89,6 +102,12 @@ try:
         rr(s, bf)
     rc(s, "SELECT", str(db))
     rr(s, bf)
+"""
+
+
+# Uses only stdlib socket + urllib — no redis-cli required.
+# \\r\\n in this bytes literal → \r\n in the inner Python source → CR+LF at runtime.
+_SIDEKIQ_REDIS_SCRIPT = _REDIS_PRELUDE + b"""\
     print("---queues---")
     rc(s, "SMEMBERS", "queues")
     qs = rr(s, bf) or []
@@ -180,79 +199,8 @@ except Exception as e:
 
 
 # Pure-Python3 Redis script to clear the Sidekiq dead queue.
-# Shares the same connection discovery logic as _SIDEKIQ_REDIS_SCRIPT.
-_SIDEKIQ_CLEAR_DEAD_SCRIPT = b"""\
-import socket, urllib.parse as up
-
-def rc(s, *args):
-    p = ["*{}\\r\\n".format(len(args))]
-    for a in args:
-        a = str(a)
-        p.append("${}\\r\\n{}\\r\\n".format(len(a.encode()), a))
-    s.sendall("".join(p).encode())
-
-def rr(s, bf):
-    while b"\\r\\n" not in bf[0]:
-        d = s.recv(65536)
-        if not d: break
-        bf[0] += d
-    if not bf[0]: return None
-    i = bf[0].index(b"\\r\\n")
-    ln = bf[0][:i].decode("utf-8", "replace")
-    bf[0] = bf[0][i+2:]
-    t, rest = ln[0], ln[1:]
-    if t == "+": return rest
-    if t == "-": return None
-    if t == ":": return int(rest) if rest.lstrip("-").isdigit() else 0
-    if t == "$":
-        n = int(rest)
-        if n < 0: return None
-        while len(bf[0]) < n + 2:
-            d = s.recv(65536)
-            if not d: break
-            bf[0] += d
-        v = bf[0][:n].decode("utf-8", "replace")
-        bf[0] = bf[0][n+2:]
-        return v
-    if t == "*":
-        n = int(rest)
-        return [rr(s, bf) for _ in range(max(n, 0))]
-    return None
-
-env = {}
-for f in ["/home/mastodon/live/.env.production", "/var/www/mastodon/.env.production", "/opt/mastodon/.env.production"]:
-    try:
-        for line in open(f):
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip().strip(chr(34)+chr(39))
-        break
-    except: pass
-
-url = env.get("REDIS_URL", "")
-if url:
-    u = up.urlparse(url)
-    host = u.hostname or "127.0.0.1"
-    port = u.port or 6379
-    pw = u.password or env.get("REDIS_PASSWORD", "")
-    db = int((u.path or "/0").lstrip("/") or "0")
-else:
-    host = env.get("REDIS_HOST", "127.0.0.1")
-    port = int(env.get("REDIS_PORT", "6379") or "6379")
-    pw = env.get("REDIS_PASSWORD", "")
-    db = int(env.get("REDIS_DB", "0") or "0")
-
-try:
-    s = socket.socket()
-    s.settimeout(5)
-    s.connect((host, port))
-    bf = [b""]
-    if pw:
-        rc(s, "AUTH", pw)
-        rr(s, bf)
-    rc(s, "SELECT", str(db))
-    rr(s, bf)
+# Shares the same connection discovery logic as _SIDEKIQ_REDIS_SCRIPT (via _REDIS_PRELUDE).
+_SIDEKIQ_CLEAR_DEAD_SCRIPT = _REDIS_PRELUDE + b"""\
     rc(s, "DEL", "dead")
     n = rr(s, bf)
     s.close()
@@ -284,79 +232,9 @@ def sidekiq_clear_dead(guest, service):
 
 # Pure-Python3 Redis script to retry all jobs in the Sidekiq dead queue.
 # Reads each job from the 'dead' sorted set, LPUSHes it back onto its queue,
-# then deletes the dead set. Shares connection discovery with the other scripts.
-_SIDEKIQ_RETRY_DEAD_SCRIPT = b"""\
-import socket, urllib.parse as up, json
-
-def rc(s, *args):
-    p = ["*{}\\r\\n".format(len(args))]
-    for a in args:
-        a = str(a)
-        p.append("${}\\r\\n{}\\r\\n".format(len(a.encode()), a))
-    s.sendall("".join(p).encode())
-
-def rr(s, bf):
-    while b"\\r\\n" not in bf[0]:
-        d = s.recv(65536)
-        if not d: break
-        bf[0] += d
-    if not bf[0]: return None
-    i = bf[0].index(b"\\r\\n")
-    ln = bf[0][:i].decode("utf-8", "replace")
-    bf[0] = bf[0][i+2:]
-    t, rest = ln[0], ln[1:]
-    if t == "+": return rest
-    if t == "-": return None
-    if t == ":": return int(rest) if rest.lstrip("-").isdigit() else 0
-    if t == "$":
-        n = int(rest)
-        if n < 0: return None
-        while len(bf[0]) < n + 2:
-            d = s.recv(65536)
-            if not d: break
-            bf[0] += d
-        v = bf[0][:n].decode("utf-8", "replace")
-        bf[0] = bf[0][n+2:]
-        return v
-    if t == "*":
-        n = int(rest)
-        return [rr(s, bf) for _ in range(max(n, 0))]
-    return None
-
-env = {}
-for f in ["/home/mastodon/live/.env.production", "/var/www/mastodon/.env.production", "/opt/mastodon/.env.production"]:
-    try:
-        for line in open(f):
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip().strip(chr(34)+chr(39))
-        break
-    except: pass
-
-url = env.get("REDIS_URL", "")
-if url:
-    u = up.urlparse(url)
-    host = u.hostname or "127.0.0.1"
-    port = u.port or 6379
-    pw = u.password or env.get("REDIS_PASSWORD", "")
-    db = int((u.path or "/0").lstrip("/") or "0")
-else:
-    host = env.get("REDIS_HOST", "127.0.0.1")
-    port = int(env.get("REDIS_PORT", "6379") or "6379")
-    pw = env.get("REDIS_PASSWORD", "")
-    db = int(env.get("REDIS_DB", "0") or "0")
-
-try:
-    s = socket.socket()
-    s.settimeout(5)
-    s.connect((host, port))
-    bf = [b""]
-    if pw:
-        rc(s, "AUTH", pw)
-        rr(s, bf)
-    rc(s, "SELECT", str(db))
-    rr(s, bf)
+# then deletes the dead set. Shares connection discovery with the other scripts
+# (via _REDIS_PRELUDE).
+_SIDEKIQ_RETRY_DEAD_SCRIPT = _REDIS_PRELUDE + b"""\
     rc(s, "ZRANGE", "dead", "0", "-1")
     jobs = rr(s, bf) or []
     count = 0
@@ -397,78 +275,7 @@ def sidekiq_retry_dead(guest, service):
 
 
 # Pure-Python3 Redis script to clear the Sidekiq retry queue.
-_SIDEKIQ_CLEAR_RETRY_SCRIPT = b"""\
-import socket, urllib.parse as up
-
-def rc(s, *args):
-    p = ["*{}\\r\\n".format(len(args))]
-    for a in args:
-        a = str(a)
-        p.append("${}\\r\\n{}\\r\\n".format(len(a.encode()), a))
-    s.sendall("".join(p).encode())
-
-def rr(s, bf):
-    while b"\\r\\n" not in bf[0]:
-        d = s.recv(65536)
-        if not d: break
-        bf[0] += d
-    if not bf[0]: return None
-    i = bf[0].index(b"\\r\\n")
-    ln = bf[0][:i].decode("utf-8", "replace")
-    bf[0] = bf[0][i+2:]
-    t, rest = ln[0], ln[1:]
-    if t == "+": return rest
-    if t == "-": return None
-    if t == ":": return int(rest) if rest.lstrip("-").isdigit() else 0
-    if t == "$":
-        n = int(rest)
-        if n < 0: return None
-        while len(bf[0]) < n + 2:
-            d = s.recv(65536)
-            if not d: break
-            bf[0] += d
-        v = bf[0][:n].decode("utf-8", "replace")
-        bf[0] = bf[0][n+2:]
-        return v
-    if t == "*":
-        n = int(rest)
-        return [rr(s, bf) for _ in range(max(n, 0))]
-    return None
-
-env = {}
-for f in ["/home/mastodon/live/.env.production", "/var/www/mastodon/.env.production", "/opt/mastodon/.env.production"]:
-    try:
-        for line in open(f):
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip().strip(chr(34)+chr(39))
-        break
-    except: pass
-
-url = env.get("REDIS_URL", "")
-if url:
-    u = up.urlparse(url)
-    host = u.hostname or "127.0.0.1"
-    port = u.port or 6379
-    pw = u.password or env.get("REDIS_PASSWORD", "")
-    db = int((u.path or "/0").lstrip("/") or "0")
-else:
-    host = env.get("REDIS_HOST", "127.0.0.1")
-    port = int(env.get("REDIS_PORT", "6379") or "6379")
-    pw = env.get("REDIS_PASSWORD", "")
-    db = int(env.get("REDIS_DB", "0") or "0")
-
-try:
-    s = socket.socket()
-    s.settimeout(5)
-    s.connect((host, port))
-    bf = [b""]
-    if pw:
-        rc(s, "AUTH", pw)
-        rr(s, bf)
-    rc(s, "SELECT", str(db))
-    rr(s, bf)
+_SIDEKIQ_CLEAR_RETRY_SCRIPT = _REDIS_PRELUDE + b"""\
     rc(s, "DEL", "retry")
     n = rr(s, bf)
     s.close()
@@ -499,78 +306,7 @@ def sidekiq_clear_retry(guest, service):
 
 
 # Pure-Python3 Redis script to immediately re-enqueue all jobs in the Sidekiq retry queue.
-_SIDEKIQ_RETRY_RETRY_SCRIPT = b"""\
-import socket, urllib.parse as up, json
-
-def rc(s, *args):
-    p = ["*{}\\r\\n".format(len(args))]
-    for a in args:
-        a = str(a)
-        p.append("${}\\r\\n{}\\r\\n".format(len(a.encode()), a))
-    s.sendall("".join(p).encode())
-
-def rr(s, bf):
-    while b"\\r\\n" not in bf[0]:
-        d = s.recv(65536)
-        if not d: break
-        bf[0] += d
-    if not bf[0]: return None
-    i = bf[0].index(b"\\r\\n")
-    ln = bf[0][:i].decode("utf-8", "replace")
-    bf[0] = bf[0][i+2:]
-    t, rest = ln[0], ln[1:]
-    if t == "+": return rest
-    if t == "-": return None
-    if t == ":": return int(rest) if rest.lstrip("-").isdigit() else 0
-    if t == "$":
-        n = int(rest)
-        if n < 0: return None
-        while len(bf[0]) < n + 2:
-            d = s.recv(65536)
-            if not d: break
-            bf[0] += d
-        v = bf[0][:n].decode("utf-8", "replace")
-        bf[0] = bf[0][n+2:]
-        return v
-    if t == "*":
-        n = int(rest)
-        return [rr(s, bf) for _ in range(max(n, 0))]
-    return None
-
-env = {}
-for f in ["/home/mastodon/live/.env.production", "/var/www/mastodon/.env.production", "/opt/mastodon/.env.production"]:
-    try:
-        for line in open(f):
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip().strip(chr(34)+chr(39))
-        break
-    except: pass
-
-url = env.get("REDIS_URL", "")
-if url:
-    u = up.urlparse(url)
-    host = u.hostname or "127.0.0.1"
-    port = u.port or 6379
-    pw = u.password or env.get("REDIS_PASSWORD", "")
-    db = int((u.path or "/0").lstrip("/") or "0")
-else:
-    host = env.get("REDIS_HOST", "127.0.0.1")
-    port = int(env.get("REDIS_PORT", "6379") or "6379")
-    pw = env.get("REDIS_PASSWORD", "")
-    db = int(env.get("REDIS_DB", "0") or "0")
-
-try:
-    s = socket.socket()
-    s.settimeout(5)
-    s.connect((host, port))
-    bf = [b""]
-    if pw:
-        rc(s, "AUTH", pw)
-        rr(s, bf)
-    rc(s, "SELECT", str(db))
-    rr(s, bf)
+_SIDEKIQ_RETRY_RETRY_SCRIPT = _REDIS_PRELUDE + b"""\
     rc(s, "ZRANGE", "retry", "0", "-1")
     jobs = rr(s, bf) or []
     count = 0
@@ -634,78 +370,7 @@ def _format_elapsed(secs):
 
 # Pure-Python3 Redis script template to list jobs from a Sidekiq sorted-set queue.
 # Placeholders __QUEUEKEY__, __OFFSET__, __ENDIDX__ are replaced at call time via bytes.replace().
-_SIDEKIQ_LIST_JOBS_TEMPLATE = b"""\
-import socket, urllib.parse as up, json
-
-def rc(s, *args):
-    p = ["*{}\\r\\n".format(len(args))]
-    for a in args:
-        a = str(a)
-        p.append("${}\\r\\n{}\\r\\n".format(len(a.encode()), a))
-    s.sendall("".join(p).encode())
-
-def rr(s, bf):
-    while b"\\r\\n" not in bf[0]:
-        d = s.recv(65536)
-        if not d: break
-        bf[0] += d
-    if not bf[0]: return None
-    i = bf[0].index(b"\\r\\n")
-    ln = bf[0][:i].decode("utf-8", "replace")
-    bf[0] = bf[0][i+2:]
-    t, rest = ln[0], ln[1:]
-    if t == "+": return rest
-    if t == "-": return None
-    if t == ":": return int(rest) if rest.lstrip("-").isdigit() else 0
-    if t == "$":
-        n = int(rest)
-        if n < 0: return None
-        while len(bf[0]) < n + 2:
-            d = s.recv(65536)
-            if not d: break
-            bf[0] += d
-        v = bf[0][:n].decode("utf-8", "replace")
-        bf[0] = bf[0][n+2:]
-        return v
-    if t == "*":
-        n = int(rest)
-        return [rr(s, bf) for _ in range(max(n, 0))]
-    return None
-
-env = {}
-for f in ["/home/mastodon/live/.env.production", "/var/www/mastodon/.env.production", "/opt/mastodon/.env.production"]:
-    try:
-        for line in open(f):
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip().strip(chr(34)+chr(39))
-        break
-    except: pass
-
-url = env.get("REDIS_URL", "")
-if url:
-    u = up.urlparse(url)
-    host = u.hostname or "127.0.0.1"
-    port = u.port or 6379
-    pw = u.password or env.get("REDIS_PASSWORD", "")
-    db = int((u.path or "/0").lstrip("/") or "0")
-else:
-    host = env.get("REDIS_HOST", "127.0.0.1")
-    port = int(env.get("REDIS_PORT", "6379") or "6379")
-    pw = env.get("REDIS_PASSWORD", "")
-    db = int(env.get("REDIS_DB", "0") or "0")
-
-try:
-    s = socket.socket()
-    s.settimeout(8)
-    s.connect((host, port))
-    bf = [b""]
-    if pw:
-        rc(s, "AUTH", pw)
-        rr(s, bf)
-    rc(s, "SELECT", str(db))
-    rr(s, bf)
+_SIDEKIQ_LIST_JOBS_TEMPLATE = _REDIS_PRELUDE + b"""\
     q_key = __QUEUEKEY__
     offset = __OFFSET__
     end = __ENDIDX__
@@ -758,78 +423,7 @@ def sidekiq_list_jobs(guest, service, queue_type, offset=0, limit=25):
 # Pure-Python3 Redis script template to delete a single Sidekiq job by JID.
 # Iterates the sorted set via ZSCAN to find and ZREM the matching member.
 # Placeholders __QUEUEKEY__ and __JID__ are replaced at call time.
-_SIDEKIQ_DELETE_JOB_TEMPLATE = b"""\
-import socket, urllib.parse as up, json
-
-def rc(s, *args):
-    p = ["*{}\\r\\n".format(len(args))]
-    for a in args:
-        a = str(a)
-        p.append("${}\\r\\n{}\\r\\n".format(len(a.encode()), a))
-    s.sendall("".join(p).encode())
-
-def rr(s, bf):
-    while b"\\r\\n" not in bf[0]:
-        d = s.recv(65536)
-        if not d: break
-        bf[0] += d
-    if not bf[0]: return None
-    i = bf[0].index(b"\\r\\n")
-    ln = bf[0][:i].decode("utf-8", "replace")
-    bf[0] = bf[0][i+2:]
-    t, rest = ln[0], ln[1:]
-    if t == "+": return rest
-    if t == "-": return None
-    if t == ":": return int(rest) if rest.lstrip("-").isdigit() else 0
-    if t == "$":
-        n = int(rest)
-        if n < 0: return None
-        while len(bf[0]) < n + 2:
-            d = s.recv(65536)
-            if not d: break
-            bf[0] += d
-        v = bf[0][:n].decode("utf-8", "replace")
-        bf[0] = bf[0][n+2:]
-        return v
-    if t == "*":
-        n = int(rest)
-        return [rr(s, bf) for _ in range(max(n, 0))]
-    return None
-
-env = {}
-for f in ["/home/mastodon/live/.env.production", "/var/www/mastodon/.env.production", "/opt/mastodon/.env.production"]:
-    try:
-        for line in open(f):
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip().strip(chr(34)+chr(39))
-        break
-    except: pass
-
-url = env.get("REDIS_URL", "")
-if url:
-    u = up.urlparse(url)
-    host = u.hostname or "127.0.0.1"
-    port = u.port or 6379
-    pw = u.password or env.get("REDIS_PASSWORD", "")
-    db = int((u.path or "/0").lstrip("/") or "0")
-else:
-    host = env.get("REDIS_HOST", "127.0.0.1")
-    port = int(env.get("REDIS_PORT", "6379") or "6379")
-    pw = env.get("REDIS_PASSWORD", "")
-    db = int(env.get("REDIS_DB", "0") or "0")
-
-try:
-    s = socket.socket()
-    s.settimeout(8)
-    s.connect((host, port))
-    bf = [b""]
-    if pw:
-        rc(s, "AUTH", pw)
-        rr(s, bf)
-    rc(s, "SELECT", str(db))
-    rr(s, bf)
+_SIDEKIQ_DELETE_JOB_TEMPLATE = _REDIS_PRELUDE + b"""\
     q_key = __QUEUEKEY__
     target_jid = __JID__
     cursor = "0"
@@ -888,78 +482,7 @@ def sidekiq_delete_job(guest, service, queue_type, jid):
 # Pure-Python3 Redis script template to retry (re-enqueue) a single Sidekiq job by JID.
 # Finds the job via ZSCAN, LPUSHes it back to its queue, then ZREMs it from the set.
 # Placeholders __QUEUEKEY__ and __JID__ are replaced at call time.
-_SIDEKIQ_RETRY_JOB_TEMPLATE = b"""\
-import socket, urllib.parse as up, json
-
-def rc(s, *args):
-    p = ["*{}\\r\\n".format(len(args))]
-    for a in args:
-        a = str(a)
-        p.append("${}\\r\\n{}\\r\\n".format(len(a.encode()), a))
-    s.sendall("".join(p).encode())
-
-def rr(s, bf):
-    while b"\\r\\n" not in bf[0]:
-        d = s.recv(65536)
-        if not d: break
-        bf[0] += d
-    if not bf[0]: return None
-    i = bf[0].index(b"\\r\\n")
-    ln = bf[0][:i].decode("utf-8", "replace")
-    bf[0] = bf[0][i+2:]
-    t, rest = ln[0], ln[1:]
-    if t == "+": return rest
-    if t == "-": return None
-    if t == ":": return int(rest) if rest.lstrip("-").isdigit() else 0
-    if t == "$":
-        n = int(rest)
-        if n < 0: return None
-        while len(bf[0]) < n + 2:
-            d = s.recv(65536)
-            if not d: break
-            bf[0] += d
-        v = bf[0][:n].decode("utf-8", "replace")
-        bf[0] = bf[0][n+2:]
-        return v
-    if t == "*":
-        n = int(rest)
-        return [rr(s, bf) for _ in range(max(n, 0))]
-    return None
-
-env = {}
-for f in ["/home/mastodon/live/.env.production", "/var/www/mastodon/.env.production", "/opt/mastodon/.env.production"]:
-    try:
-        for line in open(f):
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip().strip(chr(34)+chr(39))
-        break
-    except: pass
-
-url = env.get("REDIS_URL", "")
-if url:
-    u = up.urlparse(url)
-    host = u.hostname or "127.0.0.1"
-    port = u.port or 6379
-    pw = u.password or env.get("REDIS_PASSWORD", "")
-    db = int((u.path or "/0").lstrip("/") or "0")
-else:
-    host = env.get("REDIS_HOST", "127.0.0.1")
-    port = int(env.get("REDIS_PORT", "6379") or "6379")
-    pw = env.get("REDIS_PASSWORD", "")
-    db = int(env.get("REDIS_DB", "0") or "0")
-
-try:
-    s = socket.socket()
-    s.settimeout(8)
-    s.connect((host, port))
-    bf = [b""]
-    if pw:
-        rc(s, "AUTH", pw)
-        rr(s, bf)
-    rc(s, "SELECT", str(db))
-    rr(s, bf)
+_SIDEKIQ_RETRY_JOB_TEMPLATE = _REDIS_PRELUDE + b"""\
     q_key = __QUEUEKEY__
     target_jid = __JID__
     cursor = "0"
@@ -1064,9 +587,21 @@ def parse_upgradable(output):
 
 
 def determine_severity(package_name, security_output):
-    """Check if a package appears in security upgrade output."""
-    if security_output and package_name in security_output:
-        return "critical"
+    """Check if a package appears in security upgrade output.
+
+    Matches the package name as a whole token of the parsed package field on
+    each line, not a substring of the whole blob -- avoids false "critical"
+    hits where one package's name is a substring of another's (e.g. "ssl"
+    inside "openssl"). `apt-get -s upgrade` simulation lines look like:
+        Inst <pkg> [<old-ver>] (<new-ver> <origin> [<arch>])
+        Conf <pkg> (<new-ver> <origin> [<arch>])
+    """
+    if not security_output:
+        return "normal"
+    for line in security_output.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ("Inst", "Conf") and parts[1] == package_name:
+            return "critical"
     return "normal"
 
 
@@ -2976,8 +2511,39 @@ def check_reboot_required(guest):
         db.session.commit()
 
 
+# Per-guest locks so a user-triggered scan (routes/api.py's /scan/<id>, run in
+# a background thread) and the scheduled scan_all_guests() run can never race
+# on the same guest -- both ultimately call scan_guest(). Locks are created
+# lazily and kept for the process lifetime (one small Lock object per guest
+# ever scanned); _guest_scan_locks_guard only protects dict access, not the
+# scan itself.
+_guest_scan_locks = {}
+_guest_scan_locks_guard = threading.Lock()
+
+
+def _get_guest_scan_lock(guest_id):
+    with _guest_scan_locks_guard:
+        lock = _guest_scan_locks.get(guest_id)
+        if lock is None:
+            lock = threading.Lock()
+            _guest_scan_locks[guest_id] = lock
+        return lock
+
+
 def scan_guest(guest):
-    """Scan a single guest for updates. Returns ScanResult."""
+    """Scan a single guest for updates. Returns ScanResult.
+
+    Serialised per-guest-id: if this guest is already being scanned (e.g. the
+    scheduled scan_all_guests() run reached it, or another request is already
+    scanning it), this call blocks until that scan finishes rather than
+    racing it with a second concurrent SSH session and a second set of DB
+    writes for the same guest.
+    """
+    with _get_guest_scan_lock(guest.id):
+        return _scan_guest_locked(guest)
+
+
+def _scan_guest_locked(guest):
     logger.info(f"Scanning {guest.name} ({guest.guest_type})...")
 
     upgradable_output, security_output, error = _execute_on_guest(guest)
@@ -2998,6 +2564,14 @@ def scan_guest(guest):
         guest.last_scan = now
         db.session.add(result)
         db.session.commit()
+
+        # Push notifications for mobile app
+        try:
+            from core.push_notifier import dispatch_push_alerts
+            dispatch_push_alerts(guest, "guest_error", {"error": error})
+        except Exception as e:
+            logger.debug(f"Push notification dispatch failed for {guest.name}: {e}")
+
         return result
 
     # Parse packages
@@ -3058,8 +2632,6 @@ def scan_guest(guest):
             dispatch_push_alerts(guest, "security_update", {"count": security_count})
         if guest.reboot_required:
             dispatch_push_alerts(guest, "reboot_required")
-        if guest.status == "error":
-            dispatch_push_alerts(guest, "guest_error", {"error": error or "scan failed"})
     except Exception as e:
         logger.debug(f"Push notification dispatch failed for {guest.name}: {e}")
 

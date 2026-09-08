@@ -3,6 +3,7 @@
 import json
 import logging
 import threading as _threading
+from collections import deque
 from datetime import datetime
 
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
@@ -15,11 +16,31 @@ logger = logging.getLogger(__name__)
 
 bp = Blueprint("moderation", __name__)
 
+# Cap the in-memory log so a very chatty/long-running check can't grow this
+# unboundedly. "log_total" is a monotonically increasing count of every line
+# ever appended for the current run (independent of how many the deque has
+# room for), so /status's offset-based polling still lines up correctly even
+# after old entries have been evicted from the deque.
+_MODERATION_LOG_MAXLEN = 2000
+
 # In-memory job state — mirrors the pattern from routes/peertube.py.
 # ``result`` holds the full (email-bearing) result of the most recent run so the
 # live admin view can render emails that are deliberately NOT persisted to the
 # Setting store (see core.moderation._scrub_result_for_storage).
-_moderation_job = {"running": False, "success": None, "log": [], "result": None}
+_moderation_job = {
+    "running": False,
+    "success": None,
+    "log": deque(maxlen=_MODERATION_LOG_MAXLEN),
+    "log_total": 0,
+    "result": None,
+}
+
+
+def _append_moderation_log(msg):
+    """Append a line to the capped in-memory log and bump the running total
+    used for offset-based /status polling."""
+    _moderation_job["log"].append(msg)
+    _moderation_job["log_total"] += 1
 
 # Guards the check-then-set on _moderation_job["running"] (TOCTOU): without it,
 # two concurrent /run requests could both observe running=False and start.
@@ -114,21 +135,20 @@ def run():
             return redirect(url_for("moderation.index"))
         _moderation_job["running"] = True
         _moderation_job["success"] = None
-        _moderation_job["log"] = []
+        _moderation_job["log"] = deque(maxlen=_MODERATION_LOG_MAXLEN)
+        _moderation_job["log_total"] = 0
 
     def _worker():
         with app.app_context():
             try:
                 from core.moderation import run_moderation_check
-                ok, result = run_moderation_check(
-                    log_callback=lambda msg: _moderation_job["log"].append(msg)
-                )
+                ok, result = run_moderation_check(log_callback=_append_moderation_log)
                 _moderation_job["success"] = ok
                 # Retain the full (email-bearing) result in memory only.
                 _moderation_job["result"] = result if ok else None
             except Exception as exc:
                 logger.exception("Moderation check failed")
-                _moderation_job["log"].append(f"ERROR: {exc}")
+                _append_moderation_log(f"ERROR: {exc}")
                 _moderation_job["success"] = False
             finally:
                 _moderation_job["running"] = False
@@ -142,8 +162,24 @@ def run():
 
 @bp.route("/status")
 def status():
+    """JSON job status. Pass ?offset=<log_offset from a previous response> to
+    receive only log lines appended since then, instead of re-serialising the
+    whole (capped) log on every poll.
+    """
+    offset = request.args.get("offset", type=int, default=0)
+    if offset < 0:
+        offset = 0
+
+    log_total = _moderation_job["log_total"]
+    log_list = list(_moderation_job["log"])
+    # Absolute index of log_list[0] -- entries before this have been evicted
+    # by the deque's maxlen and can no longer be returned.
+    first_index = log_total - len(log_list)
+    new_lines = log_list if offset < first_index else log_list[offset - first_index:]
+
     return jsonify({
         "running": _moderation_job["running"],
         "success": _moderation_job["success"],
-        "log": _moderation_job["log"],
+        "log": new_lines,
+        "log_offset": log_total,
     })

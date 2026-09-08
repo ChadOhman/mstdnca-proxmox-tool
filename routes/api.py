@@ -10,7 +10,7 @@ from flask_login import current_user, login_required
 
 from auth.audit import log_action
 from core.notifier import send_update_notification
-from core.scanner import scan_all_guests, scan_guest
+from core.scanner import scan_guest
 from models import Guest, ProxmoxHost, Setting, Tag, db
 
 logger = logging.getLogger(__name__)
@@ -272,6 +272,88 @@ def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None)
             job.finish(False)
 
 
+# ---------------------------------------------------------------------------
+# Guest scanning — backgrounded so a large fleet scan doesn't block the
+# request thread behind Cloudflare's ~100s timeout. Mirrors the UpdateJob /
+# _update_jobs / _bulk_update pattern above: a per-guest job dict for
+# /scan/<id>, an aggregate dict for /scan-all. scan_guest() itself (in
+# core/scanner.py) is locked per-guest-id, so a single-guest scan and the
+# scheduled/bulk scan can never run concurrently for the same guest.
+# ---------------------------------------------------------------------------
+
+_scan_jobs = {}
+_scan_jobs_lock = threading.Lock()
+
+_bulk_scan = {
+    "running": False,
+    "started_at": None,
+    "total": 0,
+    "done": 0,
+    "items": [],  # list of {"guest_id", "name", "state", "reason", "log"}
+}
+_bulk_scan_lock = threading.Lock()
+
+
+class ScanJob:
+    """Tracks a background single-guest scan."""
+
+    def __init__(self, guest_id, guest_name):
+        self.guest_id = guest_id
+        self.guest_name = guest_name
+        self.running = True
+        self.success = None  # None=in progress, True=success, False=error
+        self.total_updates = 0
+        self.security_updates = 0
+        self.error_message = None
+        self.started_at = datetime.now(timezone.utc)
+        self._lock = threading.Lock()
+
+    def finish(self, result):
+        with self._lock:
+            self.running = False
+            if result is None:
+                self.success = False
+                self.error_message = "Unexpected error during scan"
+            else:
+                self.success = result.status == "success"
+                self.total_updates = result.total_updates
+                self.security_updates = result.security_updates
+                self.error_message = result.error_message
+
+    def to_dict(self):
+        with self._lock:
+            return {
+                "guest_id": self.guest_id,
+                "guest_name": self.guest_name,
+                "running": self.running,
+                "success": self.success,
+                "total_updates": self.total_updates,
+                "security_updates": self.security_updates,
+                "error_message": self.error_message,
+                "started_at": self.started_at.isoformat(),
+            }
+
+
+def _run_scan_background(app, guest_id):
+    """Run a single-guest scan in a background thread."""
+    with app.app_context():
+        job = _scan_jobs.get(guest_id)
+        if not job:
+            return
+
+        guest = Guest.query.get(guest_id)
+        if not guest:
+            job.finish(None)
+            return
+
+        try:
+            result = scan_guest(guest)
+            job.finish(result)
+        except Exception as e:
+            logger.error(f"Background scan error for guest {guest_id}: {e}", exc_info=True)
+            job.finish(None)
+
+
 @bp.route("/scan/<int:guest_id>", methods=["POST"])
 @login_required
 def scan_single(guest_id):
@@ -282,19 +364,104 @@ def scan_single(guest_id):
         flash("You don't have permission to scan this guest.", "error")
         return redirect(url_for("guests.index"))
 
-    result = scan_guest(guest)
-    if result.status == "success":
-        log_action("guest_scan", "guest", resource_id=guest.id, resource_name=guest.name,
-                   details={"updates_found": result.total_updates})
-        db.session.commit()
-        flash(f"Scan complete for '{guest.name}': {result.total_updates} update(s) found.", "success")
-    else:
-        flash(f"Scan failed for '{guest.name}': {result.error_message}", "error")
+    with _scan_jobs_lock:
+        existing = _scan_jobs.get(guest_id)
+        if existing and existing.running:
+            flash(f"A scan is already running for '{guest.name}'.", "info")
+        else:
+            job = ScanJob(guest_id, guest.name)
+            _scan_jobs[guest_id] = job
+
+            # log_action() needs current_user/request context, so it must run
+            # here (not in the background thread, which has neither).
+            log_action("guest_scan", "guest", resource_id=guest.id, resource_name=guest.name)
+            db.session.commit()
+
+            from flask import current_app
+            app = current_app._get_current_object()
+            thread = threading.Thread(target=_run_scan_background, args=(app, guest_id), daemon=True)
+            thread.start()
+            flash(f"Scan started for '{guest.name}'.", "info")
 
     referrer = request.referrer
     if referrer and f"/guests/{guest_id}" in referrer:
         return redirect(url_for("guests.detail", guest_id=guest_id))
     return redirect(url_for("dashboard.index"))
+
+
+@bp.route("/scan/<int:guest_id>/status")
+@login_required
+def scan_status(guest_id):
+    guest = Guest.query.get_or_404(guest_id)
+    if not current_user.is_admin and not current_user.can_access_guest(guest):
+        return jsonify({"error": "forbidden"}), 403
+
+    job = _scan_jobs.get(guest_id)
+    if not job:
+        return jsonify({"running": False, "success": None})
+    return jsonify(job.to_dict())
+
+
+def _run_bulk_scan(app, guest_ids):
+    """Orchestrator thread: scan each guest sequentially, updating _bulk_scan
+    progress as it goes. scan_guest() is locked per-guest-id (see
+    core/scanner.py), so this can safely run alongside a concurrent
+    single-guest /scan/<id> request without double-scanning the same guest.
+    """
+    with app.app_context():
+        results = []
+        for guest_id in guest_ids:
+            with _bulk_scan_lock:
+                item = next((i for i in _bulk_scan["items"] if i["guest_id"] == guest_id), None)
+                if item:
+                    item["state"] = "running"
+
+            guest = Guest.query.get(guest_id)
+            if not guest:
+                with _bulk_scan_lock:
+                    if item:
+                        item["state"] = "skipped"
+                        item["reason"] = "Guest not found"
+                    _bulk_scan["done"] += 1
+                continue
+
+            try:
+                result = scan_guest(guest)
+                results.append(result)
+                if result.status == "success":
+                    db.session.commit()
+                    with _bulk_scan_lock:
+                        if item:
+                            item["state"] = "success"
+                            item["log"] = (f"{result.total_updates} update(s) found "
+                                           f"({result.security_updates} security).")
+                else:
+                    with _bulk_scan_lock:
+                        if item:
+                            item["state"] = "failed"
+                            item["reason"] = result.error_message
+                            item["log"] = result.error_message or ""
+            except Exception as e:
+                logger.error("Bulk scan error for guest %s: %s", guest_id, e, exc_info=True)
+                with _bulk_scan_lock:
+                    if item:
+                        item["state"] = "failed"
+                        item["reason"] = str(e)
+
+            with _bulk_scan_lock:
+                _bulk_scan["done"] += 1
+
+        try:
+            send_update_notification(results)
+        except Exception as e:
+            logger.error("send_update_notification failed after bulk scan: %s", e, exc_info=True)
+
+        # NOTE: log_action() needs current_user/request context, which this
+        # background thread has neither -- the "scan requested" audit row is
+        # logged synchronously in scan_all() below, before this thread starts.
+
+        with _bulk_scan_lock:
+            _bulk_scan["running"] = False
 
 
 @bp.route("/scan-all", methods=["POST"])
@@ -304,22 +471,75 @@ def scan_all():
         flash("Only admins can scan all guests.", "error")
         return redirect(url_for("dashboard.index"))
 
-    results = scan_all_guests()
-    total = len(results)
-    errors = sum(1 for r in results if r.status == "error")
+    with _bulk_scan_lock:
+        if _bulk_scan.get("running"):
+            flash("A guest scan is already running.", "warning")
+            return redirect(url_for("api.scan_all_progress"))
 
-    send_update_notification(results)
+    # Same target set core.scanner.scan_all_guests() used to select.
+    targets = Guest.query.filter_by(enabled=True, power_state="running").all()
+    if not targets:
+        flash("No running guests are available to scan.", "info")
+        return redirect(url_for("dashboard.index"))
 
     log_action("guest_scan_all", "system", resource_name="all guests",
-               details={"total": total, "errors": errors})
+               details={"targets": len(targets)})
     db.session.commit()
 
-    if errors:
-        flash(f"Scan complete: {total} guest(s) scanned, {errors} error(s).", "warning")
-    else:
-        flash(f"Scan complete: {total} guest(s) scanned successfully.", "success")
+    items = [{"guest_id": g.id, "name": g.name, "state": "pending", "reason": None, "log": ""} for g in targets]
+    guest_ids = [g.id for g in targets]
+    with _bulk_scan_lock:
+        _bulk_scan["running"] = True
+        _bulk_scan["started_at"] = datetime.now(timezone.utc).isoformat()
+        _bulk_scan["total"] = len(items)
+        _bulk_scan["done"] = 0
+        _bulk_scan["items"] = items
 
-    return redirect(url_for("dashboard.index"))
+    from flask import current_app
+    app = current_app._get_current_object()
+    thread = threading.Thread(target=_run_bulk_scan, args=(app, guest_ids), daemon=True)
+    thread.start()
+
+    flash(f"Started scanning {len(targets)} guest(s).", "info")
+    return redirect(url_for("api.scan_all_progress"))
+
+
+@bp.route("/scan-all/progress")
+@login_required
+def scan_all_progress():
+    """Render the aggregate bulk-scan progress page for guests."""
+    if not current_user.can_manage_guests:
+        flash("You don't have permission to view this page.", "error")
+        return redirect(url_for("dashboard.index"))
+    return render_template(
+        "bulk_update_progress.html",
+        page_title="Scanning All Guests",
+        heading="Scanning All Guests",
+        status_url=url_for("api.scan_all_status"),
+        back_url=url_for("dashboard.index"),
+        back_label="Back to Dashboard",
+    )
+
+
+@bp.route("/scan-all/status")
+@login_required
+def scan_all_status():
+    """JSON: aggregate state of the bulk guest scan."""
+    if not current_user.can_manage_guests:
+        return jsonify({"error": "forbidden"}), 403
+
+    with _bulk_scan_lock:
+        running = _bulk_scan.get("running", False)
+        total = _bulk_scan.get("total", 0)
+        done = _bulk_scan.get("done", 0)
+        items = [dict(i) for i in _bulk_scan.get("items", [])]
+
+    items_out = [
+        {"id": i["guest_id"], "name": i["name"], "state": i["state"],
+         "reason": i.get("reason"), "log": i.get("log", "")}
+        for i in items
+    ]
+    return jsonify({"running": running, "total": total, "done": done, "items": items_out})
 
 
 @bp.route("/apply/<int:guest_id>", methods=["POST"])

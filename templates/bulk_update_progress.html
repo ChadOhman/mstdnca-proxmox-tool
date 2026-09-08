@@ -55,12 +55,6 @@
         skipped: { cls: 'bg-warning text-dark', label: 'Skipped' },
     };
 
-    function escapeHtml(s) {
-        return (s || '').replace(/[&<>"']/g, c => ({
-            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-        }[c]));
-    }
-
     function renderItems(items) {
         // Build once, then update in place to preserve <details> open state and scroll.
         items.forEach(item => {

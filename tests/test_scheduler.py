@@ -1574,6 +1574,100 @@ class TestRunDiscovery:
         # ProxmoxClient was attempted once per host
         assert mock_proxmox_api.ProxmoxClient.call_count == 3
 
+    @staticmethod
+    def _base_mocks(node_guests, complete=True):
+        """Build the standard mock set for a single-host _run_discovery run.
+
+        ``node_guests`` / ``complete`` control what the mocked ProxmoxClient's
+        get_node_guests(with_completeness=True) returns.
+        """
+        mock_host = MagicMock()
+        mock_host.name = "pve01"
+        mock_host.id = 1
+
+        mock_setting = MagicMock()
+        mock_setting.get.return_value = "true"
+
+        mock_host_model = MagicMock()
+        mock_host_model.query.all.return_value = [mock_host]
+
+        mock_guest_model = MagicMock()
+        # Default: no existing guests match by (host, vmid), and no VMID collision
+        # on another host -> each reported guest is treated as newly added.
+        mock_guest_model.query.filter_by.return_value.first.return_value = None
+        mock_guest_model.query.filter.return_value.first.return_value = None
+
+        mock_tag_model = MagicMock()
+        mock_tag_model.query.filter.return_value.all.return_value = []
+
+        mock_db = MagicMock()
+
+        mock_client = MagicMock()
+        mock_client.get_local_node_name.return_value = "node1"
+        mock_client.get_node_guests.return_value = (node_guests, complete)
+        mock_client.get_all_guests.return_value = (node_guests, complete)
+        mock_client.get_replication_map.return_value = {}
+        mock_client.get_guest_ip.return_value = None
+        mock_client.get_guest_mac.return_value = None
+
+        mock_proxmox_api = MagicMock()
+        mock_proxmox_api.ProxmoxClient.return_value = mock_client
+
+        mocks = {
+            "models": MagicMock(
+                Setting=mock_setting, ProxmoxHost=mock_host_model, Guest=mock_guest_model,
+                Tag=mock_tag_model, db=mock_db,
+            ),
+            "clients.proxmox_api": mock_proxmox_api,
+        }
+        return mock_host, mock_guest_model, mock_db, mocks
+
+    def test_empty_node_list_skips_stale_deletion(self):
+        """An empty guest list must never be treated as 'delete everything'."""
+        from core.scheduler import _run_discovery
+
+        app = _make_app()
+        _host, _mock_guest_model, mock_db, mocks = self._base_mocks([], complete=True)
+
+        with _SysModulesPatch(mocks):
+            _run_discovery(app)
+
+        mock_db.session.delete.assert_not_called()
+
+    def test_partial_failure_skips_stale_deletion(self):
+        """qemu.get() succeeding while lxc.get() fails must not delete the missing CTs."""
+        from core.scheduler import _run_discovery
+
+        app = _make_app()
+        node_guests = [
+            {"vmid": 1, "name": "vm1", "type": "vm", "status": "stopped", "node": "node1", "tags": ""},
+        ]
+        _host, _mock_guest_model, mock_db, mocks = self._base_mocks(node_guests, complete=False)
+
+        with _SysModulesPatch(mocks):
+            _run_discovery(app)
+
+        mock_db.session.delete.assert_not_called()
+
+    def test_normal_case_still_removes_truly_stale_guest(self):
+        """Regression guard: a complete, non-empty inventory still prunes stale guests."""
+        from core.scheduler import _run_discovery
+
+        app = _make_app()
+        node_guests = [
+            {"vmid": 1, "name": "vm1", "type": "vm", "status": "stopped", "node": "node1", "tags": ""},
+        ]
+        _host, mock_guest_model, mock_db, mocks = self._base_mocks(node_guests, complete=True)
+
+        stale_guest = MagicMock()
+        mock_guest_model.query.filter.return_value.all.return_value = [stale_guest]
+        mock_guest_model.query.filter.return_value.count.return_value = 5
+
+        with _SysModulesPatch(mocks):
+            _run_discovery(app)
+
+        mock_db.session.delete.assert_called_once_with(stale_guest)
+
 
 # ---------------------------------------------------------------------------
 # _persist_host_packages — DB persistence of APT update packages

@@ -3,6 +3,11 @@
 Covers endpoints that do not require Proxmox / SSH connectivity:
 - /api/apply/<id>/status        — job status JSON (no job -> safe empty response)
 - /api/apply/<id>/cancel        — POST cancel (no job -> error JSON, no SSH)
+- /api/scan/<id>                — POST starts a backgrounded scan (no sync SSH)
+- /api/scan/<id>/status         — scan job status JSON (no job -> safe empty response)
+- /api/scan-all                 — POST starts a backgrounded bulk scan
+- /api/scan-all/progress        — bulk-scan progress page
+- /api/scan-all/status          — bulk-scan status JSON
 - /api/task/<id>/<type>/status  — proxmox job status JSON
 - /api/task/<id>/<type>/cancel  — POST cancel (no job -> error JSON, no SSH)
 - /api/collab/presence          — POST heartbeat (uses in-process collab_hub)
@@ -11,13 +16,20 @@ Covers endpoints that do not require Proxmox / SSH connectivity:
 - /api/collab/cursors           — GET cursors for a page
 - Authorization: unauthenticated requests redirect / return 401/302
 """
+import time
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from models import Guest, UpdatePackage, db
 from routes.api import (
     ProxmoxJob,
+    ScanJob,
     UpdateJob,
+    _bulk_scan,
+    _bulk_scan_lock,
     _proxmox_jobs,
+    _scan_jobs,
     _update_jobs,
 )
 
@@ -292,6 +304,212 @@ class TestUpdateCancel:
             assert resp.content_type.startswith("application/json")
         finally:
             _delete_guest(app, guest_id)
+
+
+def _wait_until(predicate, timeout=2.0, interval=0.02):
+    """Poll `predicate()` until it returns truthy or `timeout` elapses."""
+    deadline = time.monotonic() + timeout
+    result = predicate()
+    while not result and time.monotonic() < deadline:
+        time.sleep(interval)
+        result = predicate()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# /api/scan/<guest_id> and /api/scan/<guest_id>/status
+#
+# scan_single() no longer scans synchronously in the request thread (a scan
+# can be slow enough to exceed a front-door timeout) -- it now starts a
+# background job, same pattern as /api/apply/<id>. These tests patch
+# routes.api.scan_guest so no real SSH/Proxmox call happens.
+# ---------------------------------------------------------------------------
+
+class TestScanSingle:
+    def test_post_redirects_and_does_not_block(self, app, auth_client):
+        guest_id = _make_guest(app, "_api-scan-single-redirect")
+        fake_result = SimpleNamespace(status="success", total_updates=3,
+                                       security_updates=1, error_message=None)
+        try:
+            with patch("routes.api.scan_guest", return_value=fake_result):
+                resp = auth_client.post(f"/api/scan/{guest_id}", follow_redirects=False)
+            assert resp.status_code == 302
+        finally:
+            _wait_until(lambda: not (_scan_jobs.get(guest_id) and _scan_jobs[guest_id].running))
+            _scan_jobs.pop(guest_id, None)
+            _delete_guest(app, guest_id)
+
+    def test_background_job_records_success_result(self, app, auth_client):
+        guest_id = _make_guest(app, "_api-scan-single-result")
+        fake_result = SimpleNamespace(status="success", total_updates=5,
+                                       security_updates=2, error_message=None)
+        try:
+            with patch("routes.api.scan_guest", return_value=fake_result):
+                auth_client.post(f"/api/scan/{guest_id}", follow_redirects=False)
+                # Keep the patch active until the background thread (which
+                # calls routes.api.scan_guest asynchronously) has finished --
+                # otherwise the patch is reverted before the thread gets to it.
+                assert _wait_until(lambda: not (_scan_jobs.get(guest_id) and _scan_jobs[guest_id].running))
+
+            job = _scan_jobs[guest_id]
+            assert job.success is True
+            assert job.total_updates == 5
+            assert job.security_updates == 2
+        finally:
+            _scan_jobs.pop(guest_id, None)
+            _delete_guest(app, guest_id)
+
+    def test_already_running_does_not_start_a_second_job(self, app, auth_client):
+        guest_id = _make_guest(app, "_api-scan-single-already-running")
+        existing_job = ScanJob(guest_id, "_api-scan-single-already-running")
+        _scan_jobs[guest_id] = existing_job
+        try:
+            with patch("routes.api.scan_guest") as mock_scan:
+                resp = auth_client.post(f"/api/scan/{guest_id}", follow_redirects=True)
+            assert b"already running" in resp.data
+            mock_scan.assert_not_called()
+            assert _scan_jobs[guest_id] is existing_job
+        finally:
+            _scan_jobs.pop(guest_id, None)
+            _delete_guest(app, guest_id)
+
+    def test_nonexistent_guest_returns_404(self, auth_client):
+        resp = auth_client.post("/api/scan/999999")
+        assert resp.status_code == 404
+
+
+class TestScanStatus:
+    """GET /api/scan/<guest_id>/status"""
+
+    def test_no_job_returns_running_false(self, app, auth_client):
+        guest_id = _make_guest(app, "_api-scan-status-none")
+        try:
+            resp = auth_client.get(f"/api/scan/{guest_id}/status")
+            assert resp.status_code == 200
+            assert resp.content_type.startswith("application/json")
+            data = resp.get_json()
+            assert data["running"] is False
+            assert data["success"] is None
+        finally:
+            _delete_guest(app, guest_id)
+
+    def test_active_job_running_true(self, app, auth_client):
+        guest_id = _make_guest(app, "_api-scan-status-active")
+        _scan_jobs[guest_id] = ScanJob(guest_id, "_api-scan-status-active")
+        try:
+            resp = auth_client.get(f"/api/scan/{guest_id}/status")
+            data = resp.get_json()
+            assert data["running"] is True
+            assert data["guest_id"] == guest_id
+        finally:
+            _scan_jobs.pop(guest_id, None)
+            _delete_guest(app, guest_id)
+
+    def test_finished_job_reports_totals(self, app, auth_client):
+        guest_id = _make_guest(app, "_api-scan-status-done")
+        job = ScanJob(guest_id, "_api-scan-status-done")
+        job.finish(SimpleNamespace(status="success", total_updates=7, security_updates=1, error_message=None))
+        _scan_jobs[guest_id] = job
+        try:
+            resp = auth_client.get(f"/api/scan/{guest_id}/status")
+            data = resp.get_json()
+            assert data["running"] is False
+            assert data["success"] is True
+            assert data["total_updates"] == 7
+            assert data["security_updates"] == 1
+        finally:
+            _scan_jobs.pop(guest_id, None)
+            _delete_guest(app, guest_id)
+
+    def test_failed_job_reports_error_message(self, app, auth_client):
+        guest_id = _make_guest(app, "_api-scan-status-failed")
+        job = ScanJob(guest_id, "_api-scan-status-failed")
+        job.finish(SimpleNamespace(status="error", total_updates=0, security_updates=0,
+                                    error_message="SSH connection failed"))
+        _scan_jobs[guest_id] = job
+        try:
+            resp = auth_client.get(f"/api/scan/{guest_id}/status")
+            data = resp.get_json()
+            assert data["success"] is False
+            assert data["error_message"] == "SSH connection failed"
+        finally:
+            _scan_jobs.pop(guest_id, None)
+            _delete_guest(app, guest_id)
+
+    def test_nonexistent_guest_returns_404(self, auth_client):
+        resp = auth_client.get("/api/scan/999999/status")
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /api/scan-all, /api/scan-all/progress, /api/scan-all/status
+# ---------------------------------------------------------------------------
+
+class TestScanAll:
+    def _reset_bulk_scan(self):
+        with _bulk_scan_lock:
+            _bulk_scan["running"] = False
+            _bulk_scan["started_at"] = None
+            _bulk_scan["total"] = 0
+            _bulk_scan["done"] = 0
+            _bulk_scan["items"] = []
+
+    def test_no_targets_flashes_info_and_redirects_to_dashboard(self, app, auth_client):
+        self._reset_bulk_scan()
+        resp = auth_client.post("/api/scan-all", follow_redirects=True)
+        assert resp.status_code == 200
+        assert b"No running guests" in resp.data
+
+    def test_starts_background_bulk_scan_and_redirects_to_progress(self, app, auth_client):
+        self._reset_bulk_scan()
+        guest_id = _make_guest(app, "_api-scan-all-target", power_state="running",
+                                status="updates-available")
+        fake_result = SimpleNamespace(status="success", total_updates=2,
+                                       security_updates=0, error_message=None)
+        try:
+            with patch("routes.api.scan_guest", return_value=fake_result), \
+                 patch("routes.api.send_update_notification"):
+                resp = auth_client.post("/api/scan-all", follow_redirects=False)
+                assert resp.status_code == 302
+                assert "/api/scan-all/progress" in resp.headers["Location"]
+
+                # Keep the patches active until the background thread (which
+                # calls these asynchronously) has finished.
+                assert _wait_until(lambda: not _bulk_scan["running"])
+
+            with _bulk_scan_lock:
+                items = list(_bulk_scan["items"])
+                assert _bulk_scan["done"] == _bulk_scan["total"] == 1
+            assert items[0]["guest_id"] == guest_id
+            assert items[0]["state"] == "success"
+        finally:
+            self._reset_bulk_scan()
+            _delete_guest(app, guest_id)
+
+    def test_already_running_redirects_to_progress_without_restarting(self, app, auth_client):
+        self._reset_bulk_scan()
+        with _bulk_scan_lock:
+            _bulk_scan["running"] = True
+        try:
+            with patch("routes.api.scan_guest") as mock_scan:
+                resp = auth_client.post("/api/scan-all", follow_redirects=False)
+            assert resp.status_code == 302
+            assert "/api/scan-all/progress" in resp.headers["Location"]
+            mock_scan.assert_not_called()
+        finally:
+            self._reset_bulk_scan()
+
+    def test_progress_page_renders(self, auth_client):
+        resp = auth_client.get("/api/scan-all/progress")
+        assert resp.status_code == 200
+
+    def test_status_endpoint_returns_json_shape(self, auth_client):
+        self._reset_bulk_scan()
+        resp = auth_client.get("/api/scan-all/status")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["running"] is False
+        assert data["items"] == []
 
 
 # ---------------------------------------------------------------------------

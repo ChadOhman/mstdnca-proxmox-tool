@@ -1942,11 +1942,7 @@
 <script>
 const canEditServices = {{ 'true' if current_user.can_edit_services else 'false' }};
 
-function escHtml(str) {
-    return String(str == null ? '' : str)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
+// escHtml is provided by static/esc.js
 
 function refreshStats() {
     const btn = document.getElementById('refreshBtn');

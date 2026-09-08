@@ -19,7 +19,7 @@ class TestUnpollerConfig:
         config = {
             "unifi_url": "https://10.0.0.1",
             "unifi_user": "admin",
-            "unifi_pass": "secret",
+            "unifi_pass": "test-only-secret",
             "unifi_site": "default",
             "metric_prefix": "unpoller",
             "listen_port": "9130",
@@ -27,7 +27,7 @@ class TestUnpollerConfig:
         result = _generate_unpoller_config(config)
         assert 'url = "https://10.0.0.1"' in result
         assert 'user = "admin"' in result
-        assert 'pass = "secret"' in result
+        assert 'pass = "test-only-secret"' in result
         assert 'sites = ["default"]' in result
         assert 'namespace = "unpoller"' in result
         assert 'http_listen = "0.0.0.0:9130"' in result
@@ -90,7 +90,7 @@ class TestUnpollerGetConfig:
             Setting.set("prometheus_guest_id", "42")
             Setting.set("unifi_base_url", "https://udm.local")
             Setting.set("unifi_username", "testuser")
-            Setting.set("unifi_password", "testpass")
+            Setting.set("unifi_password", "test-only-testpass")
             Setting.set("unpoller_site_name", "mysite")
             db.session.commit()
 
@@ -98,7 +98,7 @@ class TestUnpollerGetConfig:
             assert config["guest_id"] == "42"
             assert config["unifi_url"] == "https://udm.local"
             assert config["unifi_user"] == "testuser"
-            assert config["unifi_pass"] == "testpass"
+            assert config["unifi_pass"] == "test-only-testpass"
             assert config["unifi_site"] == "mysite"
 
 

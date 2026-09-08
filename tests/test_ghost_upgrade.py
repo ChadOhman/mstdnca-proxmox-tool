@@ -194,7 +194,7 @@ class TestGhostUpgradePostUpdatePermissions:
             return run_ghost_upgrade(skip_protection=True)
 
     def _healthy_ssh(self):
-        ghost_cli_json = '{"name": "news-mstdn-ca", "active-version": "6.22.0"}'
+        ghost_cli_json = '{"name": "example-site", "active-version": "6.22.0"}'
         return FakeSSH([
             (".ghost-cli", (ghost_cli_json, "", 0)),
             ("config.production.json", ('["ghost", "ghost"]', "", 0)),
@@ -234,7 +234,7 @@ class TestGhostUpgradePostUpdatePermissions:
         perms_idxs = [i for i, c in enumerate(ssh.calls) if "chown -R ghost_user:" in c]
         # Match the actual restart command, not the "systemctl restart ..."
         # substring that also appears inside the sudoers NOPASSWD grant lines.
-        restart_idx = ssh.index_of("systemctl restart ghost_news-mstdn-ca 2>&1")
+        restart_idx = ssh.index_of("systemctl restart ghost_example-site 2>&1")
         assert restart_idx > perms_idxs[1], ssh.calls
 
 

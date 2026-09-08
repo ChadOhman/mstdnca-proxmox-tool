@@ -5,15 +5,24 @@ testpaths = ["tests"]
 omit = [
     "tests/*",
     ".venv/*",
+
+    # Tested at the function level (unit tests exercise the logic directly with
+    # mocked SSH/subprocess boundaries), but omitted from the blended coverage
+    # metric because most of their lines are large SSH command-building/parsing
+    # branches that are impractical to drive end-to-end through the % metric.
     "core/scanner.py",
-    "clients/proxmox_api.py",
-    "clients/pbs_client.py",
     "apps/mastodon.py",
     "apps/ghost.py",
     "apps/elk.py",
     "apps/jitsi.py",
+
+    # Integration-only, genuinely thin: real coverage would require a live
+    # Proxmox/PBS/UniFi endpoint. clients/proxmox_api.py and clients/pbs_client.py
+    # now have ProxmoxClient(MagicMock())-style unit tests (see
+    # tests/test_proxmox_client_methods.py, tests/test_pbs_client.py) and
+    # clients/unifi_geoip.py's _is_private() helper is covered by
+    # tests/test_unifi_geoip.py, so those three are no longer omitted.
     "clients/unifi_client.py",
-    "clients/unifi_geoip.py",
 ]
 
 [tool.coverage.report]
