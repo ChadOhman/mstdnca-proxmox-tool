@@ -239,9 +239,9 @@ class TestPrometheusYmlGeneration:
 
     def test_yml_with_auth_token(self):
         from apps.prometheus_app import _generate_prometheus_yml
-        yml = _generate_prometheus_yml("10.0.0.10:5000", auth_token="secret123")
+        yml = _generate_prometheus_yml("10.0.0.10:5000", auth_token="test-only-secret123")
         assert "Bearer" in yml
-        assert "secret123" in yml
+        assert "test-only-secret123" in yml
 
     def test_yml_without_mstdnca_url(self):
         from apps.prometheus_app import _generate_prometheus_yml

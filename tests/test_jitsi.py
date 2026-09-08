@@ -786,7 +786,7 @@ class TestJitsiServiceMonitoring:
         )
         ssh.execute_sudo.side_effect = [
             (prosody_cfg, "", 0),        # cat prosody cfg
-            ("mysecret123", "", 0),      # cat TURN secret
+            ("test-only-mysecret123", "", 0),      # cat TURN secret
             ("", "", 0),                 # tee (write)
             ("", "", 0),                 # restart prosody
         ]
