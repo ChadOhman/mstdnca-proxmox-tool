@@ -720,7 +720,9 @@ class TestVerifiedDownloads:
             Setting.set("unpoller_latest_version", "5.2.4")
             Setting.set("unifi_base_url", "https://unifi.example.com")
             Setting.set("unifi_username", "unifi-ro")
-            Setting.set("unifi_password", "test-only-unifi-pass")
+            from auth.credential_store import encrypt
+            # Stored encrypted since #142; the installer decrypts it.
+            Setting.set("unifi_password", encrypt("test-only-unifi-pass"))
             db.session.commit()
             with patch("apps.unpoller.SSHClient") as MockSSH, \
                  patch("apps.unpoller._snapshot_guest", return_value=(True, "ok")), \
