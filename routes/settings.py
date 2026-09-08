@@ -293,33 +293,56 @@ def save_scan():
 
 @bp.route("/backups/refresh-storages", methods=["POST"])
 def refresh_backup_storages():
-    """Re-poll all PVE hosts for backup-capable storages and update the cache."""
+    """Re-poll all PVE hosts for backup-capable storages and update the cache.
+
+    If PVE hosts are configured but none of them respond (network blip,
+    credential issue, etc.), the previous cache is left in place -- rather
+    than being silently blanked -- and a warning is flashed/logged. Having
+    zero PVE hosts configured at all is a legitimate state and still updates
+    the cache to an empty list, same as before.
+    """
     storages = []
     seen = set()
+    host_count = 0
+    any_host_responded = False
+    query_failed = False
     try:
         from clients.proxmox_api import ProxmoxClient
         from models import ProxmoxHost
-        for host in ProxmoxHost.query.filter(ProxmoxHost.host_type != "pbs").all():
+        hosts = ProxmoxHost.query.filter(ProxmoxHost.host_type != "pbs").all()
+        host_count = len(hosts)
+        for host in hosts:
             try:
                 client = ProxmoxClient(host)
                 nodes = client.api.nodes.get()
                 if nodes:
                     node_storages = client.list_node_storages(nodes[0]['node'], content_type="backup")
+                    any_host_responded = True
                     for st in node_storages:
                         sid = st.get('storage', '')
                         if sid and sid not in seen:
                             seen.add(sid)
                             storages.append(st)
             except Exception:
-                pass
+                logger.warning("Failed to poll host %s for backup storages", host.name, exc_info=True)
     except Exception:
-        pass
+        query_failed = True
+        logger.warning("Failed to enumerate PVE hosts for backup storage refresh", exc_info=True)
+
+    is_xhr = request.headers.get("X-Requested-With") == "XMLHttpRequest"
+
+    if query_failed or (host_count > 0 and not any_host_responded):
+        logger.warning("Backup storage refresh: no PVE host responded; keeping previous cache")
+        message = "Could not refresh backup storages -- no Proxmox host responded. Keeping the previous list."
+        if is_xhr:
+            return jsonify({"ok": False, "error": message}), 502
+        flash(message, "warning")
+        return redirect(url_for("settings.index"))
 
     cached_at = datetime.now(timezone.utc).isoformat()
     Setting.set("backup_storages_cache", json.dumps(storages))
     Setting.set("backup_storages_cache_time", cached_at)
 
-    is_xhr = request.headers.get("X-Requested-With") == "XMLHttpRequest"
     if is_xhr:
         return jsonify({"ok": True, "storages": storages, "cached_at": cached_at})
     flash(f"Backup storages refreshed ({len(storages)} found).", "success")

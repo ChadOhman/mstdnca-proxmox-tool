@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+set -o pipefail
 
 # ============================================================
 # Mastodon Canada Administration Tool - Self-Update Script
@@ -11,7 +12,7 @@ APP_NAME="mstdnca-proxmox-tool"
 APP_DIR="/opt/mstdnca"
 DATA_DIR="/var/lib/mstdnca"
 BACKUP_DIR="/var/lib/mstdnca/backups"
-SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
+HEALTH_URL="http://127.0.0.1:5000/health"
 UPDATE_BRANCH=""
 
 # Parse arguments
@@ -29,6 +30,46 @@ echo "" > "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 ts() { date '+%H:%M:%S'; }
+
+# GIT_DIR / PREV_COMMIT are populated in step 2 and read by rollback_to_previous.
+GIT_DIR="$APP_DIR"
+PREV_COMMIT=""
+
+# Revert to the commit recorded before this update started, reinstall its
+# requirements, and restart the service. Used when a step fails partway
+# through, or when the post-restart health check does not come up.
+rollback_to_previous() {
+    local reason="$1"
+    echo ""
+    echo "============================================"
+    echo " ROLLING BACK ($reason)"
+    echo "============================================"
+    if [ -z "$PREV_COMMIT" ]; then
+        echo "  No previous commit recorded (fresh checkout or non-git deploy) — cannot roll back code."
+    else
+        echo "  Reverting code to $PREV_COMMIT..."
+        set +e
+        (cd "$GIT_DIR" && git checkout --quiet "$PREV_COMMIT") 2>&1 | sed 's/^/    /'
+        checkout_status=${PIPESTATUS[0]}
+        set -e
+        if [ "$checkout_status" -ne 0 ]; then
+            echo "  ERROR: rollback checkout failed (exit $checkout_status). Manual intervention required."
+        else
+            echo "  Reinstalling previous requirements..."
+            cd "$APP_DIR"
+            source venv/bin/activate
+            pip install -r requirements.txt 2>&1 | grep -E 'Successfully|already|Requirement|Collecting|ERROR' | sed 's/^/    /'
+        fi
+    fi
+    echo "  Restarting service..."
+    systemctl restart "$APP_NAME" || true
+    sleep 2
+    if systemctl is-active --quiet "$APP_NAME"; then
+        echo "  Service is active after rollback."
+    else
+        echo "  WARNING: Service did not come back up after rollback. Check: journalctl -u $APP_NAME -n 50"
+    fi
+}
 
 echo "============================================"
 echo " Mastodon Canada Administration Tool"
@@ -63,7 +104,7 @@ echo "App directory   : $APP_DIR"
 echo ""
 
 # ── Step 1: Backup ──────────────────────────────────────────
-echo "[1/4] Backing up database...  ($(ts))"
+echo "[1/5] Backing up database...  ($(ts))"
 mkdir -p "$BACKUP_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 if [ -f "$DATA_DIR/mstdnca.db" ]; then
@@ -83,9 +124,8 @@ fi
 
 # ── Step 2: Pull code ────────────────────────────────────────
 echo ""
-echo "[2/4] Pulling latest code...  ($(ts))"
+echo "[2/5] Pulling latest code...  ($(ts))"
 
-GIT_DIR="$APP_DIR"
 if [ ! -d "$APP_DIR/.git" ]; then
     PARENT_DIR=$(dirname "$APP_DIR")
     if [ -d "$PARENT_DIR/.git" ]; then
@@ -95,10 +135,13 @@ fi
 
 if [ -d "$GIT_DIR/.git" ]; then
     cd "$GIT_DIR"
+    PREV_COMMIT=$(git rev-parse HEAD)
     BRANCH="${UPDATE_BRANCH:-main}"
     echo "  Branch: $BRANCH"
+    echo "  Previous commit: $PREV_COMMIT"
 
     echo "  Fetching from origin..."
+    set +e
     if [ -n "$GITHUB_TOKEN" ]; then
         # Private repo: authenticate this fetch only via an ephemeral header.
         # GitHub git-over-HTTPS requires Basic auth with the token as the password
@@ -108,9 +151,16 @@ if [ -d "$GIT_DIR/.git" ]; then
         # script does not run `set -x`, so the token never reaches the update log.
         _gh_basic=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
         git -c http.extraheader="Authorization: Basic $_gh_basic" fetch origin 2>&1 | sed 's/^/    /'
+        fetch_status=${PIPESTATUS[0]}
         unset _gh_basic
     else
         git fetch origin 2>&1 | sed 's/^/    /'
+        fetch_status=${PIPESTATUS[0]}
+    fi
+    set -e
+    if [ "$fetch_status" -ne 0 ]; then
+        echo "ERROR: git fetch failed (exit $fetch_status). Aborting update; repository left at $PREV_COMMIT, service not restarted."
+        exit 1
     fi
 
     # Show incoming commits before applying them
@@ -122,8 +172,24 @@ if [ -d "$GIT_DIR/.git" ]; then
         echo "  Already up to date."
     fi
 
+    set +e
     git checkout "$BRANCH" 2>&1 | sed 's/^/    /'
+    checkout_status=${PIPESTATUS[0]}
+    set -e
+    if [ "$checkout_status" -ne 0 ]; then
+        echo "ERROR: git checkout $BRANCH failed (exit $checkout_status). Aborting update; repository left at $PREV_COMMIT, service not restarted."
+        exit 1
+    fi
+
+    set +e
     git reset --hard "origin/$BRANCH" 2>&1 | sed 's/^/    /'
+    reset_status=${PIPESTATUS[0]}
+    set -e
+    if [ "$reset_status" -ne 0 ]; then
+        echo "ERROR: git reset --hard failed (exit $reset_status). Aborting update; repository left at $PREV_COMMIT, service not restarted."
+        exit 1
+    fi
+
     cd "$APP_DIR"
     echo "  Code updated."
 else
@@ -139,35 +205,30 @@ echo "  New version: v$NEW_VERSION"
 
 # ── Step 3: Python dependencies ──────────────────────────────
 echo ""
-echo "[3/4] Updating Python dependencies...  ($(ts))"
+echo "[3/5] Updating Python dependencies...  ($(ts))"
 source venv/bin/activate
 
 echo "  Upgrading pip..."
-pip install --upgrade pip 2>&1 | grep -E 'Successfully|already|Requirement|ERROR' | sed 's/^/    /'
+# A failed pip self-upgrade is not fatal on its own (the existing pip is
+# reused below), so this one is logged but not treated as an abort condition.
+pip install --upgrade pip 2>&1 | grep -E 'Successfully|already|Requirement|ERROR' | sed 's/^/    /' || true
 
 echo "  Installing requirements..."
+set +e
 pip install -r requirements.txt 2>&1 | grep -E 'Successfully|already|Requirement|Collecting|ERROR' | sed 's/^/    /'
-
-echo "  Installing gevent..."
-pip install gevent 2>&1 | grep -E 'Successfully|already|Requirement|Collecting|ERROR' | sed 's/^/    /'
+pip_status=${PIPESTATUS[0]}
+set -e
+if [ "$pip_status" -ne 0 ]; then
+    echo "ERROR: pip install -r requirements.txt failed (exit $pip_status)."
+    rollback_to_previous "dependency install failure"
+    exit 1
+fi
 
 echo "  Dependencies up to date."
 
 # ── Step 4: Restart ──────────────────────────────────────────
 echo ""
-echo "[4/4] Restarting service...  ($(ts))"
-
-# Patch missing environment variables into the service file.
-# SESSION_COOKIE_SECURE=0 is required for HTTP-only installs so that
-# browsers send back the session cookie and session state (e.g. safety mode)
-# is not lost on every request.
-if [ -f "$SERVICE_FILE" ]; then
-    if ! grep -q "SESSION_COOKIE_SECURE" "$SERVICE_FILE"; then
-        sed -i '/^Environment=FLASK_SECRET_KEY_FILE/a Environment=SESSION_COOKIE_SECURE=0' "$SERVICE_FILE"
-        systemctl daemon-reload
-        echo "  Patched SESSION_COOKIE_SECURE=0 into service file."
-    fi
-fi
+echo "[4/5] Restarting service...  ($(ts))"
 
 systemctl restart "$APP_NAME"
 sleep 2
@@ -176,9 +237,33 @@ if systemctl is-active --quiet "$APP_NAME"; then
     echo "  Service is active."
     systemctl status "$APP_NAME" --no-pager -n 3 2>&1 | sed 's/^/    /'
 else
-    echo "  WARNING: Service may not have started."
-    echo "  Check: journalctl -u $APP_NAME -n 20"
+    echo "  WARNING: Service is not active yet; continuing to health check."
 fi
+
+# ── Step 5: Verify health, roll back automatically on failure ──
+echo ""
+echo "[5/5] Verifying health...  ($(ts))"
+
+HEALTH_OK=false
+for _i in $(seq 1 30); do
+    if curl -fsS -o /dev/null -m 3 "$HEALTH_URL" 2>/dev/null; then
+        HEALTH_OK=true
+        break
+    fi
+    sleep 2
+done
+
+if [ "$HEALTH_OK" != true ]; then
+    echo "  ERROR: $HEALTH_URL did not respond within ~60s after restart."
+    rollback_to_previous "failed post-update health check"
+    echo ""
+    echo "============================================"
+    echo " Update FAILED — rolled back to v$CURRENT_VERSION ($PREV_COMMIT)"
+    echo "============================================"
+    exit 1
+fi
+
+echo "  Health check passed."
 
 echo ""
 echo "============================================"

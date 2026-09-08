@@ -57,6 +57,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Validate --version early: it is later passed as an argv element into the CT
+# (see step 4), so reject anything that isn't a plain tag/branch name — in
+# particular a leading "-" that could be misread as an option by setup.sh/git.
+if [ -n "$TARGET_VERSION" ]; then
+    if [[ "$TARGET_VERSION" == -* ]] || [[ ! "$TARGET_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "ERROR: --version '$TARGET_VERSION' is invalid. Must match ^[A-Za-z0-9._-]+\$ and not start with '-'."
+        exit 1
+    fi
+fi
+
 echo "============================================"
 echo " Mastodon Canada Administration Tool - CT Provisioning"
 echo "============================================"
@@ -200,17 +210,22 @@ echo "[4/5] Installing Mastodon Canada Administration Tool..."
 
 # Install git and clone repo
 pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq git curl > /dev/null 2>&1"
-pct exec "$CTID" -- bash -c "git clone --quiet '$REPO_URL' /tmp/mstdnca-install"
+pct exec "$CTID" -- git clone --quiet "$REPO_URL" /tmp/mstdnca-install
 
-# Run setup.sh from the cloned repo
-SETUP_ARGS="$INSTALL_CLOUDFLARED"
-if [ -n "$TARGET_VERSION" ]; then
-    SETUP_ARGS="$SETUP_ARGS --version $TARGET_VERSION"
+# Run setup.sh from the cloned repo. Build the argument list as a real argv
+# array (not a concatenated shell string) so a value like --version can never
+# be reinterpreted by an inner shell.
+SETUP_ARGS=()
+if [ -n "$INSTALL_CLOUDFLARED" ]; then
+    SETUP_ARGS+=("$INSTALL_CLOUDFLARED")
 fi
-pct exec "$CTID" -- bash -c "cd /tmp/mstdnca-install && bash setup.sh $SETUP_ARGS"
+if [ -n "$TARGET_VERSION" ]; then
+    SETUP_ARGS+=(--version "$TARGET_VERSION")
+fi
+pct exec "$CTID" -- bash /tmp/mstdnca-install/setup.sh "${SETUP_ARGS[@]}"
 
 # Cleanup install temp
-pct exec "$CTID" -- bash -c "rm -rf /tmp/mstdnca-install"
+pct exec "$CTID" -- rm -rf /tmp/mstdnca-install
 
 echo ""
 echo "[5/5] Verifying installation..."
@@ -227,18 +242,20 @@ fi
 CT_IP=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')
 WEB_URL="http://${CT_IP}:5000"
 
-# Write details to CT notes in Proxmox
+# Write details to CT notes in Proxmox. The root password is deliberately NOT
+# included here — Proxmox CT descriptions are visible to anyone with read
+# access to the datacenter view, so it is printed to the console below only.
 NOTES="Mastodon Canada Administration Tool
 ==================================
 CT ID: $CTID
 Hostname: $HOSTNAME
-CT Root Password: $CT_ROOT_PASS
 Web UI: ${WEB_URL}
 App Username: admin
 App Password: generated on first start (see: journalctl -u mstdnca-proxmox-tool | grep -A3 'DEFAULT ADMIN')
 App Directory: /opt/mstdnca
 Data Directory: /var/lib/mstdnca
-Provisioned: $(date '+%Y-%m-%d %H:%M:%S')"
+Provisioned: $(date '+%Y-%m-%d %H:%M:%S')
+(CT root password was shown once in the provisioning console output.)"
 
 pct set "$CTID" --description "$NOTES" 2>/dev/null || true
 

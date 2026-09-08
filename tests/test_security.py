@@ -66,7 +66,10 @@ _CREDENTIAL_FIELD_RE = re.compile(
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Directories to scan (source + tests, skip venv / .git / __pycache__)
-_SCAN_DIRS = ["apps", "routes", "tests", "core", "clients"]
+_SCAN_DIRS = ["apps", "routes", "tests", "core", "clients", "auth"]
+
+# Individual top-level modules to scan (not under any of the directories above).
+_SCAN_FILES = ["models.py", "app.py", "config.py"]
 
 
 def _scan_file_for_secrets(filepath):
@@ -99,6 +102,14 @@ class TestNoHardcodedSecrets:
                     for lineno, text in hits:
                         relpath = os.path.relpath(fpath, _PROJECT_ROOT)
                         violations.append(f"  {relpath}:{lineno}  {text}")
+
+        for fname in _SCAN_FILES:
+            fpath = os.path.join(_PROJECT_ROOT, fname)
+            if not os.path.isfile(fpath):
+                continue
+            hits = _scan_file_for_secrets(fpath)
+            for lineno, text in hits:
+                violations.append(f"  {fname}:{lineno}  {text}")
 
         assert not violations, (
             "Hardcoded credential-like values detected (would trigger GitGuardian).\n"

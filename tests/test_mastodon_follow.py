@@ -1,5 +1,30 @@
 """Tests for the Mastodon 'make all accounts follow @account' streaming job."""
+import importlib.util
 from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _synchronous_gevent_spawn():
+    """Run gevent-spawned jobs inline when gevent is installed.
+
+    The routes spawn the background job via ``gevent.spawn`` when gevent is
+    importable (the production gunicorn worker) and only fall back to
+    ``threading.Thread`` otherwise.  The tests patch ``Thread`` with a
+    synchronous stand-in, so do the same for ``gevent.spawn`` to keep the
+    suite deterministic with or without gevent in the environment.
+    """
+    if importlib.util.find_spec("gevent") is None:
+        yield
+        return
+
+    def _run_now(fn, *args, **kwargs):
+        fn(*args, **kwargs)
+        return MagicMock()
+
+    with patch("gevent.spawn", side_effect=_run_now):
+        yield
 
 
 def _setup_settings(app):

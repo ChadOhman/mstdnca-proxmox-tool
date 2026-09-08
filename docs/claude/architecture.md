@@ -6,6 +6,8 @@
 
 **Single-worker constraint:** The collaboration system (`core/collaboration.py`) uses in-process state for presence tracking and terminal sharing. Must run with gunicorn `-w 1` or `--worker-class gthread`. Multi-worker deployments silently break collaboration features.
 
+The production worker class is `gevent` (`scripts/setup.sh` gunicorn `ExecStart`, pinned in `requirements.txt`); it's imported directly by seven `routes/*` modules to spawn background greenlets for long-running SSH/upgrade work.
+
 ## Directory Structure
 
 ```
@@ -71,7 +73,7 @@ SQLite via SQLAlchemy. Schema migrations run at startup in `_migrate_schema()` (
 
 ## Auth Layers
 
-Local login → Cloudflare Access JWT (`auth/cloudflare_access.py`) → Local network auto-login (`auth/local_network.py`, trusted CIDRs). Role-based permissions: super_admin > admin > operator > viewer with 13 permission flags on the `Role` model.
+Local login → Cloudflare Access JWT (`auth/cloudflare_access.py`) → Local network auto-login (`auth/local_network.py`, trusted CIDRs). Role-based permissions: super_admin > admin > operator > viewer; see `Role.PERMISSION_FIELDS` for the full flag list.
 
 ## Credentials
 
@@ -79,4 +81,4 @@ Fernet symmetric encryption (`auth/credential_store.py`), key at `/etc/mstdnca/s
 
 ## Frontend
 
-Jinja2 templates with Bootstrap 5.3.3 dark theme + htmx 2.0.4 + xterm.js, all from CDN. Single `static/style.css`.
+Jinja2 templates with Bootstrap 5.3.3 dark theme + xterm.js, all from CDN. Single `static/style.css` plus `static/esc.js` (shared `escHtml` helper).
