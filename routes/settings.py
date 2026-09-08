@@ -51,7 +51,7 @@ def _require_login():
 
 def _get_settings_dict():
     return {
-        "discord_webhook_url": Setting.get("discord_webhook_url"),
+        "discord_webhook_url_set": bool(Setting.get("discord_webhook_url")),
         "discord_enabled": Setting.get("discord_enabled", "false"),
         "discord_notify_updates": Setting.get("discord_notify_updates", "true"),
         "discord_notify_updates_security_only": Setting.get("discord_notify_updates_security_only", "false"),

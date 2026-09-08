@@ -34,6 +34,20 @@ def _load_flask_secret():
     return generated
 
 
+def _trusted_proxy_count():
+    """Parse TRUSTED_PROXY_COUNT from the environment, defaulting to 0 (no trust).
+
+    Anything unparseable or negative is treated as 0 so a typo can never widen
+    trust; the resulting value is the number of proxy hops ProxyFix may honour.
+    """
+    raw = os.environ.get("TRUSTED_PROXY_COUNT", "0").strip()
+    try:
+        count = int(raw)
+    except ValueError:
+        return 0
+    return max(count, 0)
+
+
 class Config:
     SECRET_KEY = _load_flask_secret()
     SQLALCHEMY_DATABASE_URI = os.environ.get(
@@ -62,6 +76,16 @@ class Config:
     REMEMBER_COOKIE_SAMESITE = "Lax"
     REMEMBER_COOKIE_SECURE = SESSION_COOKIE_SECURE
     REMEMBER_COOKIE_DURATION = timedelta(days=int(os.environ.get("REMEMBER_COOKIE_DAYS", "14")))
+
+    # Reverse-proxy trust.
+    # Number of reverse proxies you operate directly in front of this app.
+    # 0 (the default) means the app is reached directly by clients and NO
+    # forwarded header (X-Forwarded-For / X-Real-IP / CF-Connecting-IP) is
+    # trusted anywhere: request.remote_addr is always the real TCP peer.
+    # Set TRUSTED_PROXY_COUNT=1 when exactly one proxy you control (cloudflared,
+    # nginx) terminates connections and appends X-Forwarded-For. Setting it
+    # higher than the real number of hops lets clients forge their own IP.
+    TRUSTED_PROXY_COUNT = _trusted_proxy_count()
 
     # Default scan interval in hours
     SCAN_INTERVAL_HOURS = int(os.environ.get("SCAN_INTERVAL_HOURS", "6"))

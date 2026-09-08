@@ -554,6 +554,99 @@ class TestCfAccessMiddleware:
 
 
 # ---------------------------------------------------------------------------
+# CF Access sessions are tracked server-side (revocable, listed, audited)
+# ---------------------------------------------------------------------------
+
+class TestCfAccessSessionTracking:
+    """A CF Access login must produce a UserSession row like any other login.
+
+    Without one the session lives only in the signed cookie: it never appears in
+    the session list and cannot be terminated short of rotating SECRET_KEY.
+    """
+
+    _EMAIL = "cf_session_test@example.com"
+
+    def _enable(self, app):
+        with app.app_context():
+            Setting.set("cf_access_enabled", "true")
+            Setting.set("cf_access_team_domain", "myteam.cloudflareaccess.com")
+            Setting.set("cf_access_audience", "aud123")
+            Setting.set("cf_access_bypass_local_auth", "false")
+            Setting.set("cf_access_auto_provision", "true")
+            db.session.commit()
+
+    def _disable(self, app):
+        with app.app_context():
+            Setting.set("cf_access_enabled", "false")
+            user = User.query.filter_by(username=self._EMAIL).first()
+            if user:
+                db.session.delete(user)
+            db.session.commit()
+
+    def test_cf_login_creates_a_user_session_row(self, app):
+        from models import UserSession
+
+        self._enable(app)
+        payload = {"email": self._EMAIL, "name": "CF Session Tester"}
+        try:
+            with app.test_client() as c, patch(
+                "auth.cloudflare_access.validate_cf_token", return_value=payload
+            ):
+                assert c.get("/", headers={"Cf-Access-Jwt-Assertion": "fake.jwt"}).status_code == 200
+
+            with app.app_context():
+                user = User.query.filter_by(username=self._EMAIL).first()
+                assert user is not None
+                assert UserSession.query.filter_by(user_id=user.id, revoked=False).count() == 1
+        finally:
+            self._disable(app)
+
+    def test_cf_login_is_audited(self, app):
+        from models import AuditLog
+
+        self._enable(app)
+        payload = {"email": self._EMAIL, "name": "CF Session Tester"}
+        try:
+            with app.test_client() as c, patch(
+                "auth.cloudflare_access.validate_cf_token", return_value=payload
+            ):
+                c.get("/", headers={"Cf-Access-Jwt-Assertion": "fake.jwt"})
+
+            with app.app_context():
+                user = User.query.filter_by(username=self._EMAIL).first()
+                entry = (AuditLog.query
+                         .filter_by(action="login_cloudflare", user_id=user.id)
+                         .first())
+                assert entry is not None
+        finally:
+            self._disable(app)
+
+    def test_revoking_the_row_ends_the_cf_session(self, app):
+        from models import UserSession
+
+        self._enable(app)
+        payload = {"email": self._EMAIL, "name": "CF Session Tester"}
+        try:
+            with app.test_client() as c, patch(
+                "auth.cloudflare_access.validate_cf_token", return_value=payload
+            ):
+                assert c.get("/", headers={"Cf-Access-Jwt-Assertion": "fake.jwt"}).status_code == 200
+
+                with app.app_context():
+                    record = UserSession.query.filter_by(revoked=False).order_by(
+                        UserSession.id.desc()).first()
+                    record.revoked = True
+                    db.session.commit()
+
+                # The cookie alone must no longer authorise the request; without a
+                # CF header there is nothing left to re-authenticate with.
+                resp = c.get("/", follow_redirects=False)
+                assert resp.status_code == 302
+                assert "/login" in resp.headers["Location"]
+        finally:
+            self._disable(app)
+
+
 # POST /logout -- Cloudflare Access logout redirect (routes/auth.py)
 # ---------------------------------------------------------------------------
 

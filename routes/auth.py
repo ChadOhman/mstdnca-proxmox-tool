@@ -14,6 +14,7 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from auth.audit import log_action
 from auth.jwt_auth import credential_epoch
+from auth.local_network import _get_client_ip as _client_ip
 from auth.session_manager import SESSION_KEY, revoke_current_session, start_session
 from models import User, UserSession, db
 
@@ -152,55 +153,56 @@ def _enforce_remember_and_password_change():
 # ---------------------------------------------------------------------------
 _FAIL_WINDOW = 300   # 5-minute sliding window
 _FAIL_LIMIT = 10     # failed attempts before lockout
+_FAIL_MAX_KEYS = 4096  # hard cap so a flood of distinct IPs cannot grow the dict
 
 _failed_attempts: dict = collections.defaultdict(list)
 _failed_lock = threading.Lock()
+
+
+def _prune_failed_attempts(cutoff: float) -> None:
+    """Drop buckets with no attempt newer than ``cutoff``. Caller holds the lock.
+
+    Without this the dict only ever grows: every distinct source IP that fails a
+    login leaves a permanent (eventually empty) entry behind.
+    """
+    for key in [k for k, v in _failed_attempts.items() if not v or v[-1] <= cutoff]:
+        del _failed_attempts[key]
+    if len(_failed_attempts) > _FAIL_MAX_KEYS:
+        # Still over the cap after pruning: evict the least recently active keys.
+        stale = sorted(_failed_attempts, key=lambda k: _failed_attempts[k][-1])
+        for key in stale[: len(_failed_attempts) - _FAIL_MAX_KEYS]:
+            del _failed_attempts[key]
 
 
 def _check_rate_limit(ip: str) -> bool:
     """Return True if this IP is currently locked out."""
     cutoff = time.time() - _FAIL_WINDOW
     with _failed_lock:
-        _failed_attempts[ip] = [t for t in _failed_attempts[ip] if t > cutoff]
-        return len(_failed_attempts[ip]) >= _FAIL_LIMIT
+        _prune_failed_attempts(cutoff)
+        recent = [t for t in _failed_attempts.get(ip, []) if t > cutoff]
+        if recent:
+            _failed_attempts[ip] = recent
+        else:
+            _failed_attempts.pop(ip, None)
+        return len(recent) >= _FAIL_LIMIT
 
 
 def _record_failed_login(ip: str) -> None:
     with _failed_lock:
         _failed_attempts[ip].append(time.time())
+        _prune_failed_attempts(time.time() - _FAIL_WINDOW)
 
 
 def _get_client_ip() -> str:
-    """Return the real client IP, respecting proxy headers only from trusted sources.
+    """Return the client IP used as the rate-limit key.
 
-    Only trust CF-Connecting-IP / X-Forwarded-For when the direct connection is
-    from a loopback or private address (i.e. a reverse proxy).  This prevents
-    external clients from spoofing headers to bypass rate limiting.
+    Delegates to the single app-wide implementation in ``auth.local_network`` so
+    the limiter, the audit log and the local-network bypass can never disagree
+    about who the caller is.  Forwarded headers are only ever honoured when
+    ``TRUSTED_PROXY_COUNT`` is configured, so they cannot be used to rotate the
+    rate-limit key.
     """
-    import ipaddress
-
-    remote_addr = request.remote_addr or "unknown"
-
-    try:
-        remote_ip = ipaddress.ip_address(remote_addr)
-        trust_forwarded = remote_ip.is_loopback or remote_ip.is_private
-    except ValueError:
-        return remote_addr
-
-    if trust_forwarded:
-        cf_ip = request.headers.get("CF-Connecting-IP")
-        if cf_ip:
-            return cf_ip.strip()
-
-        real_ip = request.headers.get("X-Real-IP")
-        if real_ip:
-            return real_ip.strip()
-
-        forwarded = request.headers.get("X-Forwarded-For")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-
-    return remote_addr
+    return _client_ip() or "unknown"
 
 
 def _is_safe_next_url(target):

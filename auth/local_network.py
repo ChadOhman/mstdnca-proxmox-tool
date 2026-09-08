@@ -15,13 +15,17 @@ import logging
 from datetime import datetime, timezone
 
 from flask import g, request, session
-from flask_login import current_user, login_user
+from flask_login import current_user, login_user, logout_user
 
-from models import Role, Setting, User
+from models import Role, Setting, User, db
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TRUSTED_SUBNETS = ""
+
+# Flask-session flag marking a session that was established by this bypass (as
+# opposed to a real login), so it can be re-validated on every request.
+BYPASS_SESSION_KEY = "_local_bypass"
 
 
 def _get_trusted_networks():
@@ -40,41 +44,49 @@ def _get_trusted_networks():
 
 
 def _get_client_ip():
-    """Get the real client IP, respecting proxy headers.
+    """Return the client IP.  Single source of truth for the whole app.
 
-    Order of preference:
-      1. CF-Connecting-IP  (set by Cloudflare)
-      2. X-Real-IP         (set by nginx / reverse proxies)
-      3. First entry in X-Forwarded-For
-      4. request.remote_addr (direct connection)
+    ``request.remote_addr`` is the real TCP peer unless ``TRUSTED_PROXY_COUNT``
+    is greater than 0, in which case ``ProxyFix`` (installed in ``create_app``)
+    has already resolved it from ``X-Forwarded-For``.  This function therefore
+    never parses ``X-Forwarded-For`` / ``X-Real-IP`` itself: doing so would let
+    a direct client pick its own source IP, which is what the trust decisions
+    built on top of this value (local bypass, rate limiting, audit) rely on.
+
+    The one extra header honoured is Cloudflare's ``CF-Connecting-IP``, and only
+    when ProxyFix actually ran *and* the pre-ProxyFix TCP peer is loopback or
+    private -- i.e. the request really did arrive through local proxy
+    infrastructure rather than straight off the network.
     """
     remote_addr = request.remote_addr
-    if not remote_addr:
-        return None
 
-    # Only trust forwarded headers when traffic is coming from local/private
-    # infrastructure (e.g. reverse proxy). This prevents direct clients from
-    # spoofing X-Forwarded-For / X-Real-IP / CF-Connecting-IP.
+    orig = request.environ.get("werkzeug.proxy_fix.orig")
+    if orig and _is_proxy_peer(orig.get("REMOTE_ADDR")):
+        cf_ip = (request.headers.get("CF-Connecting-IP") or "").strip()
+        if cf_ip and _is_ip_address(cf_ip):
+            return cf_ip
+
+    return remote_addr or None
+
+
+def _is_ip_address(value):
+    """True when ``value`` parses as an IPv4/IPv6 address."""
     try:
-        remote_ip = ipaddress.ip_address(remote_addr)
-        trust_forwarded = remote_ip.is_loopback or remote_ip.is_private
+        ipaddress.ip_address(value)
     except ValueError:
-        trust_forwarded = False
+        return False
+    return True
 
-    if trust_forwarded:
-        cf_ip = request.headers.get("CF-Connecting-IP")
-        if cf_ip:
-            return cf_ip.strip()
 
-        real_ip = request.headers.get("X-Real-IP")
-        if real_ip:
-            return real_ip.strip()
-
-        forwarded = request.headers.get("X-Forwarded-For")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-
-    return remote_addr
+def _is_proxy_peer(addr):
+    """True when ``addr`` is loopback/private, i.e. plausible proxy infrastructure."""
+    if not addr:
+        return False
+    try:
+        parsed = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return parsed.is_loopback or parsed.is_private
 
 
 def _is_trusted(client_ip, networks):
@@ -86,8 +98,48 @@ def _is_trusted(client_ip, networks):
         return False
 
 
+def _bypass_enabled():
+    """True when the local-network auto-login feature is switched on."""
+    return Setting.get("local_bypass_enabled", "false") != "false"
+
+
+def _bypass_session_still_valid():
+    """Re-validate an already-established bypass session against live settings.
+
+    A bypass session carries no credentials, so it must not outlive the
+    conditions that created it: turning ``local_bypass_enabled`` off or
+    narrowing ``trusted_subnets`` has to invalidate it on the very next request.
+    """
+    if not _bypass_enabled():
+        return False
+    return _is_trusted(_get_client_ip(), _get_trusted_networks())
+
+
+def _warn_if_proxy_trust_missing(app):
+    """Warn when header-dependent auth is enabled but no proxy hop is trusted."""
+    if app.config.get("TRUSTED_PROXY_COUNT", 0):
+        return
+    try:
+        with app.app_context():
+            cf_enabled = Setting.get("cf_access_enabled", "false") == "true"
+            bypass_enabled = _bypass_enabled()
+    except Exception:  # pragma: no cover - settings table not ready yet
+        return
+    if not (cf_enabled or bypass_enabled):
+        return
+    logger.warning(
+        "TRUSTED_PROXY_COUNT is 0 while %s enabled: forwarded headers "
+        "(X-Forwarded-For / CF-Connecting-IP) are ignored and every trust decision uses the "
+        "direct TCP peer. If a reverse proxy (cloudflared, nginx) fronts this app, set "
+        "TRUSTED_PROXY_COUNT to the number of proxy hops you operate (usually 1) so client "
+        "IPs resolve correctly; leave it at 0 when clients connect directly.",
+        "Cloudflare Access is" if cf_enabled else "local-network bypass is",
+    )
+
+
 def init_local_bypass(app):
     """Register the local-network auto-auth middleware."""
+    _warn_if_proxy_trust_missing(app)
 
     @app.before_request
     def _local_network_bypass():
@@ -95,12 +147,23 @@ def init_local_bypass(app):
         if request.path.startswith(("/static/", "/api/v1/")):
             return
 
-        # Already authenticated -- nothing to do
+        # Already authenticated -- nothing to do, except that a session created
+        # by this bypass must be re-checked while it is in use.
         if current_user.is_authenticated:
+            if session.get(BYPASS_SESSION_KEY):
+                if _bypass_session_still_valid():
+                    g.local_bypass = True
+                else:
+                    from auth.session_manager import revoke_current_session
+                    revoke_current_session()
+                    db.session.commit()
+                    logout_user()
+                    session.clear()
+                    logger.info("Local bypass session invalidated (settings changed or IP no longer trusted)")
             return
 
         # Check if bypass is enabled
-        if Setting.get("local_bypass_enabled", "false") == "false":
+        if not _bypass_enabled():
             return
 
         client_ip = _get_client_ip()
@@ -115,12 +178,22 @@ def init_local_bypass(app):
             Role.name.in_(("super_admin", "admin")),
         ).first()
         if admin and admin.is_active:
+            from auth.audit import log_action
+            from auth.session_manager import start_session
+
             safety = session.get("safety_mode", False)
             session.clear()
             login_user(admin)
             admin.last_login_at = datetime.now(timezone.utc)
             if safety:
                 session["safety_mode"] = True
+            # Track the session server-side so it is listed and revocable, and
+            # mark it as bypass-established so it can be re-validated per request.
+            start_session(admin)
+            session[BYPASS_SESSION_KEY] = True
+            log_action("login_local_bypass", "user", resource_id=admin.id,
+                       resource_name=admin.username, details={"client_ip": client_ip})
+            db.session.commit()
             g.local_bypass = True
             logger.debug(f"Local bypass: auto-authenticated {client_ip} as admin")
 

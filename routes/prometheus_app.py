@@ -14,7 +14,7 @@ from flask import Blueprint, flash, jsonify, redirect, render_template, request,
 from flask_login import current_user, login_required
 
 from auth.audit import log_action
-from models import ExporterInstance, Guest, HostExporterInstance, ProxmoxHost, Setting, db
+from models import ExporterInstance, Guest, HostExporterInstance, ProxmoxHost, Setting, Tag, db
 
 
 def _parse_iso(value):
@@ -47,11 +47,27 @@ def _require_login():
         return redirect(url_for("dashboard.index"))
 
 
+def _require_guest_access(guest):
+    """Flash + redirect when the current user may not manage exporters on `guest`."""
+    if guest is not None and current_user.may_access_guest(guest):
+        return None
+    flash("You don't have permission to access this guest.", "error")
+    return redirect(url_for("prometheus_app.manage"))
+
+
+def _require_host_admin():
+    """Host-level exporters run on the Proxmox hosts themselves — admin only."""
+    if current_user.is_admin:
+        return None
+    flash("Administrator access is required to manage host exporters.", "error")
+    return redirect(url_for("prometheus_app.manage"))
+
+
 def _get_settings():
     return {
         "guest_id": Setting.get("prometheus_guest_id", ""),
         "url": Setting.get("prometheus_url", ""),
-        "auth_token": Setting.get("prometheus_auth_token", ""),
+        "auth_token_set": bool(Setting.get("prometheus_auth_token")),
         "enabled": Setting.get("prometheus_enabled", "false") == "true",
         "auto_upgrade": Setting.get("prometheus_auto_upgrade", "false"),
         "current_version": Setting.get("prometheus_current_version", ""),
@@ -132,7 +148,12 @@ def manage():
 def save():
     Setting.set("prometheus_guest_id", request.form.get("prometheus_guest_id", "").strip())
     Setting.set("prometheus_url", request.form.get("prometheus_url", "").strip())
-    Setting.set("prometheus_auth_token", request.form.get("prometheus_auth_token", "").strip())
+    auth_token = request.form.get("prometheus_auth_token", "").strip()
+    if auth_token:
+        # Blank submission keeps the currently stored token — the field is
+        # never rendered with its real value, so an empty field means
+        # "unchanged", not "clear the token".
+        Setting.set("prometheus_auth_token", auth_token)
     Setting.set("prometheus_enabled",
                 "true" if "prometheus_enabled" in request.form else "false")
     Setting.set("prometheus_auto_upgrade",
@@ -407,7 +428,12 @@ def upgrade():
 @bp.route("/exporters")
 def exporters_list():
     from apps.exporters import KNOWN_EXPORTERS
-    instances = ExporterInstance.query.join(Guest).order_by(Guest.name).all()
+    query = ExporterInstance.query.join(Guest)
+    if not current_user.is_admin:
+        user_tag_ids = [t.id for t in current_user.allowed_tags]
+        query = (query.filter(Guest.tags.any(Tag.id.in_(user_tag_ids)))
+                 if user_tag_ids else query.filter(False))
+    instances = query.order_by(Guest.name).all()
     return jsonify({"exporters": [
         {
             "id": e.id,
@@ -453,6 +479,10 @@ def exporter_add():
     if not guest:
         flash("Guest not found.", "error")
         return redirect(url_for("prometheus_app.manage"))
+
+    denied = _require_guest_access(guest)
+    if denied:
+        return denied
 
     info = KNOWN_EXPORTERS[exporter_type]
     try:
@@ -501,6 +531,8 @@ def exporter_install(instance_id):
         return jsonify({"error": "Another exporter operation is already running."}), 409
 
     instance = ExporterInstance.query.get_or_404(instance_id)
+    if not current_user.may_access_guest(instance.guest):
+        return jsonify({"error": "Permission denied."}), 403
 
     _exporter_install_job["running"] = True
     _exporter_install_job["success"] = None
@@ -553,6 +585,8 @@ def exporter_uninstall(instance_id):
         return jsonify({"error": "Another exporter operation is already running."}), 409
 
     instance = ExporterInstance.query.get_or_404(instance_id)
+    if not current_user.may_access_guest(instance.guest):
+        return jsonify({"error": "Permission denied."}), 403
 
     _exporter_uninstall_job["running"] = True
     _exporter_uninstall_job["success"] = None
@@ -602,6 +636,9 @@ def exporter_uninstall_status():
 @bp.route("/exporters/<int:instance_id>/delete", methods=["POST"])
 def exporter_delete(instance_id):
     instance = ExporterInstance.query.get_or_404(instance_id)
+    denied = _require_guest_access(instance.guest)
+    if denied:
+        return denied
     if instance.status == "installed":
         flash("Uninstall the exporter before deleting.", "error")
         return redirect(url_for("prometheus_app.manage"))
@@ -621,6 +658,9 @@ def exporter_update_config(instance_id):
     from apps.exporters import KNOWN_EXPORTERS
 
     instance = ExporterInstance.query.get_or_404(instance_id)
+    denied = _require_guest_access(instance.guest)
+    if denied:
+        return denied
     if instance.status == "installed":
         flash("Uninstall the exporter before changing its configuration.", "error")
         return redirect(url_for("prometheus_app.manage"))
@@ -655,6 +695,10 @@ def exporter_update_config(instance_id):
 @bp.route("/host-exporters/add", methods=["POST"])
 def host_exporter_add():
     from apps.exporters import KNOWN_EXPORTERS
+
+    denied = _require_host_admin()
+    if denied:
+        return denied
 
     data = request.form if request.form else (request.get_json(silent=True) or {})
     host_id = data.get("host_id", "")
@@ -723,6 +767,9 @@ def host_exporter_install(instance_id):
     if _host_exporter_install_job["running"] or _host_exporter_uninstall_job["running"]:
         return jsonify({"error": "Another host exporter operation is already running."}), 409
 
+    if not current_user.is_admin:
+        return jsonify({"error": "Administrator access is required."}), 403
+
     instance = HostExporterInstance.query.get_or_404(instance_id)
 
     _host_exporter_install_job["running"] = True
@@ -775,6 +822,9 @@ def host_exporter_uninstall(instance_id):
     if _host_exporter_install_job["running"] or _host_exporter_uninstall_job["running"]:
         return jsonify({"error": "Another host exporter operation is already running."}), 409
 
+    if not current_user.is_admin:
+        return jsonify({"error": "Administrator access is required."}), 403
+
     instance = HostExporterInstance.query.get_or_404(instance_id)
 
     _host_exporter_uninstall_job["running"] = True
@@ -824,6 +874,10 @@ def host_exporter_uninstall_status():
 
 @bp.route("/host-exporters/<int:instance_id>/delete", methods=["POST"])
 def host_exporter_delete(instance_id):
+    denied = _require_host_admin()
+    if denied:
+        return denied
+
     instance = HostExporterInstance.query.get_or_404(instance_id)
     if instance.status == "installed":
         flash("Uninstall the exporter before deleting.", "error")
@@ -842,6 +896,10 @@ def host_exporter_delete(instance_id):
 @bp.route("/host-exporters/<int:instance_id>/config", methods=["POST"])
 def host_exporter_update_config(instance_id):
     from apps.exporters import KNOWN_EXPORTERS
+
+    denied = _require_host_admin()
+    if denied:
+        return denied
 
     instance = HostExporterInstance.query.get_or_404(instance_id)
     if instance.status == "installed":

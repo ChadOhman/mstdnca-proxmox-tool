@@ -337,6 +337,15 @@ class User(UserMixin, db.Model):
         guest_tag_ids = {t.id for t in guest.tags}
         return bool(user_tag_ids & guest_tag_ids)
 
+    def may_access_guest(self, guest):
+        """Single predicate for "may this user act on this guest?".
+
+        Admin-tier roles (level >= 3) see every guest; everyone else is limited
+        to guests carrying one of their tags.  Use this instead of an ad-hoc
+        ``is_admin or can_access_guest(...)`` pair so read and write paths agree.
+        """
+        return bool(self.is_admin or self.can_access_guest(guest))
+
     def accessible_guests(self):
         """Return list of guests this user can access."""
         if self.is_super_admin:

@@ -75,6 +75,10 @@ SQLite via SQLAlchemy. Schema migrations run at startup in `_migrate_schema()` (
 
 Local login → Cloudflare Access JWT (`auth/cloudflare_access.py`) → Local network auto-login (`auth/local_network.py`, trusted CIDRs). Role-based permissions: super_admin > admin > operator > viewer; see `Role.PERMISSION_FIELDS` for the full flag list.
 
+**Client IP / proxy trust.** `auth/local_network._get_client_ip()` is the single source of truth for the caller's address — the local bypass, login and API rate limiting (`routes/auth.py`, `auth/jwt_auth.py`) and `auth/audit.log_action()` all go through it. It returns `request.remote_addr` and never parses forwarded headers itself. `ProxyFix` is installed in `create_app()` **only** when `Config.TRUSTED_PROXY_COUNT` (env `TRUSTED_PROXY_COUNT`, default `0`) is greater than 0, so with the default no client-supplied header can influence `remote_addr`. When ProxyFix is active, `CF-Connecting-IP` is additionally honoured, but only if the pre-ProxyFix peer (`environ["werkzeug.proxy_fix.orig"]["REMOTE_ADDR"]`) is loopback/private. Deployments behind cloudflared or nginx must set `TRUSTED_PROXY_COUNT=1`; a startup WARNING is logged when CF Access or the local bypass is enabled while it is 0.
+
+**Session tracking.** All three auth paths call `auth/session_manager.start_session()`, so bypass and CF Access sessions get a `UserSession` row and are listed/revocable. Bypass sessions carry a `_local_bypass` flag in the Flask session and are re-validated against `local_bypass_enabled` + `trusted_subnets` on every request.
+
 ## Credentials
 
 Fernet symmetric encryption (`auth/credential_store.py`), key at `/etc/mstdnca/secret.key`. Fernet instance cached at module level with thread-safe double-checked locking.

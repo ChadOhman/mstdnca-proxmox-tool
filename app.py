@@ -46,13 +46,24 @@ def create_app(test_config=None):
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config.from_object(Config)
 
-    # Trust one layer of reverse-proxy headers (nginx, Cloudflare, etc.).
-    # This makes request.remote_addr reflect the real client IP.
-    from werkzeug.middleware.proxy_fix import ProxyFix
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-
     if test_config:
         app.config.update(test_config)
+
+    # Reverse-proxy header trust is opt-in.  ProxyFix rewrites REMOTE_ADDR from
+    # the client-supplied X-Forwarded-For header, so installing it when nothing
+    # trustworthy sits in front of the app would let any client choose its own
+    # source IP.  With TRUSTED_PROXY_COUNT=0 (the default) it is not installed at
+    # all and request.remote_addr stays the real TCP peer everywhere.
+    proxy_count = app.config.get("TRUSTED_PROXY_COUNT", 0) or 0
+    if proxy_count > 0:
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=proxy_count,
+            x_proto=proxy_count,
+            x_host=proxy_count,
+            x_prefix=proxy_count,
+        )
 
     # Ensure data directory exists
     os.makedirs(DATA_DIR, exist_ok=True)

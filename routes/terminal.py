@@ -189,7 +189,7 @@ def _ws_send(ws, msg_type, data):
 @bp.route("/")
 @login_required
 def index():
-    if not current_user.can_ssh and not current_user.is_admin:
+    if not current_user.can_ssh:
         flash("You don't have SSH terminal permission.", "error")
         return redirect(url_for("dashboard.index"))
 
@@ -231,13 +231,13 @@ def index():
 @bp.route("/<int:guest_id>")
 @login_required
 def connect(guest_id):
-    if not current_user.can_ssh and not current_user.is_admin:
+    if not current_user.can_ssh:
         flash("You don't have SSH terminal permission.", "error")
         return redirect(url_for("dashboard.index"))
 
     guest = Guest.query.get_or_404(guest_id)
 
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to access this guest.", "error")
         return redirect(url_for("terminal.index"))
 
@@ -270,13 +270,13 @@ def connect(guest_id):
 @login_required
 def follow(guest_id, session_id):
     """Read-only follow view that mirrors an active terminal session."""
-    if not current_user.can_ssh and not current_user.is_admin:
+    if not current_user.can_ssh:
         flash("You don't have SSH terminal permission.", "error")
         return redirect(url_for("dashboard.index"))
 
     guest = Guest.query.get_or_404(guest_id)
 
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to access this guest.", "error")
         return redirect(url_for("terminal.index"))
 
@@ -298,13 +298,13 @@ def follow(guest_id, session_id):
 @login_required
 def popout(guest_id):
     """Render the terminal in a minimal standalone window (no navbar)."""
-    if not current_user.can_ssh and not current_user.is_admin:
+    if not current_user.can_ssh:
         flash("You don't have SSH terminal permission.", "error")
         return redirect(url_for("dashboard.index"))
 
     guest = Guest.query.get_or_404(guest_id)
 
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to access this guest.", "error")
         return redirect(url_for("terminal.index"))
 
@@ -333,12 +333,12 @@ def popout(guest_id):
 @login_required
 def connect_adhoc(guest_id):
     """Store ad-hoc SSH credentials in the session and redirect to the terminal."""
-    if not current_user.can_ssh and not current_user.is_admin:
+    if not current_user.can_ssh:
         flash("You don't have SSH terminal permission.", "error")
         return redirect(url_for("dashboard.index"))
 
     guest = Guest.query.get_or_404(guest_id)
-    if not current_user.is_admin and not current_user.can_access_guest(guest):
+    if not current_user.may_access_guest(guest):
         flash("You don't have permission to access this guest.", "error")
         return redirect(url_for("terminal.index"))
 
@@ -409,7 +409,7 @@ def _ws_primary(ws, guest_id):
         if not ws_user.is_authenticated:
             _ws_send(ws, "error", "Not authenticated")
             return
-        if not ws_user.can_ssh and not ws_user.is_admin:
+        if not ws_user.can_ssh:
             _ws_send(ws, "error", "No SSH permission")
             return
 
@@ -417,7 +417,7 @@ def _ws_primary(ws, guest_id):
         if not guest:
             _ws_send(ws, "error", "Guest not found")
             return
-        if not ws_user.is_admin and not ws_user.can_access_guest(guest):
+        if not ws_user.may_access_guest(guest):
             _ws_send(ws, "error", "Access denied")
             return
 
@@ -690,7 +690,7 @@ def _ws_follow(ws, guest_id, session_id):
         if not ws_user.is_authenticated:
             _ws_send(ws, "error", "Not authenticated")
             return
-        if not ws_user.can_ssh and not ws_user.is_admin:
+        if not ws_user.can_ssh:
             _ws_send(ws, "error", "No SSH permission")
             return
 
@@ -698,7 +698,7 @@ def _ws_follow(ws, guest_id, session_id):
         if not guest:
             _ws_send(ws, "error", "Guest not found")
             return
-        if not ws_user.is_admin and not ws_user.can_access_guest(guest):
+        if not ws_user.may_access_guest(guest):
             _ws_send(ws, "error", "Access denied")
             return
 

@@ -175,11 +175,13 @@
                 case 'session_id':
                     // Server tells us our session ID so we can display a share link
                     currentSessionId = msg.data;
-                    // Tell the presence system to advertise the follow URL so that
-                    // users following us land directly on the read-only follower page
+                    // Advertise only the guest page in presence — never the live
+                    // session id, which presence broadcasts to every connected
+                    // user regardless of tag scope.  Followers who are allowed to
+                    // see this guest resolve the session id from the tag-filtered
+                    // /api/collab/terminal-sessions endpoint instead.
                     if (!FOLLOW_MODE) {
-                        document.body.dataset.collabPage =
-                            `/terminal/{{ guest.id }}/follow/${msg.data}`;
+                        document.body.dataset.collabPage = `/terminal/{{ guest.id }}`;
                         if (window._collabSendPresence) window._collabSendPresence();
                     }
                     break;
