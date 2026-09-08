@@ -795,7 +795,7 @@ def _get_config():
         "guest_id": Setting.get("prometheus_guest_id", ""),
         "unifi_url": Setting.get("unifi_base_url", ""),
         "unifi_user": Setting.get("unifi_username", ""),
-        "unifi_pass": Setting.get("unifi_password", ""),
+        "unifi_pass": _get_unifi_password(),
         "unifi_site": Setting.get("unpoller_site_name", "default"),
         "metric_prefix": Setting.get("unpoller_metric_prefix", "unpoller"),
         "listen_port": Setting.get("unpoller_listen_port", str(DEFAULT_PORT)),
@@ -803,6 +803,29 @@ def _get_config():
         # routes/settings.py, clients/unifi_client.py) instead of hardcoding false.
         "verify_ssl": Setting.get("unifi_verify_ssl", "false") == "true",
     }
+
+
+def _get_unifi_password():
+    """Return the decrypted UniFi controller password, or "" if unavailable.
+
+    The value is stored Fernet-encrypted by the settings UI. decrypt() returns
+    None for an empty value and raises (e.g. InvalidToken) on a non-Fernet or
+    corrupt string, so guard both cases rather than crash install/reconfigure.
+    """
+    from auth.credential_store import decrypt
+
+    encrypted_pw = Setting.get("unifi_password", "")
+    if not encrypted_pw:
+        return ""
+    try:
+        return decrypt(encrypted_pw) or ""
+    except Exception:
+        logger.error(
+            "Failed to decrypt unifi_password; unpoller up.conf will have an empty "
+            "UniFi password. Re-save the UniFi credentials in Settings to fix this.",
+            exc_info=True,
+        )
+        return ""
 
 
 def _toml_escape(value):

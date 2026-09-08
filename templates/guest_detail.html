@@ -940,8 +940,8 @@
                 set('u-bytes',
                     `<i class="bi bi-arrow-up text-muted"></i> ${fmtBytes(s.tx_bytes)} &nbsp;·&nbsp; <i class="bi bi-arrow-down text-muted"></i> ${fmtBytes(s.rx_bytes)}`
                 );
-                set('u-ip', s.ip || '-');
-                set('u-network', s.network || 'Unknown');
+                set('u-ip', escHtml(s.ip || '-'));
+                set('u-network', escHtml(s.network || 'Unknown'));
                 set('u-uptime', fmtUptime(s.uptime));
 
                 const el = document.getElementById('unifi-poll-time');

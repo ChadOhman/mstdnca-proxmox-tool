@@ -5,6 +5,7 @@ import json
 import re
 from unittest.mock import MagicMock, patch
 
+from auth.credential_store import encrypt
 from models import Credential, Guest, Setting, db
 
 
@@ -163,7 +164,8 @@ class TestUnpollerGetConfig:
             Setting.set("prometheus_guest_id", "42")
             Setting.set("unifi_base_url", "https://udm.local")
             Setting.set("unifi_username", "testuser")
-            Setting.set("unifi_password", "test-only-testpass")
+            # Stored encrypted, exactly as the settings UI persists it.
+            Setting.set("unifi_password", encrypt("test-only-testpass"))
             Setting.set("unpoller_site_name", "mysite")
             db.session.commit()
 
@@ -171,8 +173,30 @@ class TestUnpollerGetConfig:
             assert config["guest_id"] == "42"
             assert config["unifi_url"] == "https://udm.local"
             assert config["unifi_user"] == "testuser"
+            # Decrypted plaintext must reach up.conf, not the ciphertext.
             assert config["unifi_pass"] == "test-only-testpass"
             assert config["unifi_site"] == "mysite"
+
+    def test_get_config_password_unset(self, app):
+        from apps.unpoller import _get_config
+
+        with app.app_context():
+            # A blank/unset password yields an empty string, not a crash.
+            # (Session-scoped DB is shared, so set it explicitly.)
+            Setting.set("unifi_password", "")
+            db.session.commit()
+            config = _get_config()
+            assert config["unifi_pass"] == ""
+
+    def test_get_config_corrupt_password_falls_back(self, app):
+        from apps.unpoller import _get_config
+
+        with app.app_context():
+            # A non-Fernet / corrupt value must not crash install/reconfigure.
+            Setting.set("unifi_password", "not-a-valid-fernet-token")
+            db.session.commit()
+            config = _get_config()
+            assert config["unifi_pass"] == ""
 
     def test_get_config_follows_unifi_verify_ssl_setting(self, app):
         """verify_ssl must track the app's existing UniFi verify-SSL setting (the
@@ -299,7 +323,7 @@ class TestRunUnpollerInstall:
             Setting.set("prometheus_guest_id", str(guest.id))
             Setting.set("unifi_base_url", "https://udm.local")
             Setting.set("unifi_username", "admin")
-            Setting.set("unifi_password", "test-only-unifi-pass")
+            Setting.set("unifi_password", encrypt("test-only-unifi-pass"))
             Setting.set("unpoller_latest_version", "1.2.3")
             db.session.commit()
 
@@ -358,7 +382,7 @@ class TestRunUnpollerReconfig:
             Setting.set("prometheus_guest_id", str(guest.id))
             Setting.set("unifi_base_url", "https://udm.local")
             Setting.set("unifi_username", "admin")
-            Setting.set("unifi_password", 'pw"withquote')
+            Setting.set("unifi_password", encrypt('pw"withquote'))
             db.session.commit()
 
             ok, logs = run_unpoller_reconfig()

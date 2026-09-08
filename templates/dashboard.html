@@ -443,14 +443,14 @@
             const tr = document.createElement('tr');
             const pbsBadge = h.is_pbs ? ' <span class="badge bg-warning text-dark">PBS</span>' : '';
             if (!h.online) {
-                tr.innerHTML = '<td><a href="/hosts/' + h.id + '" class="text-light text-decoration-none">' + h.name + '</a>' + pbsBadge + ' <span class="badge bg-danger">Offline</span></td>' +
+                tr.innerHTML = '<td><a href="/hosts/' + h.id + '" class="text-light text-decoration-none">' + escHtml(h.name) + '</a>' + pbsBadge + ' <span class="badge bg-danger">Offline</span></td>' +
                                '<td colspan="5" class="text-muted">Unreachable</td>';
             } else {
                 const memPct = h.memory_total ? ((h.memory_used / h.memory_total) * 100).toFixed(1) : 0;
                 const rootPct = h.rootfs_total ? ((h.rootfs_used / h.rootfs_total) * 100).toFixed(1) : 0;
                 const load = h.loadavg ? h.loadavg.join(', ') : '-';
                 tr.innerHTML =
-                    '<td><a href="/hosts/' + h.id + '" class="text-light text-decoration-none">' + h.name + '</a>' + pbsBadge + '</td>' +
+                    '<td><a href="/hosts/' + h.id + '" class="text-light text-decoration-none">' + escHtml(h.name) + '</a>' + pbsBadge + '</td>' +
                     '<td><span class="text-' + pctColor(h.cpu_usage) + '">' + h.cpu_usage + '%</span><br>' + progressBar(h.cpu_usage, true) + '</td>' +
                     '<td><span class="text-' + pctColor(memPct) + '">' + memPct + '%</span><br>' + progressBar(memPct, true) +
                     '<small class="text-muted">' + formatBytes(h.memory_used) + '/' + formatBytes(h.memory_total) + '</small></td>' +
@@ -513,11 +513,10 @@
         guests.forEach(g => {
             const tr = document.createElement('tr');
             let nameCell = g.guest_id
-                ? '<a href="/guests/' + g.guest_id + '" class="text-light text-decoration-none">' + g.name + '</a>'
-                : g.name;
+                ? '<a href="/guests/' + g.guest_id + '" class="text-light text-decoration-none">' + escHtml(g.name) + '</a>'
+                : escHtml(g.name);
             if (g.lock) {
-                const lk = String(g.lock).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                nameCell += ' <span class="badge bg-warning text-dark" title="Locked by Proxmox — operation in progress or interrupted"><i class="bi bi-lock-fill"></i> ' + lk + '</span>';
+                nameCell += ' <span class="badge bg-warning text-dark" title="Locked by Proxmox — operation in progress or interrupted"><i class="bi bi-lock-fill"></i> ' + escHtml(g.lock) + '</span>';
             }
             const typeBadge = g.type === 'vm'
                 ? '<span class="badge bg-primary">VM</span>'
@@ -526,7 +525,7 @@
             const diskUsed = formatBytes(g.disk_used) + ' / ' + formatBytes(g.disk_total);
 
             tr.innerHTML =
-                '<td>' + nameCell + '<br><small class="text-muted">' + g.node + '</small></td>' +
+                '<td>' + nameCell + '<br><small class="text-muted">' + escHtml(g.node) + '</small></td>' +
                 '<td>' + typeBadge + '</td>' +
                 '<td><span class="text-' + pctColor(g.cpu_pct) + '">' + g.cpu_pct + '%</span><br>' + progressBar(g.cpu_pct, true) + '</td>' +
                 '<td><span class="text-' + pctColor(g.mem_pct) + '">' + g.mem_pct + '%</span><br>' + progressBar(g.mem_pct, true) +
@@ -594,7 +593,7 @@
                         : '<span class="badge bg-primary">PVE</span>';
                     const tr = document.createElement('tr');
                     tr.innerHTML =
-                        '<td><a href="/hosts/' + host.id + '" class="text-light text-decoration-none">' + host.name + '</a></td>' +
+                        '<td><a href="/hosts/' + host.id + '" class="text-light text-decoration-none">' + escHtml(host.name) + '</a></td>' +
                         '<td>' + badge + '</td>' +
                         '<td>' + count + '</td>' +
                         '<td><span class="text-muted">—</span></td>' +
@@ -628,7 +627,7 @@
                 div.className = 'list-group-item bg-dark border-secondary';
                 div.innerHTML =
                     '<div class="d-flex justify-content-between">' +
-                    '<strong><a href="/hosts/' + host.id + '" class="text-light text-decoration-none">' + host.name + '</a>' + badge + '</strong>' +
+                    '<strong><a href="/hosts/' + host.id + '" class="text-light text-decoration-none">' + escHtml(host.name) + '</a>' + badge + '</strong>' +
                     '<small class="text-muted">Live</small>' +
                     '</div>' +
                     '<small>' + statusHtml + '</small>';
