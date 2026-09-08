@@ -512,9 +512,13 @@
 
         guests.forEach(g => {
             const tr = document.createElement('tr');
-            const nameCell = g.guest_id
+            let nameCell = g.guest_id
                 ? '<a href="/guests/' + g.guest_id + '" class="text-light text-decoration-none">' + g.name + '</a>'
                 : g.name;
+            if (g.lock) {
+                const lk = String(g.lock).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                nameCell += ' <span class="badge bg-warning text-dark" title="Locked by Proxmox — operation in progress or interrupted"><i class="bi bi-lock-fill"></i> ' + lk + '</span>';
+            }
             const typeBadge = g.type === 'vm'
                 ? '<span class="badge bg-primary">VM</span>'
                 : '<span class="badge bg-success">CT</span>';

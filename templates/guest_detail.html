@@ -23,6 +23,9 @@
             {% endif %}
             {{ guest.name }}
             <span class="badge bg-{{ 'primary' if guest.guest_type == 'vm' else 'success' }}">{{ guest.guest_type|upper }}</span>
+            {% if guest.lock_reason %}
+            <span class="badge bg-warning text-dark" title="This guest is locked by Proxmox ({{ guest.lock_reason }}) — an operation is in progress or was interrupted"><i class="bi bi-lock-fill"></i> {{ guest.lock_reason }}</span>
+            {% endif %}
         </h2>
     </div>
     <div class="flex-shrink-0">
@@ -195,6 +198,9 @@
                 <span class="badge bg-warning">Paused</span>
                 {% else %}
                 <span class="badge bg-secondary">Unknown</span>
+                {% endif %}
+                {% if guest.lock_reason %}
+                <span class="badge bg-warning text-dark ms-1" title="Locked by Proxmox ({{ guest.lock_reason }}) — power actions may be blocked until the lock clears"><i class="bi bi-lock-fill"></i> {{ guest.lock_reason }}</span>
                 {% endif %}
             </span>
             {% if guest.power_state != 'running' %}

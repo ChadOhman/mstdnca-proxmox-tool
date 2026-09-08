@@ -450,6 +450,7 @@ class Guest(db.Model):
     replication_target = db.Column(db.String(128), nullable=True)  # node name if replicated
     mac_address = db.Column(db.String(17), nullable=True)  # MAC from Proxmox config (for UniFi matching)
     power_state = db.Column(db.String(16), default="unknown")  # running, stopped, paused, unknown
+    lock_reason = db.Column(db.String(32), nullable=True)  # Proxmox config lock (backup, migrate, snapshot, ...) or None
     reboot_required = db.Column(db.Boolean, default=False)
     require_snapshot = db.Column(db.String(16), default="inherit")  # inherit, yes, no
     backup_storage = db.Column(db.String(128), nullable=True)  # per-guest backup storage override

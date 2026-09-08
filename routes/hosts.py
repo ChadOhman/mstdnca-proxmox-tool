@@ -400,6 +400,8 @@ def discover(host_id):
 
             # Normalize power state from Proxmox status
             power_state = status if status in ("running", "stopped", "paused") else "unknown"
+            # Proxmox config lock (backup, migrate, snapshot, ...); absent when unlocked
+            lock_reason = g.get("lock") or None
 
             if not existing:
                 guest = Guest(
@@ -412,6 +414,7 @@ def discover(host_id):
                     replication_target=repl_target,
                     mac_address=mac,
                     power_state=power_state,
+                    lock_reason=lock_reason,
                 )
                 db.session.add(guest)
                 added += 1
@@ -430,6 +433,7 @@ def discover(host_id):
                 existing.name = g.get("name", existing.name)
                 existing.replication_target = repl_target
                 existing.power_state = power_state
+                existing.lock_reason = lock_reason
                 if mac:
                     existing.mac_address = mac
                 existing.tags.clear()
@@ -529,6 +533,7 @@ def discover_all():
                 repl_target = repl_map.get(vmid)
                 mac = client.get_guest_mac(g["node"], vmid, g["type"])
                 power_state = status if status in ("running", "stopped", "paused") else "unknown"
+                lock_reason = g.get("lock") or None
 
                 if not existing:
                     guest = Guest(
@@ -541,6 +546,7 @@ def discover_all():
                         replication_target=repl_target,
                         mac_address=mac,
                         power_state=power_state,
+                        lock_reason=lock_reason,
                     )
                     db.session.add(guest)
                     added += 1
@@ -557,6 +563,7 @@ def discover_all():
                     existing.name = g.get("name", existing.name)
                     existing.replication_target = repl_target
                     existing.power_state = power_state
+                    existing.lock_reason = lock_reason
                     if mac:
                         existing.mac_address = mac
                     existing.tags.clear()
