@@ -43,6 +43,7 @@ def create_app(test_config=None):
         _migrate_ipmi_columns()
         _migrate_moderation_columns()
         _migrate_smcipmi_to_ipmi_exporter()
+        _migrate_guest_lock_column()
         _seed_roles()
         _ensure_default_admin()
 
@@ -347,6 +348,11 @@ def _migrate_ipmi_columns():
     _add_column_if_missing("proxmox_hosts", "ipmi_username", "VARCHAR(128)")
     _add_column_if_missing("proxmox_hosts", "ipmi_password", "TEXT")
     _add_column_if_missing("proxmox_hosts", "ipmi_verify_ssl", "BOOLEAN DEFAULT 0")
+
+
+def _migrate_guest_lock_column():
+    """Add the guests.lock_reason column to databases created before lock display."""
+    _add_column_if_missing("guests", "lock_reason", "VARCHAR(32)")
 
 
 def _migrate_smcipmi_to_ipmi_exporter():

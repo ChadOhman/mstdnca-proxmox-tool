@@ -1191,6 +1191,7 @@ def dashboard_guest_stats():
                 "name": g.get("name", f"VMID {vmid}"),
                 "type": g.get("type", "vm"),
                 "node": g.get("node", ""),
+                "lock": g.get("lock") or "",
                 "host_name": host.name,
                 "cpu_pct": cpu_pct,
                 "mem_used": mem_used,
@@ -1240,6 +1241,7 @@ def host_guest_stats(host_id):
         disk_total = g.get("maxdisk", 0) or 1
         stats[vmid] = {
             "status": g.get("status", ""),
+            "lock": g.get("lock") or "",
             "cpu_pct": round(g.get("cpu", 0) * 100, 1),
             "mem_used": mem_used,
             "mem_total": mem_total,

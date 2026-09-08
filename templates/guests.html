@@ -96,6 +96,9 @@
                             {% if guest.reboot_required %}
                             <span class="text-warning ms-1" title="Reboot required"><i class="bi bi-exclamation-triangle-fill"></i></span>
                             {% endif %}
+                            {% if guest.lock_reason %}
+                            <span class="badge bg-warning text-dark ms-1" title="This guest is locked by Proxmox ({{ guest.lock_reason }}) — an operation is in progress or was interrupted"><i class="bi bi-lock-fill"></i> {{ guest.lock_reason }}</span>
+                            {% endif %}
                         </td>
                         <td>
                             <span class="badge bg-{{ 'primary' if guest.guest_type == 'vm' else 'success' }}">

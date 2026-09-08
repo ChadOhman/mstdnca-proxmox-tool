@@ -361,6 +361,7 @@
                                     {% if guest.reboot_required %}
                                     <span class="text-warning ms-1" title="Reboot required"><i class="bi bi-exclamation-triangle-fill"></i></span>
                                     {% endif %}
+                                    <span class="gs-lock">{% if guest.lock_reason %}<span class="badge bg-warning text-dark ms-1" title="Locked by Proxmox ({{ guest.lock_reason }}) — operation in progress or interrupted"><i class="bi bi-lock-fill"></i> {{ guest.lock_reason }}</span>{% endif %}</span>
                                 </td>
                                 <td>
                                     <span class="badge bg-{{ 'primary' if guest.guest_type == 'vm' else 'success' }}">{{ guest.guest_type|upper }}</span>
@@ -774,6 +775,16 @@
             const cpuTd  = row.querySelector('.gs-cpu');
             const memTd  = row.querySelector('.gs-mem');
             const diskTd = row.querySelector('.gs-disk');
+            const lockTd = row.querySelector('.gs-lock');
+            if (lockTd && s) {
+                if (s.lock) {
+                    const lk = String(s.lock).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    lockTd.innerHTML = '<span class="badge bg-warning text-dark ms-1" title="Locked by Proxmox — operation in progress or interrupted">' +
+                        '<i class="bi bi-lock-fill"></i> ' + lk + '</span>';
+                } else {
+                    lockTd.innerHTML = '';
+                }
+            }
             if (!s || s.status !== 'running') {
                 [cpuTd, memTd, diskTd].forEach(td => { if (td) td.innerHTML = '<span class="text-muted">—</span>'; });
                 return;
