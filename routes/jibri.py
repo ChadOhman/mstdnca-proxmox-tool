@@ -5,7 +5,7 @@ from datetime import datetime
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import login_required
 
-from apps.utils import JobTracker
+from apps.utils import JobTracker, _validate_abs_path, _validate_shell_param
 from auth.audit import log_action
 from models import Guest, Setting, db
 
@@ -103,9 +103,26 @@ def manage_page():
 
 @bp.route("/save", methods=["POST"])
 def save():
+    # The recording directory becomes an /etc/fstab mount point, a `mount`
+    # argument, and the parent of every recording delete, and the SMB share/user
+    # land in a credentials file and an fstab line — validate before storing.
+    from apps.jibri import _SMB_PATH_RE
+
+    recording_dir = request.form.get("jibri_recording_dir", "/srv/recordings").strip() or "/srv/recordings"
+    smb_share = request.form.get("jibri_smb_share", "").strip()
+    smb_username = request.form.get("jibri_smb_username", "").strip()
+    try:
+        _validate_abs_path(recording_dir, "Recording directory")
+        if smb_share and not _SMB_PATH_RE.match(smb_share):
+            raise ValueError(f"SMB share must look like //server/share: {smb_share!r}")
+        if smb_username:
+            _validate_shell_param(smb_username, "SMB username")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("jibri.manage_page"))
+
     Setting.set("jibri_guest_id", request.form.get("jibri_guest_id", "").strip())
-    Setting.set("jibri_recording_dir",
-                request.form.get("jibri_recording_dir", "/srv/recordings").strip() or "/srv/recordings")
+    Setting.set("jibri_recording_dir", recording_dir)
 
     protection_type = request.form.get("jibri_protection_type", "snapshot")
     Setting.set("jibri_protection_type",
@@ -116,11 +133,14 @@ def save():
                 backup_mode if backup_mode in ("snapshot", "suspend", "stop") else "snapshot")
 
     # SMB settings
-    Setting.set("jibri_smb_share", request.form.get("jibri_smb_share", "").strip())
-    Setting.set("jibri_smb_username", request.form.get("jibri_smb_username", "").strip())
+    Setting.set("jibri_smb_share", smb_share)
+    Setting.set("jibri_smb_username", smb_username)
     smb_password = request.form.get("jibri_smb_password", "")
     if smb_password:  # Only update if a new password is provided
-        Setting.set("jibri_smb_password", smb_password)
+        # Stored encrypted at rest, like peertube_db_password; apps/jibri.py
+        # decrypts it at the point of use.
+        from auth.credential_store import encrypt
+        Setting.set("jibri_smb_password", encrypt(smb_password))
 
     log_action("jibri_config_save", "settings", resource_name="jibri")
     db.session.commit()

@@ -6,15 +6,23 @@ Creates a dedicated user, systemd service, and generates an up.conf config file
 that connects to the UniFi controller using credentials from app settings.
 """
 
-import base64
 import json
 import logging
 import re
+import shlex
 import time
 import urllib.request
 from datetime import datetime
 
-from apps.utils import _log_cmd_output, _validate_shell_param, _version_gt
+from apps.utils import (
+    _cleanup_workdir,
+    _fetch_verified_tarball,
+    _log_cmd_output,
+    _remote_write_cmd,
+    _validate_release_tag,
+    _validate_shell_param,
+    _version_gt,
+)
 from clients.proxmox_api import ProxmoxClient
 from clients.ssh_client import SSHClient
 from models import Guest, Setting
@@ -36,14 +44,21 @@ def _write_remote_file(ssh, content, path, mode="640", owner="root", group=None,
 
     Returns (success, stderr).
     """
-    group = group or owner
-    b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    cmd = (
-        f"echo {b64} | base64 -d | "
-        f"install -m {mode} -o {owner} -g {group} /dev/stdin {path}"
-    )
+    cmd = _remote_write_cmd(path, content, mode=mode, owner=owner, group=group)
     stdout, stderr, code = ssh.execute_sudo(cmd, timeout=timeout)
     return code == 0, stderr or stdout or ""
+
+
+def _unpoller_release_urls(latest, up_arch):
+    """Return (asset_name, download_url, checksum_url) for an unpoller release.
+
+    unpoller's goreleaser build publishes ``unpoller_<version>_checksums.txt``
+    in each release, so the tarball's SHA-256 can be checked on the target host
+    before the binary is installed to /usr/local/bin as root.
+    """
+    asset = f"unpoller_{latest}_linux_{up_arch}.tar.gz"
+    base = f"https://github.com/{GITHUB_REPO}/releases/download/v{latest}"
+    return asset, f"{base}/{asset}", f"{base}/unpoller_{latest}_checksums.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -60,11 +75,20 @@ def check_unpoller_release():
         req = urllib.request.Request(url, headers={"User-Agent": "mstdnca-proxmox-tool"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-            latest = data.get("tag_name", "").lstrip("v")
+            tag = data.get("tag_name", "")
             release_url = data.get("html_url", "")
 
-        if not latest:
+        if not tag:
             return False, "", ""
+
+        # The tag reaches a download URL and an extraction path on the target
+        # host — validate it before it can reach either.
+        try:
+            _validate_release_tag(tag, "unpoller release tag")
+        except ValueError as e:
+            logger.error("Rejected unpoller release tag: %s", e)
+            return False, "", ""
+        latest = tag.lstrip("v")
 
         Setting.set("unpoller_latest_version", latest)
 
@@ -283,28 +307,19 @@ def run_unpoller_install(log_callback=None):
                 _log("ERROR: Failed to create directories.")
                 return False, log_lines
 
-            # Download and extract unpoller
-            dl_url = (
-                f"https://github.com/{GITHUB_REPO}/releases/download/v{latest}/"
-                f"unpoller_{latest}_linux_{up_arch}.tar.gz"
-            )
+            # Download unpoller, verify its published SHA-256, and extract it
+            # into a private temp dir (not a predictable /tmp path).
+            asset, dl_url, sums_url = _unpoller_release_urls(latest, up_arch)
             _log(f"Downloading unpoller v{latest} ({up_arch})...")
-            dl_cmd = (
-                f"cd /tmp && rm -rf unpoller_extract && mkdir unpoller_extract && "
-                f"(curl -sSL -o unpoller.tar.gz '{dl_url}' 2>/dev/null "
-                f"|| wget -q -O unpoller.tar.gz '{dl_url}') && "
-                f"tar xzf unpoller.tar.gz -C unpoller_extract"
-            )
-            stdout, stderr, code = ssh.execute_sudo(dl_cmd, timeout=120)
-            _log_cmd_output(_log, stdout, stderr, code)
-            if code != 0:
-                _log("ERROR: Failed to download unpoller.")
+            ok, workdir, err = _fetch_verified_tarball(ssh, _log, dl_url, asset, sums_url)
+            if not ok:
+                _log(f"ERROR: Failed to download unpoller: {err}")
                 return False, log_lines
 
             # Install binary
             _log("Installing binary...")
             stdout, stderr, code = ssh.execute_sudo(
-                "cp /tmp/unpoller_extract/unpoller /usr/local/bin/unpoller && "
+                f"cp {shlex.quote(workdir + '/unpoller')} /usr/local/bin/unpoller && "
                 "chmod +x /usr/local/bin/unpoller && "
                 "chown root:root /usr/local/bin/unpoller",
                 timeout=30,
@@ -312,6 +327,7 @@ def run_unpoller_install(log_callback=None):
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
                 _log("ERROR: Failed to install binary.")
+                _cleanup_workdir(ssh, workdir)
                 return False, log_lines
 
             # Generate config — written atomically with its final mode/ownership so
@@ -327,12 +343,16 @@ def run_unpoller_install(log_callback=None):
             _log("Creating systemd service...")
             service_content = _generate_systemd_unit()
             stdout, stderr, code = ssh.execute_sudo(
-                f"cat > /etc/systemd/system/unpoller.service << 'SVCEOF'\n{service_content}\nSVCEOF",
+                _remote_write_cmd(
+                    "/etc/systemd/system/unpoller.service", service_content,
+                    mode="644", owner="root",
+                ),
                 timeout=15,
             )
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
                 _log("ERROR: Failed to create systemd service.")
+                _cleanup_workdir(ssh, workdir)
                 return False, log_lines
 
             # Enable and start
@@ -355,7 +375,7 @@ def run_unpoller_install(log_callback=None):
                 _log("WARNING: Unpoller may not be running. Check logs with: journalctl -u unpoller")
 
             # Clean up
-            ssh.execute_sudo("rm -rf /tmp/unpoller_extract /tmp/unpoller.tar.gz", timeout=15)
+            _cleanup_workdir(ssh, workdir)
 
             _log(f"Unpoller v{latest} installed successfully.")
 
@@ -455,22 +475,12 @@ def run_unpoller_upgrade(log_callback=None):
             arch = (arch_out or "amd64").strip()
             up_arch = "arm64" if arch == "arm64" else "amd64"
 
-            # Download new version
-            dl_url = (
-                f"https://github.com/{GITHUB_REPO}/releases/download/v{latest}/"
-                f"unpoller_{latest}_linux_{up_arch}.tar.gz"
-            )
+            # Download the new version and verify its published SHA-256
+            asset, dl_url, sums_url = _unpoller_release_urls(latest, up_arch)
             _log(f"Downloading unpoller v{latest}...")
-            dl_cmd = (
-                f"cd /tmp && rm -rf unpoller_extract && mkdir unpoller_extract && "
-                f"(curl -sSL -o unpoller.tar.gz '{dl_url}' 2>/dev/null "
-                f"|| wget -q -O unpoller.tar.gz '{dl_url}') && "
-                f"tar xzf unpoller.tar.gz -C unpoller_extract"
-            )
-            stdout, stderr, code = ssh.execute_sudo(dl_cmd, timeout=120)
-            _log_cmd_output(_log, stdout, stderr, code)
-            if code != 0:
-                _log("ERROR: Failed to download new version.")
+            ok, workdir, err = _fetch_verified_tarball(ssh, _log, dl_url, asset, sums_url)
+            if not ok:
+                _log(f"ERROR: Failed to download new version: {err}")
                 return False, log_lines
 
             # Stop service
@@ -480,7 +490,7 @@ def run_unpoller_upgrade(log_callback=None):
             # Replace binary
             _log("Replacing binary...")
             stdout, stderr, code = ssh.execute_sudo(
-                "cp /tmp/unpoller_extract/unpoller /usr/local/bin/unpoller && "
+                f"cp {shlex.quote(workdir + '/unpoller')} /usr/local/bin/unpoller && "
                 "chmod +x /usr/local/bin/unpoller && "
                 "chown root:root /usr/local/bin/unpoller",
                 timeout=30,
@@ -488,6 +498,7 @@ def run_unpoller_upgrade(log_callback=None):
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
                 _log("ERROR: Failed to replace binary.")
+                _cleanup_workdir(ssh, workdir)
                 return False, log_lines
 
             # Start service
@@ -499,7 +510,7 @@ def run_unpoller_upgrade(log_callback=None):
                 return False, log_lines
 
             # Clean up
-            ssh.execute_sudo("rm -rf /tmp/unpoller_extract /tmp/unpoller.tar.gz", timeout=15)
+            _cleanup_workdir(ssh, workdir)
 
             _log(f"Unpoller upgraded to v{latest} successfully.")
             Setting.set("unpoller_current_version", latest)

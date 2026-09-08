@@ -202,7 +202,12 @@ class TestJibriRouteAuthed:
             assert Setting.get("jibri_backup_mode") == "suspend"
             assert Setting.get("jibri_smb_share") == "//nas/recordings"
             assert Setting.get("jibri_smb_username") == "jibri_user"
-            assert Setting.get("jibri_smb_password") == "test-only-not-real"
+            # The SMB password is stored encrypted at rest (GHSA-hx66-9rjm-v8mx):
+            # the stored value is ciphertext and only decrypts back to the input.
+            from auth.credential_store import decrypt
+            stored = Setting.get("jibri_smb_password")
+            assert stored != "test-only-not-real"
+            assert decrypt(stored) == "test-only-not-real"
 
     def test_save_validates_protection_type(self, app, auth_client):
         from models import Setting

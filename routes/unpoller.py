@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 
+from apps.utils import _validate_no_control_chars, _validate_shell_param
 from auth.audit import log_action
 from models import Guest, Setting, db
 
@@ -95,12 +96,24 @@ def manage():
 
 @bp.route("/save", methods=["POST"])
 def save():
+    # Both of these are written into up.conf on the Prometheus guest.  The TOML
+    # writer escapes them, but a newline or control character has no legitimate
+    # use in either and is rejected outright rather than escaped.
+    metric_prefix = request.form.get("unpoller_metric_prefix", "unpoller").strip() or "unpoller"
+    site_name = request.form.get("unpoller_site_name", "default").strip() or "default"
+    try:
+        _validate_shell_param(metric_prefix, "Metric prefix")
+        _validate_no_control_chars(site_name, "Site name")
+        if len(site_name) > 128:
+            raise ValueError("Site name is too long")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("unpoller.manage"))
+
     Setting.set("unpoller_auto_upgrade",
                 "true" if "unpoller_auto_upgrade" in request.form else "false")
-    Setting.set("unpoller_metric_prefix",
-                request.form.get("unpoller_metric_prefix", "unpoller").strip() or "unpoller")
-    Setting.set("unpoller_site_name",
-                request.form.get("unpoller_site_name", "default").strip() or "default")
+    Setting.set("unpoller_metric_prefix", metric_prefix)
+    Setting.set("unpoller_site_name", site_name)
 
     port = request.form.get("unpoller_listen_port", "9130").strip()
     try:

@@ -1007,10 +1007,16 @@ class TestRunPrometheusInstall:
         # A valid bootstrap config was written and Prometheus started BEFORE the
         # unified generator ran (which needs `systemctl reload prometheus` to work).
         calls = [str(c.args[0]) for c in mock_ssh.execute_sudo.call_args_list]
-        bootstrap_calls = [c for c in calls if "prometheus.yml << 'PROMEOF'" in c]
+
+        def _is_bootstrap(cmd):
+            # Written via the base64 pipe rather than a heredoc (GHSA-hx66-9rjm-v8mx)
+            return "install -m 644 -o prometheus" in cmd and "/etc/prometheus/prometheus.yml" in cmd
+
+        bootstrap_calls = [c for c in calls if _is_bootstrap(c)]
         assert len(bootstrap_calls) == 1
+        assert not any("<<" in c for c in calls), "config files must not be written with a heredoc"
         start_index = next(i for i, c in enumerate(calls) if "systemctl start prometheus" in c)
-        bootstrap_index = next(i for i, c in enumerate(calls) if "prometheus.yml << 'PROMEOF'" in c)
+        bootstrap_index = next(i for i, c in enumerate(calls) if _is_bootstrap(c))
         assert bootstrap_index < start_index
 
         with app.app_context():

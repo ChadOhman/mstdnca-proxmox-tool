@@ -5,7 +5,13 @@ from datetime import datetime
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import login_required
 
-from apps.utils import JobTracker
+from apps.utils import (
+    JobTracker,
+    _validate_email,
+    _validate_hostname,
+    _validate_http_url,
+    _validate_ipv4,
+)
 from auth.audit import log_action
 from models import Guest, Setting, db
 
@@ -113,14 +119,33 @@ def upgrade_page():
 
 @bp.route("/save", methods=["POST"])
 def save():
+    # The hostname is interpolated into config-file paths and shell arguments on
+    # the Jitsi guest, and the public IP into JVB's NAT harvester config — both
+    # are allow-listed here so a hostile value is never stored in the first place.
+    hostname = request.form.get("jitsi_hostname", "").strip()
+    letsencrypt_email = request.form.get("jitsi_letsencrypt_email", "").strip()
+    jitsi_url = request.form.get("jitsi_url", "").strip()
+    public_ip = request.form.get("jitsi_public_ip", "").strip()
+    try:
+        if hostname:
+            _validate_hostname(hostname, "Jitsi hostname")
+        if letsencrypt_email:
+            _validate_email(letsencrypt_email, "Let's Encrypt email")
+        if jitsi_url:
+            _validate_http_url(jitsi_url, "Jitsi URL")
+        if public_ip:
+            _validate_ipv4(public_ip, "Public IP")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("jitsi.upgrade_page"))
+
     Setting.set("jitsi_guest_id", request.form.get("jitsi_guest_id", "").strip())
-    Setting.set("jitsi_hostname", request.form.get("jitsi_hostname", "").strip())
+    Setting.set("jitsi_hostname", hostname)
     cert_type = request.form.get("jitsi_cert_type", "self-signed")
     Setting.set("jitsi_cert_type",
                 cert_type if cert_type in ("letsencrypt", "self-signed", "custom") else "self-signed")
-    Setting.set("jitsi_letsencrypt_email",
-                request.form.get("jitsi_letsencrypt_email", "").strip())
-    Setting.set("jitsi_url", request.form.get("jitsi_url", "").strip())
+    Setting.set("jitsi_letsencrypt_email", letsencrypt_email)
+    Setting.set("jitsi_url", jitsi_url)
     Setting.set("jitsi_current_version", request.form.get("jitsi_current_version", "").strip())
     Setting.set("jitsi_auto_upgrade",
                 "true" if "jitsi_auto_upgrade" in request.form else "false")
@@ -134,7 +159,7 @@ def save():
 
     cf_mode = request.form.get("jitsi_cf_mode", "none")
     Setting.set("jitsi_cf_mode", cf_mode if cf_mode in ("none", "tcp_only", "hybrid") else "none")
-    Setting.set("jitsi_public_ip", request.form.get("jitsi_public_ip", "").strip())
+    Setting.set("jitsi_public_ip", public_ip)
 
     Setting.set("jitsi_secure_domain",
                 "true" if "jitsi_secure_domain" in request.form else "false")

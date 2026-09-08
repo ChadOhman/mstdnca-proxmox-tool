@@ -5,7 +5,14 @@ from datetime import datetime
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import login_required
 
-from apps.utils import JobTracker
+from apps.utils import (
+    JobTracker,
+    _validate_abs_path,
+    _validate_db_name,
+    _validate_http_url,
+    _validate_shell_param,
+    _validate_username,
+)
 from auth.audit import log_action
 from models import Guest, Setting, db
 
@@ -105,13 +112,32 @@ def upgrade_page():
 
 @bp.route("/save", methods=["POST"])
 def save():
+    # user / db_name / dir / db_host all reach a root shell on the PeerTube and
+    # database guests — allow-list them before anything is persisted.
+    user = request.form.get("peertube_user", "peertube").strip() or "peertube"
+    db_name = request.form.get("peertube_db_name", "peertube").strip() or "peertube"
+    peertube_dir = request.form.get("peertube_dir", "/var/www/peertube").strip() or "/var/www/peertube"
+    peertube_url = request.form.get("peertube_url", "").strip()
+    db_host = request.form.get("peertube_db_host", "").strip()
+    try:
+        _validate_username(user, "PeerTube user")
+        _validate_db_name(db_name, "Database name")
+        _validate_abs_path(peertube_dir, "PeerTube directory")
+        if peertube_url:
+            _validate_http_url(peertube_url, "PeerTube URL")
+        if db_host:
+            _validate_shell_param(db_host, "Database host")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("peertube.upgrade_page"))
+
     Setting.set("peertube_guest_id", request.form.get("peertube_guest_id", "").strip())
     Setting.set("peertube_db_guest_id", request.form.get("peertube_db_guest_id", "").strip())
-    Setting.set("peertube_user", request.form.get("peertube_user", "peertube").strip() or "peertube")
-    Setting.set("peertube_db_name", request.form.get("peertube_db_name", "peertube").strip() or "peertube")
-    Setting.set("peertube_dir", request.form.get("peertube_dir", "/var/www/peertube").strip() or "/var/www/peertube")
-    Setting.set("peertube_url", request.form.get("peertube_url", "").strip())
-    Setting.set("peertube_db_host", request.form.get("peertube_db_host", "").strip())
+    Setting.set("peertube_user", user)
+    Setting.set("peertube_db_name", db_name)
+    Setting.set("peertube_dir", peertube_dir)
+    Setting.set("peertube_url", peertube_url)
+    Setting.set("peertube_db_host", db_host)
 
     # Encrypt DB password if provided; keep existing if blank
     db_password_raw = request.form.get("peertube_db_password", "").strip()

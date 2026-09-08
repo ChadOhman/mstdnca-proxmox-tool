@@ -5,14 +5,22 @@ Supports installing node_exporter, postgres_exporter, and redis_exporter
 on target guests via SSH, and regenerating the Prometheus scrape config.
 """
 
-import base64
 import json
 import logging
 import re
+import shlex
 import time
 import urllib.request
 
-from apps.utils import _log_cmd_output
+from apps.utils import (
+    _cleanup_workdir,
+    _fetch_verified_tarball,
+    _log_cmd_output,
+    _remote_write_cmd,
+    _validate_abs_path,
+    _validate_no_control_chars,
+    _validate_release_tag,
+)
 from clients.ssh_client import SSHClient
 
 logger = logging.getLogger(__name__)
@@ -158,12 +166,7 @@ def _write_remote_file(ssh, content, path, mode="600", owner="root", group=None,
 
     Returns (success, stderr).
     """
-    group = group or owner
-    b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    cmd = (
-        f"echo {b64} | base64 -d | "
-        f"install -m {mode} -o {owner} -g {group} /dev/stdin {path}"
-    )
+    cmd = _remote_write_cmd(path, content, mode=mode, owner=owner, group=group)
     stdout, stderr, code = ssh.execute_sudo(cmd, timeout=timeout)
     return code == 0, stderr or stdout or ""
 
@@ -245,11 +248,55 @@ def check_exporter_release(exporter_type):
         req = urllib.request.Request(url, headers={"User-Agent": "mstdnca-proxmox-tool"})
         with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
             data = json.loads(resp.read().decode())
-            latest = data.get("tag_name", "").lstrip("v")
-        return latest or None, "" if latest else "No version found"
+            tag = data.get("tag_name", "")
+        if not tag:
+            return None, "No version found"
+        # The tag comes from a third party and is interpolated into download
+        # URLs, extraction paths, and an `rm -rf` — validate before any of that.
+        try:
+            _validate_release_tag(tag, f"{exporter_type} release tag")
+        except ValueError as e:
+            logger.error("Rejected %s release tag: %s", exporter_type, e)
+            return None, str(e)
+        return tag.lstrip("v"), ""
     except Exception as e:
         logger.error("Failed to check %s releases: %s", exporter_type, e)
         return None, str(e)
+
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _render_env_file(config):
+    """Render an ``/etc/default/<exporter>`` env file from a config dict.
+
+    systemd's EnvironmentFile parser is line-based, so a newline in a value
+    would add an arbitrary extra variable (and, before this, could close the
+    heredoc the file used to be written with).  Keys are restricted to the
+    shell-variable character set and values are single-quoted after being
+    rejected for control characters.  Raises ValueError on a bad key/value.
+    """
+    lines = []
+    for key, value in config.items():
+        if not _ENV_KEY_RE.match(str(key)):
+            raise ValueError(f"invalid environment variable name: {key!r}")
+        _validate_no_control_chars(value, f"value for {key}")
+        lines.append(f"{key}={shlex.quote(str(value))}")
+    return "\n".join(lines) + "\n"
+
+
+def _release_asset_urls(info, binary, latest, dl_arch):
+    """Return (asset_name, download_url, checksum_url, extract_dir) for a release.
+
+    Every Prometheus-project and prometheus-community exporter publishes a
+    ``sha256sums.txt`` next to the tarballs in the same release, so the digest
+    can be checked on the target host before anything is unpacked as root.
+    """
+    vprefix = info.get("asset_version_prefix", "")
+    extract_dir = f"{binary}-{vprefix}{latest}.linux-{dl_arch}"
+    asset = f"{extract_dir}.tar.gz"
+    base = f"https://github.com/{info['github_repo']}/releases/download/v{latest}"
+    return asset, f"{base}/{asset}", f"{base}/sha256sums.txt", extract_dir
 
 
 def detect_exporter_version(guest, exporter_type):
@@ -407,38 +454,30 @@ def run_exporter_install(instance_id, log_callback=None):
             )
             _log_cmd_output(_log, stdout, stderr, code)
 
-            # Download and extract
-            vprefix = info.get("asset_version_prefix", "")
-            dl_url = (
-                f"https://github.com/{info['github_repo']}/releases/download/v{latest}/"
-                f"{binary}-{vprefix}{latest}.linux-{dl_arch}.tar.gz"
+            # Download, verify the published SHA-256, and extract
+            asset, dl_url, sums_url, extract_dir = _release_asset_urls(
+                info, binary, latest, dl_arch
             )
             _log(f"Downloading {info['display_name']} v{latest} ({dl_arch})...")
-            dl_cmd = (
-                f"cd /tmp && "
-                f"(curl -sSL -o {binary}.tar.gz '{dl_url}' 2>/dev/null "
-                f"|| wget -q -O {binary}.tar.gz '{dl_url}') && "
-                f"tar xzf {binary}.tar.gz"
-            )
-            stdout, stderr, code = ssh.execute_sudo(dl_cmd, timeout=120)
-            _log_cmd_output(_log, stdout, stderr, code)
-            if code != 0:
-                _log(f"ERROR: Failed to download {info['display_name']}.")
+            ok, workdir, err = _fetch_verified_tarball(ssh, _log, dl_url, asset, sums_url)
+            if not ok:
+                _log(f"ERROR: Failed to download {info['display_name']}: {err}")
                 instance.status = "failed"
                 db.session.commit()
                 return False, log_lines
 
             # Install binary
-            extract_dir = f"{binary}-{vprefix}{latest}.linux-{dl_arch}"
             _log("Installing binary...")
+            src = shlex.quote(f"{workdir}/{extract_dir}/{binary}")
             stdout, stderr, code = ssh.execute_sudo(
-                f"cp /tmp/{extract_dir}/{binary} /usr/local/bin/ && "
+                f"cp {src} /usr/local/bin/ && "
                 f"chown {binary}:{binary} /usr/local/bin/{binary}",
                 timeout=30,
             )
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
                 _log("ERROR: Failed to install binary.")
+                _cleanup_workdir(ssh, workdir)
                 instance.status = "failed"
                 db.session.commit()
                 return False, log_lines
@@ -447,11 +486,17 @@ def run_exporter_install(instance_id, log_callback=None):
             env_file = None
             if info.get("requires_config") and instance.config:
                 env_file = f"/etc/default/{binary}"
-                env_lines = "\n".join(f"{k}={v}" for k, v in instance.config.items())
+                try:
+                    env_lines = _render_env_file(instance.config)
+                except ValueError as e:
+                    _log(f"ERROR: Invalid exporter configuration: {e}")
+                    _cleanup_workdir(ssh, workdir)
+                    instance.status = "failed"
+                    db.session.commit()
+                    return False, log_lines
                 _log("Writing environment configuration...")
                 stdout, stderr, code = ssh.execute_sudo(
-                    f"cat > {env_file} << 'ENVEOF'\n{env_lines}\nENVEOF\n"
-                    f"chmod 600 {env_file}",
+                    _remote_write_cmd(env_file, env_lines, mode="600", owner="root"),
                     timeout=15,
                 )
                 _log_cmd_output(_log, stdout, stderr, code)
@@ -462,12 +507,16 @@ def run_exporter_install(instance_id, log_callback=None):
                 instance.exporter_type, instance.port, env_file
             )
             stdout, stderr, code = ssh.execute_sudo(
-                f"cat > /etc/systemd/system/{info['systemd_unit']} << 'SVCEOF'\n{service_content}\nSVCEOF",
+                _remote_write_cmd(
+                    f"/etc/systemd/system/{info['systemd_unit']}",
+                    service_content, mode="644", owner="root",
+                ),
                 timeout=15,
             )
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
                 _log("ERROR: Failed to create systemd service.")
+                _cleanup_workdir(ssh, workdir)
                 instance.status = "failed"
                 db.session.commit()
                 return False, log_lines
@@ -495,7 +544,7 @@ def run_exporter_install(instance_id, log_callback=None):
                 _log(f"WARNING: {info['display_name']} may not be running.")
 
             # Clean up
-            ssh.execute_sudo(f"rm -rf /tmp/{binary}.tar.gz /tmp/{extract_dir}", timeout=15)
+            _cleanup_workdir(ssh, workdir)
 
             _log(f"{info['display_name']} v{latest} installed successfully.")
 
@@ -618,39 +667,26 @@ def _install_host_exporter_release(ssh, info, binary, _log, exporter_type):
     arch = (arch_out or "amd64").strip()
     dl_arch = "arm64" if arch == "arm64" else "amd64"
 
-    vprefix = info.get("asset_version_prefix", "")
-    dl_url = (
-        f"https://github.com/{info['github_repo']}/releases/download/v{latest}/"
-        f"{binary}-{vprefix}{latest}.linux-{dl_arch}.tar.gz"
-    )
+    asset, dl_url, sums_url, extract_dir = _release_asset_urls(info, binary, latest, dl_arch)
     _log(f"Downloading {info['display_name']} v{latest} ({dl_arch})...")
-    dl_cmd = (
-        f"cd /tmp && "
-        f"(curl -sSL -o {binary}.tar.gz '{dl_url}' 2>/dev/null "
-        f"|| wget -q -O {binary}.tar.gz '{dl_url}') && "
-        f"tar xzf {binary}.tar.gz"
-    )
-    stdout, stderr, code = ssh.execute_sudo(dl_cmd, timeout=120)
-    _log_cmd_output(_log, stdout, stderr, code)
-    if code != 0:
-        _log(f"ERROR: Failed to download {info['display_name']}.")
+    ok, workdir, err = _fetch_verified_tarball(ssh, _log, dl_url, asset, sums_url)
+    if not ok:
+        _log(f"ERROR: Failed to download {info['display_name']}: {err}")
         return False, None
 
     # Install binary
-    extract_dir = f"{binary}-{vprefix}{latest}.linux-{dl_arch}"
     _log("Installing binary...")
+    src = shlex.quote(f"{workdir}/{extract_dir}/{binary}")
     stdout, stderr, code = ssh.execute_sudo(
-        f"cp /tmp/{extract_dir}/{binary} /usr/local/bin/ && "
+        f"cp {src} /usr/local/bin/ && "
         f"chown {binary}:{binary} /usr/local/bin/{binary}",
         timeout=30,
     )
     _log_cmd_output(_log, stdout, stderr, code)
+    _cleanup_workdir(ssh, workdir)
     if code != 0:
         _log("ERROR: Failed to install binary.")
         return False, None
-
-    # Clean up
-    ssh.execute_sudo(f"rm -rf /tmp/{binary}.tar.gz /tmp/{extract_dir}", timeout=15)
 
     return True, latest
 
@@ -754,7 +790,9 @@ def run_host_exporter_install(instance_id, log_callback=None):
                 )
 
                 _log(f"Writing exporter config to {config_path}...")
-                stdout, stderr, code = ssh.execute_sudo(f"mkdir -p {config_dir}", timeout=15)
+                stdout, stderr, code = ssh.execute_sudo(
+                    f"mkdir -p {shlex.quote(config_dir)}", timeout=15
+                )
                 if code != 0:
                     _log_cmd_output(_log, stdout, stderr, code)
                     _log("ERROR: Failed to create exporter config directory.")
@@ -773,11 +811,16 @@ def run_host_exporter_install(instance_id, log_callback=None):
             env_file = None
             if info.get("requires_config") and instance.config and not info.get("config_file_path"):
                 env_file = f"/etc/default/{binary}"
-                env_lines = "\n".join(f"{k}={v}" for k, v in instance.config.items())
+                try:
+                    env_lines = _render_env_file(instance.config)
+                except ValueError as e:
+                    _log(f"ERROR: Invalid exporter configuration: {e}")
+                    instance.status = "failed"
+                    db.session.commit()
+                    return False, log_lines
                 _log("Writing environment configuration...")
                 stdout, stderr, code = ssh.execute_sudo(
-                    f"cat > {env_file} << 'ENVEOF'\n{env_lines}\nENVEOF\n"
-                    f"chmod 600 {env_file}",
+                    _remote_write_cmd(env_file, env_lines, mode="600", owner="root"),
                     timeout=15,
                 )
                 _log_cmd_output(_log, stdout, stderr, code)
@@ -788,7 +831,10 @@ def run_host_exporter_install(instance_id, log_callback=None):
                 instance.exporter_type, instance.port, env_file
             )
             stdout, stderr, code = ssh.execute_sudo(
-                f"cat > /etc/systemd/system/{info['systemd_unit']} << 'SVCEOF'\n{service_content}\nSVCEOF",
+                _remote_write_cmd(
+                    f"/etc/systemd/system/{info['systemd_unit']}",
+                    service_content, mode="644", owner="root",
+                ),
                 timeout=15,
             )
             _log_cmd_output(_log, stdout, stderr, code)
@@ -1151,6 +1197,11 @@ def enable_mastodon_exporter(guest_id, config=None, log_callback=None):
         return True
 
     app_dir = Setting.get("mastodon_app_dir", "/home/mastodon/live")
+    try:
+        _validate_abs_path(app_dir, "Mastodon app_dir")
+    except ValueError as e:
+        _log(f"ERROR: {e}")
+        return False
     env_file = f"{app_dir}/.env.production"
     info = BUILTIN_EXPORTERS["mastodon"]
     env_vars = _build_mastodon_env_vars(config)
@@ -1176,15 +1227,16 @@ def enable_mastodon_exporter(guest_id, config=None, log_callback=None):
         with SSHClient.from_credential(ip, credential) as ssh:
             # Step 1: Remove existing exporter env vars (idempotent)
             _log(f"Updating {env_file} with Prometheus exporter env vars...")
-            sed_cmd = f"sed -i '{_MASTODON_EXPORTER_SED}' {env_file}"
+            sed_cmd = f"sed -i '{_MASTODON_EXPORTER_SED}' {shlex.quote(env_file)}"
             stdout, stderr, code = ssh.execute_sudo(sed_cmd, timeout=10)
             if code != 0:
                 _log(f"WARNING: sed returned {code}: {(stderr or '')[:200]}")
 
-            # Step 2: Append env vars
-            env_lines = "\n".join(f"{k}={v}" for k, v in env_vars.items())
-            append_cmd = f"cat >> {env_file} << 'EOF'\n{env_lines}\nEOF"
-            stdout, stderr, code = ssh.execute_sudo(append_cmd, timeout=10)
+            # Step 2: Append env vars (base64 pipe — no heredoc terminator to match)
+            env_lines = "\n".join(f"{k}={v}" for k, v in env_vars.items()) + "\n"
+            stdout, stderr, code = ssh.execute_sudo(
+                _remote_write_cmd(env_file, env_lines, append=True), timeout=10
+            )
             if code != 0:
                 _log(f"ERROR: Failed to append env vars: {(stderr or '')[:200]}")
                 return False
@@ -1195,8 +1247,10 @@ def enable_mastodon_exporter(guest_id, config=None, log_callback=None):
                 _log("Creating prometheus_exporter collector service...")
                 unit_content = _mastodon_collector_unit(app_dir, host, port)
                 stdout, stderr, code = ssh.execute_sudo(
-                    f"cat > /etc/systemd/system/{_MASTODON_COLLECTOR_UNIT} << 'SVCEOF'\n"
-                    f"{unit_content}\nSVCEOF",
+                    _remote_write_cmd(
+                        f"/etc/systemd/system/{_MASTODON_COLLECTOR_UNIT}",
+                        unit_content, mode="644", owner="root",
+                    ),
                     timeout=15,
                 )
                 _log_cmd_output(_log, stdout, stderr, code)
@@ -1312,6 +1366,11 @@ def disable_mastodon_exporter(guest_id, log_callback=None):
         return False
 
     app_dir = Setting.get("mastodon_app_dir", "/home/mastodon/live")
+    try:
+        _validate_abs_path(app_dir, "Mastodon app_dir")
+    except ValueError as e:
+        _log(f"ERROR: {e}")
+        return False
     env_file = f"{app_dir}/.env.production"
 
     credential = guest.credential
@@ -1330,7 +1389,7 @@ def disable_mastodon_exporter(guest_id, log_callback=None):
         with SSHClient.from_credential(ip, credential) as ssh:
             # Step 1: Remove env vars (both MASTODON_PROMETHEUS_EXPORTER_* and PROMETHEUS_EXPORTER_*)
             _log(f"Removing Prometheus exporter env vars from {env_file}...")
-            sed_cmd = f"sed -i '{_MASTODON_EXPORTER_SED}' {env_file}"
+            sed_cmd = f"sed -i '{_MASTODON_EXPORTER_SED}' {shlex.quote(env_file)}"
             stdout, stderr, code = ssh.execute_sudo(sed_cmd, timeout=10)
             if code != 0:
                 _log(f"WARNING: sed returned {code}: {(stderr or '')[:200]}")
@@ -1413,6 +1472,11 @@ def reconfigure_mastodon_exporter(guest_id, config, log_callback=None):
         return False
 
     app_dir = Setting.get("mastodon_app_dir", "/home/mastodon/live")
+    try:
+        _validate_abs_path(app_dir, "Mastodon app_dir")
+    except ValueError as e:
+        _log(f"ERROR: {e}")
+        return False
     env_file = f"{app_dir}/.env.production"
     env_vars = _build_mastodon_env_vars(config)
     new_port = int(config.get("port", BUILTIN_EXPORTERS["mastodon"]["default_port"]))
@@ -1435,15 +1499,16 @@ def reconfigure_mastodon_exporter(guest_id, config, log_callback=None):
         with SSHClient.from_credential(ip, credential) as ssh:
             # Step 1: Remove old env vars
             _log(f"Updating {env_file} with new Prometheus exporter configuration...")
-            sed_cmd = f"sed -i '{_MASTODON_EXPORTER_SED}' {env_file}"
+            sed_cmd = f"sed -i '{_MASTODON_EXPORTER_SED}' {shlex.quote(env_file)}"
             stdout, stderr, code = ssh.execute_sudo(sed_cmd, timeout=10)
             if code != 0:
                 _log(f"WARNING: sed returned {code}: {(stderr or '')[:200]}")
 
-            # Step 2: Append new env vars
-            env_lines = "\n".join(f"{k}={v}" for k, v in env_vars.items())
-            append_cmd = f"cat >> {env_file} << 'EOF'\n{env_lines}\nEOF"
-            stdout, stderr, code = ssh.execute_sudo(append_cmd, timeout=10)
+            # Step 2: Append new env vars (base64 pipe — no heredoc terminator to match)
+            env_lines = "\n".join(f"{k}={v}" for k, v in env_vars.items()) + "\n"
+            stdout, stderr, code = ssh.execute_sudo(
+                _remote_write_cmd(env_file, env_lines, append=True), timeout=10
+            )
             if code != 0:
                 _log(f"ERROR: Failed to append env vars: {(stderr or '')[:200]}")
                 return False
@@ -1454,8 +1519,10 @@ def reconfigure_mastodon_exporter(guest_id, config, log_callback=None):
                 _log("Updating collector service...")
                 unit_content = _mastodon_collector_unit(app_dir, new_host, new_port)
                 ssh.execute_sudo(
-                    f"cat > /etc/systemd/system/{_MASTODON_COLLECTOR_UNIT} << 'SVCEOF'\n"
-                    f"{unit_content}\nSVCEOF",
+                    _remote_write_cmd(
+                        f"/etc/systemd/system/{_MASTODON_COLLECTOR_UNIT}",
+                        unit_content, mode="644", owner="root",
+                    ),
                     timeout=15,
                 )
                 ssh.execute_sudo(

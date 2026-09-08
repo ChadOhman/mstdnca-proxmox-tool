@@ -17,7 +17,15 @@ from urllib.request import Request, urlopen
 from apps.backup import backup_guest, snapshot_guest
 
 # Shared shell-safety and output helpers from the Mastodon module
-from apps.utils import _log_cmd_output, _validate_shell_param, _version_gt
+from apps.utils import (
+    _log_cmd_output,
+    _validate_abs_path,
+    _validate_db_name,
+    _validate_release_tag,
+    _validate_shell_param,
+    _validate_username,
+    _version_gt,
+)
 from clients.proxmox_api import ProxmoxClient
 from clients.ssh_client import SSHClient
 from models import Guest, Setting
@@ -140,9 +148,18 @@ def check_peertube_release():
         if not tag:
             return False, "", ""
 
+        # The tag is interpolated into a download URL, a file name, and a symlink
+        # target on the guest — validate it before it can reach any of them.
+        try:
+            _validate_release_tag(tag, "PeerTube release tag")
+        except ValueError as e:
+            logger.error("Rejected PeerTube release tag: %s", e)
+            return False, "", ""
+
         latest = tag.lstrip("vV")
         release_url = _PEERTUBE_RELEASE_BASE.format(tag=tag)
 
+        Setting.set("peertube_latest_release_tag", tag)
         Setting.set("peertube_latest_version", latest)
         Setting.set("peertube_latest_release_url", release_url)
 
@@ -202,8 +219,8 @@ def detect_peertube_version(guest, peertube_dir, user="peertube"):
     from models import Credential
 
     try:
-        _validate_shell_param(peertube_dir, "PeerTube dir")
-        _validate_shell_param(user, "PeerTube user")
+        _validate_abs_path(peertube_dir, "PeerTube dir")
+        _validate_username(user, "PeerTube user")
     except ValueError as e:
         return None, str(e)
 
@@ -338,9 +355,9 @@ def run_peertube_install(log_callback=None):
         return False, f"Instance URL hostname is not a valid hostname: {hostname!r}"
 
     try:
-        _validate_shell_param(user, "PeerTube user")
-        _validate_shell_param(peertube_dir, "PeerTube dir")
-        _validate_shell_param(db_name, "Database name")
+        _validate_username(user, "PeerTube user")
+        _validate_abs_path(peertube_dir, "PeerTube dir")
+        _validate_db_name(db_name, "Database name")
         if db_host:
             _validate_shell_param(db_host, "Database host")
     except ValueError as e:
@@ -621,18 +638,21 @@ def run_peertube_install(log_callback=None):
                 log(f"WARNING: {peertube_dir}/peertube-latest already exists — aborting to prevent overwrite")
                 return False, "\n".join(log_lines)
 
-            # Fetch latest version from GitHub
+            # Resolve the release tag here, on the tool host, where it goes
+            # through _validate_release_tag — rather than shelling out to a
+            # `curl | python3 -c` one-liner on the guest and feeding whatever it
+            # printed straight back into root shell commands.
             log("Fetching latest release version from GitHub...")
-            stdout, stderr, code = ssh.execute_sudo(
-                "curl -s https://api.github.com/repos/chocobozzz/peertube/releases/latest"
-                " | python3 -c \"import sys,json; print(json.load(sys.stdin).get('tag_name',''))\"",
-                timeout=30,
-            )
-            if code != 0 or not (stdout or "").strip():
+            check_peertube_release()
+            version_tag = Setting.get("peertube_latest_release_tag", "")
+            if not version_tag:
                 log("ERROR: Could not determine latest PeerTube version from GitHub")
-                _log_cmd_output(log, stdout, stderr, code, max_chars=500)
                 return False, "\n".join(log_lines)
-            version_tag = (stdout or "").strip()
+            try:
+                _validate_release_tag(version_tag, "PeerTube release tag")
+            except ValueError as e:
+                log(f"ERROR: {e}")
+                return False, "\n".join(log_lines)
             version_num = version_tag.lstrip("vV")
             log(f"Latest release: {version_tag}")
 
@@ -908,8 +928,8 @@ def run_peertube_preflight(log_callback=None):
     peertube_dir = config.get("peertube_dir", "/var/www/peertube")
 
     try:
-        _validate_shell_param(user, "PeerTube user")
-        _validate_shell_param(peertube_dir, "PeerTube dir")
+        _validate_username(user, "PeerTube user")
+        _validate_abs_path(peertube_dir, "PeerTube dir")
         check("Shell-safe config values", True)
     except ValueError as e:
         check("Shell-safe config values", False, str(e))
@@ -1153,9 +1173,9 @@ def run_peertube_upgrade(log_callback=None, skip_protection=False):
     db_name = config["db_name"]
 
     try:
-        _validate_shell_param(user, "PeerTube user")
-        _validate_shell_param(peertube_dir, "PeerTube dir")
-        _validate_shell_param(db_name, "Database name")
+        _validate_username(user, "PeerTube user")
+        _validate_abs_path(peertube_dir, "PeerTube dir")
+        _validate_db_name(db_name, "Database name")
     except ValueError as e:
         return False, str(e)
 
