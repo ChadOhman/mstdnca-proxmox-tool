@@ -1,5 +1,7 @@
 """Tests for the Prometheus exporter management system."""
 
+import base64
+import re
 from unittest.mock import MagicMock, patch
 
 from models import Credential, ExporterInstance, Guest, HostExporterInstance, ProxmoxHost, Setting, db
@@ -7,6 +9,44 @@ from models import Credential, ExporterInstance, Guest, HostExporterInstance, Pr
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class _FakeSSH:
+    """Minimal SSHClient.from_credential() stand-in for exercising _regenerate_
+    prometheus_config() and friends without a real SSH connection.
+
+    `responses` is a list of (substring, (stdout, stderr, code)) checked in order
+    against each execute_sudo() command; the first substring match wins. Unmatched
+    commands succeed with ("", "", 0). Every command is recorded in `.calls`.
+    """
+
+    def __init__(self, responses=None):
+        self.responses = responses or []
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def execute_sudo(self, cmd, timeout=None):
+        self.calls.append(cmd)
+        for substr, result in self.responses:
+            if substr in cmd:
+                return result
+        return ("", "", 0)
+
+    def execute(self, cmd, timeout=None):
+        return self.execute_sudo(cmd, timeout=timeout)
+
+
+def _decode_written_file(cmd):
+    """Extract and base64-decode the payload from a `_write_remote_file()` command
+    (`echo <b64> | base64 -d | install ...`)."""
+    m = re.search(r"echo (\S+) \| base64 -d", cmd)
+    assert m, f"command does not look like a base64 atomic write: {cmd!r}"
+    return base64.b64decode(m.group(1)).decode("utf-8")
 
 def _create_host(app):
     """Create a minimal host for guest FK."""
@@ -212,14 +252,24 @@ class TestExporterLogic:
 
     def test_detect_exporter_version_no_credential(self, app):
         from apps.exporters import detect_exporter_version
+        from models import Credential
         with app.app_context():
-            guest = _create_guest(app, name="exp-nocred-test", ip="10.0.0.64")
-            version, err = detect_exporter_version(guest, "node_exporter")
-            assert version is None
-            assert "credential" in err.lower()
-
-            db.session.delete(guest)
+            # Other suites may leave an is_default credential behind in the
+            # session-scoped DB; the fallback lookup would then find it.
+            leaked = Credential.query.filter_by(is_default=True).all()
+            for cred in leaked:
+                cred.is_default = False
             db.session.commit()
+            guest = _create_guest(app, name="exp-nocred-test", ip="10.0.0.64")
+            try:
+                version, err = detect_exporter_version(guest, "node_exporter")
+                assert version is None
+                assert "credential" in err.lower()
+            finally:
+                db.session.delete(guest)
+                for cred in leaked:
+                    cred.is_default = True
+                db.session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +332,30 @@ class TestExporterRoutes:
             "port": "9100",
         }, follow_redirects=False)
         assert resp.status_code in (302, 303)
+
+    def test_exporter_add_rejects_host_level_exporter(self, auth_client, app):
+        """exporter_add (the per-guest route) must reject host-level exporter types
+        like ipmi_exporter — those install via /prometheus/host-exporters/add
+        instead (mirrors the host route's own guard, see routes/prometheus_app.py
+        host_exporter_add())."""
+        with app.app_context():
+            guest = _create_guest(app, name="exp-route-hostlevel", ip="10.0.0.71")
+            guest_id = guest.id
+
+        resp = auth_client.post("/prometheus/exporters/add", data={
+            "guest_id": str(guest_id),
+            "exporter_type": "ipmi_exporter",
+            "port": "9290",
+        }, follow_redirects=True)
+        assert resp.status_code == 200
+        assert b"host-level" in resp.data.lower()
+
+        with app.app_context():
+            assert ExporterInstance.query.filter_by(guest_id=guest_id).first() is None
+            guest = Guest.query.get(guest_id)
+            if guest:
+                db.session.delete(guest)
+            db.session.commit()
 
     def test_exporter_add_missing_guest(self, auth_client):
         resp = auth_client.post("/prometheus/exporters/add", data={
@@ -1522,3 +1596,385 @@ class TestHostExporterModel:
         from apps.exporters import KNOWN_EXPORTERS
         assert KNOWN_EXPORTERS["node_exporter"].get("host_level") is not True
         assert KNOWN_EXPORTERS["postgres_exporter"].get("host_level") is not True
+
+
+# ---------------------------------------------------------------------------
+# Config-generation helpers (issue #128)
+# ---------------------------------------------------------------------------
+
+class TestConfigHelpers:
+
+    def test_slugify_job_name(self):
+        from apps.exporters import _slugify_job_name
+        assert _slugify_job_name("My Host!") == "my_host"
+        assert _slugify_job_name("proxmox-01") == "proxmox-01"
+        assert _slugify_job_name('quote"host') == "quote_host"
+        assert _slugify_job_name("  spaced  ") == "spaced"
+        assert _slugify_job_name("") == "unnamed"
+        assert _slugify_job_name("!!!") == "unnamed"
+
+    def test_dedupe_job_name(self):
+        from apps.exporters import _dedupe_job_name
+        used = set()
+        assert _dedupe_job_name("ipmi_host1", used) == "ipmi_host1"
+        assert _dedupe_job_name("ipmi_host1", used) == "ipmi_host1_2"
+        assert _dedupe_job_name("ipmi_host1", used) == "ipmi_host1_3"
+        assert used == {"ipmi_host1", "ipmi_host1_2", "ipmi_host1_3"}
+
+    def test_yaml_single_quote_basic(self):
+        from apps.exporters import _yaml_single_quote
+        assert _yaml_single_quote("simple") == "'simple'"
+
+    def test_yaml_single_quote_escapes_embedded_quote(self):
+        from apps.exporters import _yaml_single_quote
+        # A raw double-quoted "{val}" would have broken on this; single-quote
+        # style only needs the quote doubled.
+        assert _yaml_single_quote('pass"word') == "'pass\"word'"
+        assert _yaml_single_quote("it's") == "'it''s'"
+
+    def test_yaml_single_quote_strips_newlines(self):
+        from apps.exporters import _yaml_single_quote
+        quoted = _yaml_single_quote("line1\nline2\r\n")
+        assert "\n" not in quoted
+        assert "\r" not in quoted
+        assert quoted == "'line1 line2 '"
+
+    def test_yaml_single_quote_output_is_valid_yaml(self):
+        import yaml
+
+        from apps.exporters import _yaml_single_quote
+        for raw in ["simple", 'has"quote', "has'quote", "new\nline", ""]:
+            doc = f"key: {_yaml_single_quote(raw)}\n"
+            parsed = yaml.safe_load(doc)
+            assert isinstance(parsed["key"], str)
+
+    def test_write_remote_file_uses_base64_install_not_heredoc(self):
+        from apps.exporters import _write_remote_file
+        fake = _FakeSSH()
+        secret_content = "password: test-only-password\nCFGEOF\nmore: data\n"
+        ok, err = _write_remote_file(fake, secret_content, "/etc/foo/config.yml", mode="600", owner="myuser")
+        assert ok is True
+        assert len(fake.calls) == 1
+        cmd = fake.calls[0]
+        assert "cat >" not in cmd
+        assert "<<" not in cmd
+        assert "test-only-password" not in cmd  # raw content never appears in the command line
+        assert "install -m 600 -o myuser -g myuser /dev/stdin /etc/foo/config.yml" in cmd
+        assert _decode_written_file(cmd) == secret_content
+
+    def test_write_remote_file_reports_failure(self):
+        from apps.exporters import _write_remote_file
+        fake = _FakeSSH(responses=[("install", ("", "permission denied", 1))])
+        ok, err = _write_remote_file(fake, "x: 1\n", "/etc/foo.yml")
+        assert ok is False
+        assert "permission denied" in err
+
+
+# ---------------------------------------------------------------------------
+# Unified, validated prometheus.yml generator (issue #128)
+# ---------------------------------------------------------------------------
+
+class TestRegeneratePrometheusConfig:
+    """NOTE: "prometheus_guest_id" is a global Setting shared across the whole
+    (session-scoped) test DB — every test here that points it at a guest resets it
+    to "" afterward so it doesn't leak into unrelated tests in other files that
+    assume it's unset by default (e.g. tests/test_unpoller.py's
+    TestUnpollerGetConfig.test_get_config_defaults)."""
+
+    def _prom_guest(self, app, ip="10.0.0.200"):
+        guest = _create_guest(app, name="prom-guest", ip=ip, with_credential=True)
+        Setting.set("prometheus_guest_id", str(guest.id))
+        return guest
+
+    def _reset_prometheus_guest_id(self, app):
+        with app.app_context():
+            Setting.set("prometheus_guest_id", "")
+            db.session.commit()
+
+    def test_skips_when_no_guest_configured(self, app):
+        from apps.exporters import _regenerate_prometheus_config
+        with app.app_context():
+            Setting.set("prometheus_guest_id", "")
+            log = []
+            result = _regenerate_prometheus_config(log.append)
+            assert result is True
+            assert any("Skipping" in m for m in log)
+
+    def test_invalid_guest_id_returns_false(self, app):
+        from apps.exporters import _regenerate_prometheus_config
+        with app.app_context():
+            Setting.set("prometheus_guest_id", "not-a-number")
+            log = []
+            result = _regenerate_prometheus_config(log.append)
+            assert result is False
+            assert any("ERROR" in m for m in log)
+        self._reset_prometheus_guest_id(app)
+
+    @patch("apps.exporters.SSHClient")
+    def test_generated_config_includes_every_configured_job(self, MockSSH, app):
+        """Single generator: mstdnca, per-guest exporter instances, IPMI (host-level,
+        multi-target), and unpoller must all appear in the config produced by ONE
+        call — this is the fix for the three-generators-overwrite-each-other bug."""
+        from apps.exporters import _regenerate_prometheus_config
+
+        fake = _FakeSSH()
+        MockSSH.from_credential.return_value = fake
+
+        with app.app_context():
+            self._prom_guest(app, ip="10.0.0.200")
+            Setting.set("prometheus_mstdnca_metrics_url", "10.0.0.5:5000")
+            Setting.set("prometheus_auth_token", "test-only-token")
+
+            node_guest = _create_guest(app, name="node-guest", ip="10.0.0.201")
+            exp = ExporterInstance(
+                guest_id=node_guest.id, exporter_type="node_exporter", port=9100, status="installed",
+            )
+            db.session.add(exp)
+
+            ipmi_host = _create_ipmi_host(app, name="Weird Host Name!", hostname="10.0.0.202")
+            host_exp = HostExporterInstance(
+                host_id=ipmi_host.id, exporter_type="ipmi_exporter", port=9290, status="installed",
+            )
+            db.session.add(host_exp)
+            ipmi_host_id = ipmi_host.id
+
+            Setting.set("jitsi_prometheus_scrape", "true")
+            jvb_guest = _create_guest(app, name="jvb-guest", ip="10.0.0.203")
+            Setting.set("jitsi_guest_id", str(jvb_guest.id))
+
+            Setting.set("unpoller_installed", "true")
+            Setting.set("unpoller_listen_port", "9130")
+
+            db.session.commit()
+
+            log = []
+            result = _regenerate_prometheus_config(log.append)
+            assert result is True, "\n".join(log)
+
+        # Find the write of the candidate config and the promtool check that ran
+        # against the SAME path, confirming validate-before-install actually ran.
+        write_calls = [c for c in fake.calls if "install -m 644 -o prometheus" in c]
+        assert len(write_calls) == 1
+        yml = _decode_written_file(write_calls[0])
+
+        check_calls = [c for c in fake.calls if "check config" in c]
+        assert len(check_calls) == 1
+        assert "prometheus.yml.new" in check_calls[0]
+
+        mv_calls = [c for c in fake.calls if c.startswith("mv ") or " mv " in c]
+        assert any("prometheus.yml.new" in c and "prometheus.yml" in c for c in mv_calls)
+        assert any("reload prometheus" in c for c in fake.calls)
+
+        import yaml
+        parsed = yaml.safe_load(yml)
+        job_names = {j["job_name"] for j in parsed["scrape_configs"]}
+        assert "mstdnca" in job_names
+        assert "prometheus" in job_names
+        assert "node" in job_names
+        assert "jitsi_jvb" in job_names
+        assert "unpoller" in job_names
+        assert any(name.startswith("ipmi_") for name in job_names)
+        # The free-text host name must have been slugified, not embedded raw.
+        assert not any("Weird Host Name!" in name for name in job_names)
+
+        node_job = next(j for j in parsed["scrape_configs"] if j["job_name"] == "node")
+        assert node_job["static_configs"][0]["targets"] == ["10.0.0.201:9100"]
+
+        unpoller_job = next(j for j in parsed["scrape_configs"] if j["job_name"] == "unpoller")
+        assert unpoller_job["static_configs"][0]["targets"] == ["10.0.0.200:9130"]
+
+        with app.app_context():
+            # ipmi_host is ipmi_enabled=True — must not linger for /ipmi/ route tests
+            # in other test files (session-scoped DB).
+            HostExporterInstance.query.filter_by(host_id=ipmi_host_id).delete()
+            ProxmoxHost.query.filter_by(id=ipmi_host_id).delete()
+            db.session.commit()
+        self._reset_prometheus_guest_id(app)
+
+    @patch("apps.exporters.SSHClient")
+    def test_promtool_failure_blocks_install_and_reload(self, MockSSH, app):
+        """A failing `promtool check config` must NOT reach `mv`/reload, and must
+        make _regenerate_prometheus_config() (and therefore the calling install/
+        uninstall operation) report failure — not a warning with success=True."""
+        from apps.exporters import _regenerate_prometheus_config
+
+        fake = _FakeSSH(responses=[
+            ("check config", ("", "error: invalid YAML at line 3", 1)),
+        ])
+        MockSSH.from_credential.return_value = fake
+
+        with app.app_context():
+            self._prom_guest(app, ip="10.0.0.210")
+            log = []
+            result = _regenerate_prometheus_config(log.append)
+
+        assert result is False
+        assert any("ERROR" in m and "promtool" in m for m in log)
+        assert not any(c.startswith("mv ") for c in fake.calls)
+        assert not any("reload prometheus" in c for c in fake.calls)
+        self._reset_prometheus_guest_id(app)
+
+    @patch("apps.exporters.SSHClient")
+    def test_reload_failure_returns_false(self, MockSSH, app):
+        from apps.exporters import _regenerate_prometheus_config
+
+        fake = _FakeSSH(responses=[
+            ("reload prometheus", ("", "Unit prometheus.service not found.", 1)),
+        ])
+        MockSSH.from_credential.return_value = fake
+
+        with app.app_context():
+            self._prom_guest(app, ip="10.0.0.211")
+            log = []
+            result = _regenerate_prometheus_config(log.append)
+
+        assert result is False
+        assert any("reload" in m.lower() for m in log)
+        self._reset_prometheus_guest_id(app)
+
+    @patch("apps.exporters.SSHClient")
+    def test_install_propagates_config_regen_failure(self, MockSSH, app):
+        """run_exporter_install() must report failure when the prometheus.yml push
+        fails, even though the exporter itself installed fine — this is the
+        "reload failure only warned, calling op still returns True" bug."""
+        from apps.exporters import run_exporter_install
+
+        mock_ssh = MagicMock()
+        mock_ssh.execute_sudo.return_value = ("", "", 0)
+        mock_ssh.__enter__ = MagicMock(return_value=mock_ssh)
+        mock_ssh.__exit__ = MagicMock(return_value=False)
+
+        with app.app_context():
+            guest = _create_guest(app, name="exp-install-propagate", ip="10.0.0.212", with_credential=True)
+            exp = ExporterInstance(guest_id=guest.id, exporter_type="node_exporter", port=9100, status="pending")
+            db.session.add(exp)
+            db.session.commit()
+            exp_id = exp.id
+
+            with patch("apps.exporters.SSHClient") as MockSSH2, \
+                 patch("apps.exporters.check_exporter_release", return_value=("1.2.3", "")), \
+                 patch("apps.exporters._regenerate_prometheus_config", return_value=False):
+                MockSSH2.from_credential.return_value = mock_ssh
+                ok, log_lines = run_exporter_install(exp_id)
+
+            assert ok is False
+            updated = ExporterInstance.query.get(exp_id)
+            assert updated.status == "installed"  # the exporter install itself succeeded
+
+            db.session.delete(updated)
+            db.session.delete(guest)
+            db.session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Host exporter install: explicit registry key + atomic IPMI config write
+# ---------------------------------------------------------------------------
+
+class TestHostExporterInstallDetails:
+
+    @patch("apps.exporters.SSHClient")
+    def test_check_exporter_release_receives_explicit_registry_key(self, MockSSH, app):
+        """_install_host_exporter_release() must pass the exporter's own registry
+        key to check_exporter_release() explicitly, not read it from a never-set
+        info["_exporter_type_key"] (which silently fell back to the binary name)."""
+        from apps.exporters import run_host_exporter_install
+
+        mock_ssh = MagicMock()
+        mock_ssh.execute_sudo.return_value = ("", "", 0)
+        mock_ssh.__enter__ = MagicMock(return_value=mock_ssh)
+        mock_ssh.__exit__ = MagicMock(return_value=False)
+        MockSSH.from_credential.return_value = mock_ssh
+
+        with app.app_context():
+            host = _create_ipmi_host(app, name="hexp-key", hostname="10.0.0.98")
+            exp = HostExporterInstance(host_id=host.id, exporter_type="ipmi_exporter", port=9290, status="pending")
+            db.session.add(exp)
+            db.session.commit()
+            exp_id = exp.id
+
+            with patch("apps.exporters.check_exporter_release") as mock_check:
+                mock_check.return_value = (None, "boom")  # fail fast right after the call
+                run_host_exporter_install(exp_id)
+
+            mock_check.assert_called_once_with("ipmi_exporter")
+
+            db.session.delete(HostExporterInstance.query.get(exp_id))
+            ProxmoxHost.query.filter_by(id=host.id).delete()
+            db.session.commit()
+
+    @patch("apps.exporters.SSHClient")
+    def test_ipmi_config_written_atomically_with_escaped_credentials(self, MockSSH, app):
+        from apps.exporters import run_host_exporter_install
+        from auth.credential_store import encrypt
+
+        mock_ssh = MagicMock()
+        mock_ssh.execute_sudo.return_value = ("", "", 0)
+        mock_ssh.__enter__ = MagicMock(return_value=mock_ssh)
+        mock_ssh.__exit__ = MagicMock(return_value=False)
+        MockSSH.from_credential.return_value = mock_ssh
+
+        with app.app_context():
+            host = _create_ipmi_host(app, name="hexp-cfg-atomic", hostname="10.0.0.99")
+            host.ipmi_username = 'weird"user'
+            host.ipmi_password = encrypt('pa"ss\nword')
+            db.session.commit()
+            host_id = host.id
+
+            exp = HostExporterInstance(host_id=host.id, exporter_type="ipmi_exporter", port=9290, status="pending")
+            db.session.add(exp)
+            db.session.commit()
+            exp_id = exp.id
+
+            with patch("apps.exporters.check_exporter_release", return_value=("1.2.3", "")), \
+                 patch("apps.exporters._regenerate_prometheus_config", return_value=True):
+                ok, log_lines = run_host_exporter_install(exp_id)
+
+            assert ok is True, "\n".join(log_lines)
+
+        calls = [str(c.args[0]) for c in mock_ssh.execute_sudo.call_args_list]
+        write_calls = [c for c in calls if "config.yml" in c and "install -m 600" in c]
+        assert len(write_calls) == 1
+        write_cmd = write_calls[0]
+        assert "cat >" not in write_cmd
+        assert "CFGEOF" not in write_cmd
+        assert 'pa"ss' not in write_cmd  # raw password never appears in the command
+
+        import yaml
+        decoded = _decode_written_file(write_cmd)
+        parsed = yaml.safe_load(decoded)
+        module = parsed["modules"]["default"]
+        assert module["user"] == 'weird"user'
+        assert module["pass"] == 'pa"ss word'  # newline folded, quote preserved intact
+
+        with app.app_context():
+            HostExporterInstance.query.filter_by(host_id=host_id).delete()
+            ProxmoxHost.query.filter_by(id=host_id).delete()
+            db.session.commit()
+
+    @patch("apps.exporters.SSHClient")
+    def test_ipmi_config_write_failure_is_fatal(self, MockSSH, app):
+        """A failed config.yml write must fail the install outright, not just log a
+        WARNING while the install still reports success (issue #128)."""
+        from apps.exporters import run_host_exporter_install
+
+        fake = _FakeSSH(responses=[("install -m 600", ("", "no space left on device", 1))])
+        MockSSH.from_credential.return_value = fake
+
+        with app.app_context():
+            host = _create_ipmi_host(app, name="hexp-cfg-fail", hostname="10.0.0.100")
+            exp = HostExporterInstance(host_id=host.id, exporter_type="ipmi_exporter", port=9290, status="pending")
+            db.session.add(exp)
+            db.session.commit()
+            exp_id = exp.id
+
+            with patch("apps.exporters.check_exporter_release", return_value=("1.2.3", "")):
+                ok, log_lines = run_host_exporter_install(exp_id)
+
+            assert ok is False
+            assert any("ERROR" in m and "config" in m.lower() for m in log_lines)
+            updated = HostExporterInstance.query.get(exp_id)
+            assert updated.status == "failed"
+
+            db.session.delete(updated)
+            ProxmoxHost.query.filter_by(id=host.id).delete()
+            db.session.commit()

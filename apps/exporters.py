@@ -5,6 +5,7 @@ Supports installing node_exporter, postgres_exporter, and redis_exporter
 on target guests via SSH, and regenerating the Prometheus scrape config.
 """
 
+import base64
 import json
 import logging
 import re
@@ -103,6 +104,68 @@ _MASTODON_EXPORTER_SED = (
     "/^PROMETHEUS_EXPORTER_HOST=/d; "
     "/^PROMETHEUS_EXPORTER_PORT=/d"
 )
+
+_SLUG_RE = re.compile(r"[^a-z0-9_-]+")
+
+
+def _slugify_job_name(text):
+    """Turn free-text (e.g. a host name) into a safe Prometheus job_name.
+
+    Prometheus job names are just labels, but free text (spaces, quotes, unicode)
+    flowing straight into generated YAML makes the config fragile to edit/diff and,
+    for values containing a literal quote, syntactically wrong. Lowercases, replaces
+    runs of non [a-z0-9_-] with "_", and trims leading/trailing "_".
+    """
+    slug = _SLUG_RE.sub("_", str(text).strip().lower()).strip("_")
+    return slug or "unnamed"
+
+
+def _dedupe_job_name(base, used):
+    """Return `base`, or `base` with a numeric suffix, that isn't already in `used`.
+
+    Mutates `used` by adding the returned name.
+    """
+    name = base
+    n = 2
+    while name in used:
+        name = f"{base}_{n}"
+        n += 1
+    used.add(name)
+    return name
+
+
+def _yaml_single_quote(value):
+    """Render `value` as a single-quoted YAML scalar.
+
+    Single-quoted YAML strings support exactly one escape: a doubled quote for a
+    literal `'`. Embedded CR/LF are stripped first — YAML line-folding would
+    otherwise turn a raw newline in the source into a fold point, and a stray `\\r`
+    can trip up strict parsers — so this always yields one safely parseable line
+    regardless of what a user typed into the source field (e.g. a BMC password).
+    """
+    text = str(value).replace("\r", "").replace("\n", " ")
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _write_remote_file(ssh, content, path, mode="600", owner="root", group=None, timeout=15):
+    """Write `content` to `path` on the remote host atomically, with no
+    world-readable window and without a heredoc (whose terminator a value in
+    `content` could accidentally — or maliciously — match and break out of).
+
+    Base64-encodes `content` and pipes it through `install`, which writes the
+    destination with the final mode/ownership in one step rather than creating it
+    at the shell's default umask and `chmod`ing afterward.
+
+    Returns (success, stderr).
+    """
+    group = group or owner
+    b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    cmd = (
+        f"echo {b64} | base64 -d | "
+        f"install -m {mode} -o {owner} -g {group} /dev/stdin {path}"
+    )
+    stdout, stderr, code = ssh.execute_sudo(cmd, timeout=timeout)
+    return code == 0, stderr or stdout or ""
 
 
 def _build_mastodon_env_vars(config=None):
@@ -442,10 +505,11 @@ def run_exporter_install(instance_id, log_callback=None):
             instance.installed_at = datetime.now(timezone.utc)
             db.session.commit()
 
-            # Regenerate prometheus.yml
-            _regenerate_prometheus_config(_log)
+            # Regenerate prometheus.yml — a failed validation/reload here fails the
+            # overall install so it isn't silently reported as a success.
+            config_ok = _regenerate_prometheus_config(_log)
 
-            return True, log_lines
+            return config_ok, log_lines
 
     except Exception as e:
         _log(f"FATAL ERROR: {e}")
@@ -521,9 +585,9 @@ def run_exporter_uninstall(instance_id, log_callback=None):
             db.session.commit()
 
             # Regenerate prometheus.yml
-            _regenerate_prometheus_config(_log)
+            config_ok = _regenerate_prometheus_config(_log)
 
-            return True, log_lines
+            return config_ok, log_lines
 
     except Exception as e:
         _log(f"FATAL ERROR: {e}")
@@ -538,13 +602,13 @@ def run_exporter_uninstall(instance_id, log_callback=None):
 # ---------------------------------------------------------------------------
 
 
-def _install_host_exporter_release(ssh, info, binary, _log):
+def _install_host_exporter_release(ssh, info, binary, _log, exporter_type):
     """Install a host exporter from a pre-built GitHub release tarball.
 
     Returns (success, version_string).
     """
     _log(f"Checking latest {info['display_name']} version...")
-    latest, err = check_exporter_release(info.get("_exporter_type_key", binary))
+    latest, err = check_exporter_release(exporter_type)
     if not latest:
         _log(f"ERROR: Could not determine latest version: {err}")
         return False, None
@@ -657,7 +721,7 @@ def run_host_exporter_install(instance_id, log_callback=None):
                     _log(f"WARNING: Failed to install dependencies: {deps_str}")
 
             # Install binary from release tarball
-            ok, version = _install_host_exporter_release(ssh, info, binary, _log)
+            ok, version = _install_host_exporter_release(ssh, info, binary, _log, instance.exporter_type)
 
             if not ok:
                 instance.status = "failed"
@@ -677,28 +741,33 @@ def run_host_exporter_install(instance_id, log_callback=None):
                     ipmi_pass = decrypt(host.ipmi_password) or ""
 
                 config_yml = (
-                    f"modules:\n"
-                    f"  default:\n"
-                    f"    collectors:\n"
-                    f"      - bmc\n"
-                    f"      - ipmi\n"
-                    f"      - dcmi\n"
-                    f"    user: \"{ipmi_user}\"\n"
-                    f"    pass: \"{ipmi_pass}\"\n"
-                    f"    privilege: \"admin\"\n"
-                    f"    driver: \"LAN_2_0\"\n"
+                    "modules:\n"
+                    "  default:\n"
+                    "    collectors:\n"
+                    "      - bmc\n"
+                    "      - ipmi\n"
+                    "      - dcmi\n"
+                    f"    user: {_yaml_single_quote(ipmi_user)}\n"
+                    f"    pass: {_yaml_single_quote(ipmi_pass)}\n"
+                    "    privilege: 'admin'\n"
+                    "    driver: 'LAN_2_0'\n"
                 )
 
                 _log(f"Writing exporter config to {config_path}...")
-                stdout, stderr, code = ssh.execute_sudo(
-                    f"mkdir -p {config_dir} && "
-                    f"cat > {config_path} << 'CFGEOF'\n{config_yml}CFGEOF\n"
-                    f"chmod 600 {config_path} && chown {binary}:{binary} {config_path}",
-                    timeout=15,
-                )
-                _log_cmd_output(_log, stdout, stderr, code)
+                stdout, stderr, code = ssh.execute_sudo(f"mkdir -p {config_dir}", timeout=15)
                 if code != 0:
-                    _log("WARNING: Failed to write exporter config file.")
+                    _log_cmd_output(_log, stdout, stderr, code)
+                    _log("ERROR: Failed to create exporter config directory.")
+                    instance.status = "failed"
+                    db.session.commit()
+                    return False, log_lines
+
+                ok, err = _write_remote_file(ssh, config_yml, config_path, mode="600", owner=binary)
+                if not ok:
+                    _log(f"ERROR: Failed to write exporter config file: {err[:200]}")
+                    instance.status = "failed"
+                    db.session.commit()
+                    return False, log_lines
 
             # Write env file if needed (not used by SMCIPMI but kept for other host exporters)
             env_file = None
@@ -760,9 +829,9 @@ def run_host_exporter_install(instance_id, log_callback=None):
             db.session.commit()
 
             # Regenerate prometheus.yml
-            _regenerate_prometheus_config(_log)
+            config_ok = _regenerate_prometheus_config(_log)
 
-            return True, log_lines
+            return config_ok, log_lines
 
     except Exception as e:
         _log(f"FATAL ERROR: {e}")
@@ -838,9 +907,9 @@ def run_host_exporter_uninstall(instance_id, log_callback=None):
             db.session.commit()
 
             # Regenerate prometheus.yml
-            _regenerate_prometheus_config(_log)
+            config_ok = _regenerate_prometheus_config(_log)
 
-            return True, log_lines
+            return config_ok, log_lines
 
     except Exception as e:
         _log(f"FATAL ERROR: {e}")
@@ -855,7 +924,22 @@ def run_host_exporter_uninstall(instance_id, log_callback=None):
 # ---------------------------------------------------------------------------
 
 def _regenerate_prometheus_config(_log=None):
-    """Regenerate prometheus.yml with all installed exporter targets and push to Prometheus guest."""
+    """Regenerate prometheus.yml with every configured scrape target and push it to the
+    Prometheus guest.
+
+    This is the SINGLE generator for prometheus.yml — it is also called (instead of a
+    local copy) by run_prometheus_install() and run_unpoller_install()/reconfig, so
+    installing/reinstalling any one component can no longer wipe out the scrape jobs
+    another component added.
+
+    The rendered config is validated with `promtool check config` before it replaces
+    the live file, and a validation or reload failure is treated as a failure of this
+    function (and, by extension, of whatever install/uninstall operation called it) —
+    not merely logged and ignored.
+
+    Returns True if regeneration was skipped (nothing configured yet) or succeeded,
+    False if it was attempted and failed.
+    """
     from apps.prometheus_app import _generate_prometheus_yml
     from models import Credential, ExporterInstance, Guest, HostExporterInstance, ProxmoxHost, Setting
 
@@ -864,17 +948,17 @@ def _regenerate_prometheus_config(_log=None):
     prom_guest_id = Setting.get("prometheus_guest_id", "")
     if not prom_guest_id:
         _log("Skipping prometheus.yml regeneration: no Prometheus guest configured.")
-        return
+        return True
 
     try:
         prom_guest = Guest.query.get(int(prom_guest_id))
     except (TypeError, ValueError):
         _log("ERROR: Invalid Prometheus guest ID.")
-        return
+        return False
 
     if not prom_guest:
         _log("ERROR: Prometheus guest not found.")
-        return
+        return False
 
     # Build extra scrape configs from installed exporters
     installed = (
@@ -925,10 +1009,11 @@ def _regenerate_prometheus_config(_log=None):
             except (TypeError, ValueError):
                 pass
 
+    used_job_names = set()
     extra_configs = ""
     for etype, targets in sorted(by_type.items()):
         info = KNOWN_EXPORTERS.get(etype) or BUILTIN_EXPORTERS.get(etype, {})
-        job_name = info.get("job_name", etype)
+        job_name = _dedupe_job_name(info.get("job_name", etype), used_job_names)
         targets_str = ", ".join(f'"{t}"' for t in sorted(targets))
         extra_configs += f"""
 
@@ -941,9 +1026,10 @@ def _regenerate_prometheus_config(_log=None):
     if ipmi_targets:
         # Group by exporter address (host:port) — typically one exporter per host
         for bmc_ip, host_ip, port, host_name in sorted(ipmi_targets):
+            job_name = _dedupe_job_name(f"ipmi_{_slugify_job_name(host_name)}", used_job_names)
             extra_configs += f"""
 
-  - job_name: "ipmi_{host_name}"
+  - job_name: "{job_name}"
     scrape_interval: 60s
     scrape_timeout: 30s
     metrics_path: /ipmi
@@ -959,6 +1045,14 @@ def _regenerate_prometheus_config(_log=None):
       - target_label: __address__
         replacement: "{host_ip}:{port}" """
 
+    # Unpoller (UniFi metrics) — included here so this is the ONLY function that ever
+    # writes prometheus.yml; a separate generator in apps/unpoller.py or
+    # apps/prometheus_app.py would each overwrite the other's scrape jobs.
+    if Setting.get("unpoller_installed", "false") == "true":
+        from apps.unpoller import get_unpoller_scrape_config
+        if prom_guest.ip_address and prom_guest.ip_address.lower() not in ("dhcp", "dhcp6", "auto"):
+            extra_configs += get_unpoller_scrape_config(prom_guest.ip_address)
+
     # Generate full config
     mstdnca_url = Setting.get("prometheus_mstdnca_metrics_url", "")
     auth_token = Setting.get("prometheus_auth_token", "")
@@ -970,29 +1064,60 @@ def _regenerate_prometheus_config(_log=None):
         credential = Credential.query.filter_by(is_default=True).first()
     if not credential:
         _log("ERROR: No SSH credential for Prometheus guest.")
-        return
+        return False
+
+    return _validate_and_install_prometheus_config(prom_guest, credential, yml, _log)
+
+
+def _validate_and_install_prometheus_config(prom_guest, credential, yml, _log):
+    """Write `yml` to prometheus.yml.new on `prom_guest`, validate it with
+    `promtool check config`, and only then move it into place and reload Prometheus.
+
+    A failed check, move, or reload is reported as an ERROR and returns False — the
+    live prometheus.yml is left untouched by a failed check, and neither is reported
+    to the caller as a success.
+    """
+    new_path = "/etc/prometheus/prometheus.yml.new"
+    live_path = "/etc/prometheus/prometheus.yml"
 
     try:
         with SSHClient.from_credential(prom_guest.ip_address, credential) as ssh:
-            _log("Updating prometheus.yml with exporter targets...")
-            stdout, stderr, code = ssh.execute_sudo(
-                f"cat > /etc/prometheus/prometheus.yml << 'PROMEOF'\n{yml}\nPROMEOF",
-                timeout=15,
+            _log("Writing candidate prometheus.yml...")
+            ok, err = _write_remote_file(ssh, yml, new_path, mode="644", owner="prometheus")
+            if not ok:
+                _log(f"ERROR: Failed to write {new_path}: {err[:200]}")
+                return False
+
+            _log("Validating prometheus.yml with promtool...")
+            check_cmd = (
+                'PROMTOOL="/usr/local/bin/promtool"; '
+                'command -v "$PROMTOOL" >/dev/null 2>&1 || PROMTOOL="promtool"; '
+                f'"$PROMTOOL" check config {new_path}'
             )
+            stdout, stderr, code = ssh.execute_sudo(check_cmd, timeout=30)
             if code != 0:
-                _log(f"ERROR: Failed to write prometheus.yml: {(stderr or '')[:200]}")
-                return
+                _log_cmd_output(_log, stdout, stderr, code)
+                _log("ERROR: promtool check config failed — prometheus.yml was NOT updated.")
+                ssh.execute_sudo(f"rm -f {new_path}", timeout=10)
+                return False
+
+            _log("Installing validated prometheus.yml...")
+            stdout, stderr, code = ssh.execute_sudo(f"mv {new_path} {live_path}", timeout=15)
+            if code != 0:
+                _log(f"ERROR: Failed to install validated prometheus.yml: {(stderr or '')[:200]}")
+                return False
 
             _log("Reloading Prometheus configuration...")
-            stdout, stderr, code = ssh.execute_sudo(
-                "systemctl reload prometheus", timeout=15
-            )
+            stdout, stderr, code = ssh.execute_sudo("systemctl reload prometheus", timeout=15)
             if code != 0:
-                _log(f"WARNING: Prometheus reload may have failed: {(stderr or '')[:200]}")
-            else:
-                _log("Prometheus configuration updated successfully.")
+                _log(f"ERROR: Prometheus reload failed: {(stderr or '')[:200]}")
+                return False
+
+            _log("Prometheus configuration updated successfully.")
+            return True
     except Exception as e:
         _log(f"ERROR: Failed to update Prometheus config: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1166,7 +1291,10 @@ def enable_mastodon_exporter(guest_id, config=None, log_callback=None):
     _log("ExporterInstance record created.")
 
     # Step 6: Regenerate Prometheus scrape config
-    _regenerate_prometheus_config(_log)
+    config_ok = _regenerate_prometheus_config(_log)
+    if not config_ok:
+        _log("WARNING: Mastodon exporter is enabled but the Prometheus scrape config could not be updated.")
+        return False
 
     _log("Mastodon Prometheus exporter enabled successfully.")
     return True
@@ -1253,7 +1381,10 @@ def disable_mastodon_exporter(guest_id, log_callback=None):
     _log(f"Removed {deleted} ExporterInstance record(s).")
 
     # Step 4: Regenerate Prometheus scrape config
-    _regenerate_prometheus_config(_log)
+    config_ok = _regenerate_prometheus_config(_log)
+    if not config_ok:
+        _log("WARNING: Mastodon exporter is disabled but the Prometheus scrape config could not be updated.")
+        return False
 
     _log("Mastodon Prometheus exporter disabled successfully.")
     return True
@@ -1392,7 +1523,10 @@ def reconfigure_mastodon_exporter(guest_id, config, log_callback=None):
     _log("ExporterInstance record updated.")
 
     # Step 6: Regenerate Prometheus scrape config (port may have changed)
-    _regenerate_prometheus_config(_log)
+    config_ok = _regenerate_prometheus_config(_log)
+    if not config_ok:
+        _log("WARNING: Mastodon exporter is reconfigured but the Prometheus scrape config could not be updated.")
+        return False
 
     _log("Mastodon Prometheus exporter reconfigured successfully.")
     return True

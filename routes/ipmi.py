@@ -1,5 +1,6 @@
 import json
 import logging
+from contextlib import contextmanager
 
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
@@ -42,6 +43,25 @@ def _get_redfish_client(host):
     )
 
 
+@contextmanager
+def _redfish_session(host):
+    """Yield a RedfishClient for `host` (or None if IPMI isn't configured).
+
+    Always logs the BMC session out on exit — a fresh RedfishClient is created per
+    request, and without an explicit logout each request leaks a Redfish session on
+    the BMC, eventually exhausting its (typically very small) session table.
+    """
+    client = _get_redfish_client(host)
+    try:
+        yield client
+    finally:
+        if client is not None:
+            try:
+                client.logout()
+            except Exception:
+                logger.debug("Failed to log out IPMI session for %s", host.name, exc_info=True)
+
+
 @bp.route("/")
 def index():
     """IPMI dashboard showing all IPMI-enabled hosts."""
@@ -49,13 +69,13 @@ def index():
 
     host_data = []
     for host in hosts:
-        client = _get_redfish_client(host)
         snapshot = None
-        if client:
-            try:
-                snapshot = client.get_health_snapshot()
-            except Exception:
-                logger.debug("Failed to fetch IPMI data for %s", host.name, exc_info=True)
+        with _redfish_session(host) as client:
+            if client:
+                try:
+                    snapshot = client.get_health_snapshot()
+                except Exception:
+                    logger.debug("Failed to fetch IPMI data for %s", host.name, exc_info=True)
 
         host_data.append({
             "host": host,
@@ -73,18 +93,18 @@ def detail(host_id):
         flash("IPMI is not enabled for this host.", "warning")
         return redirect(url_for("ipmi.index"))
 
-    client = _get_redfish_client(host)
     snapshot = None
     sel_entries = []
-    if client:
-        try:
-            snapshot = client.get_health_snapshot()
-        except Exception:
-            logger.debug("Failed to fetch IPMI data for %s", host.name, exc_info=True)
-        try:
-            sel_entries = client.get_sel_entries()
-        except Exception:
-            logger.debug("Failed to fetch SEL for %s", host.name, exc_info=True)
+    with _redfish_session(host) as client:
+        if client:
+            try:
+                snapshot = client.get_health_snapshot()
+            except Exception:
+                logger.debug("Failed to fetch IPMI data for %s", host.name, exc_info=True)
+            try:
+                sel_entries = client.get_sel_entries()
+            except Exception:
+                logger.debug("Failed to fetch SEL for %s", host.name, exc_info=True)
 
     return render_template("ipmi_detail.html", host=host, snapshot=snapshot, sel_entries=sel_entries)
 
@@ -103,12 +123,13 @@ def power_action(host_id):
         flash(f"Invalid power action: {action}", "error")
         return redirect(url_for("ipmi.detail", host_id=host_id))
 
-    client = _get_redfish_client(host)
-    if not client:
-        flash("IPMI is not configured for this host.", "error")
-        return redirect(url_for("ipmi.detail", host_id=host_id))
+    with _redfish_session(host) as client:
+        if not client:
+            flash("IPMI is not configured for this host.", "error")
+            return redirect(url_for("ipmi.detail", host_id=host_id))
 
-    ok, msg = client.power_action(action)
+        ok, msg = client.power_action(action)
+
     if ok:
         log_action(f"ipmi_power_{action}", "host", resource_id=host.id,
                    resource_name=host.name, details={"ipmi_address": host.ipmi_address})
@@ -124,12 +145,13 @@ def power_action(host_id):
 def test_connection(host_id):
     """Test IPMI connection to a host."""
     host = ProxmoxHost.query.get_or_404(host_id)
-    client = _get_redfish_client(host)
-    if not client:
-        flash("IPMI is not configured for this host.", "error")
-        return redirect(request.referrer or url_for("ipmi.index"))
+    with _redfish_session(host) as client:
+        if not client:
+            flash("IPMI is not configured for this host.", "error")
+            return redirect(request.referrer or url_for("ipmi.index"))
 
-    ok, msg = client.test_connection()
+        ok, msg = client.test_connection()
+
     if ok:
         flash(f"IPMI connection to {host.name} successful: {msg}", "success")
     else:
@@ -151,14 +173,14 @@ def sel(host_id):
     except (ValueError, TypeError):
         limit = 500
 
-    client = _get_redfish_client(host)
     entries = []
-    if client:
-        try:
-            entries = client.get_sel_entries(limit=limit)
-        except Exception:
-            logger.debug("Failed to fetch SEL for %s", host.name, exc_info=True)
-            flash("Failed to fetch System Event Log.", "error")
+    with _redfish_session(host) as client:
+        if client:
+            try:
+                entries = client.get_sel_entries(limit=limit)
+            except Exception:
+                logger.debug("Failed to fetch SEL for %s", host.name, exc_info=True)
+                flash("Failed to fetch System Event Log.", "error")
 
     return render_template("ipmi_sel.html", host=host, entries=entries, limit=limit)
 

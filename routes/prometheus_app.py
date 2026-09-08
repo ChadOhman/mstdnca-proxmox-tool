@@ -436,6 +436,10 @@ def exporter_add():
         flash("Invalid exporter type.", "error")
         return redirect(url_for("prometheus_app.manage"))
 
+    if KNOWN_EXPORTERS[exporter_type].get("host_level"):
+        flash("This exporter is host-level — install it from the host exporters section.", "error")
+        return redirect(url_for("prometheus_app.manage"))
+
     if not guest_id:
         flash("Please select a guest.", "error")
         return redirect(url_for("prometheus_app.manage"))
