@@ -155,10 +155,13 @@ class TestSqlitePragmas:
         assert str(journal).lower() == "wal"
         assert busy == 30000
 
-    def test_in_memory_database_skips_wal(self, app):
+    def test_in_memory_database_skips_wal(self):
         """WAL is meaningless for :memory:; the other pragmas still apply."""
+        from app import create_app
         from models import db
 
+        app = create_app({"TESTING": True, "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+                          "SECRET_KEY": "test-secret-key"})
         with app.app_context():
             fk = db.session.execute(db.text("PRAGMA foreign_keys")).scalar()
             journal = db.session.execute(db.text("PRAGMA journal_mode")).scalar()

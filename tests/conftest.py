@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 
 import pytest
@@ -9,9 +10,21 @@ from models import db as _db
 
 _TEST_ADMIN_PASSWORD = "TestPass123!"
 
+# The suite uses a file-backed SQLite database in a per-session temp directory
+# rather than ``sqlite:///:memory:``.  An in-memory database is served through
+# a single shared connection (StaticPool) that is not safe to use from several
+# threads at once, and the app legitimately starts background threads (scan and
+# update jobs) that touch the DB -- with ``:memory:`` those raced against the
+# test that spawned them and produced intermittent ObjectDeletedError /
+# StaleDataError / "no such row" failures.  A real file gets one connection per
+# thread plus the WAL + busy_timeout pragmas applied by app.py, exactly like
+# production.
+_TEST_DB_DIR = tempfile.mkdtemp(prefix="mstdnca-testdb-")
+_TEST_DB_PATH = os.path.join(_TEST_DB_DIR, "test.sqlite3")
+
 _TEST_CONFIG = {
     "TESTING": True,
-    "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+    "SQLALCHEMY_DATABASE_URI": "sqlite:///" + _TEST_DB_PATH.replace(os.sep, "/"),
     "SECRET_KEY": "test-secret-key",
     "WTF_CSRF_ENABLED": False,
 }
@@ -54,6 +67,12 @@ def app():
             admin.set_password(_TEST_ADMIN_PASSWORD)
             _db.session.commit()
     yield application
+    # Release every pooled connection before deleting the file (Windows refuses
+    # to remove an open database), then drop the per-session directory.
+    with application.app_context():
+        _db.session.remove()
+        _db.engine.dispose()
+    shutil.rmtree(_TEST_DB_DIR, ignore_errors=True)
 
 
 @pytest.fixture()
