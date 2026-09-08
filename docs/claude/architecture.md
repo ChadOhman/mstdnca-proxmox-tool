@@ -6,6 +6,8 @@
 
 **Single-worker constraint:** The collaboration system (`core/collaboration.py`) uses in-process state for presence tracking and terminal sharing. Must run with gunicorn `-w 1` or `--worker-class gthread`. Multi-worker deployments silently break collaboration features.
 
+The production worker class is `gevent` (`scripts/setup.sh` gunicorn `ExecStart`, pinned in `requirements.txt`); it's imported directly by seven `routes/*` modules to spawn background greenlets for long-running SSH/upgrade work.
+
 ## Directory Structure
 
 ```

@@ -81,8 +81,15 @@ class ProxmoxClient:
             pass
         return None
 
-    def get_node_guests(self, node_name):
-        """Get VMs and CTs on a specific node only."""
+    def get_node_guests(self, node_name, with_completeness=False):
+        """Get VMs and CTs on a specific node only.
+
+        By default returns just the guest list (backward compatible). Pass
+        ``with_completeness=True`` to instead get a ``(guests, complete)``
+        tuple, where ``complete`` is False if either the VM or CT listing
+        failed — callers that use the result to prune "stale" records must
+        check this before treating a short/empty list as authoritative.
+        """
         guests = []
         errors = []
         try:
@@ -109,6 +116,8 @@ class ProxmoxClient:
         if not guests and errors:
             raise RuntimeError(f"Could not list guests on {node_name}: {'; '.join(errors)}")
 
+        if with_completeness:
+            return guests, not errors
         return guests
 
     def get_replication_map(self):
@@ -160,8 +169,15 @@ class ProxmoxClient:
         except Exception as e:
             return False, str(e)
 
-    def get_all_guests(self):
-        """Get all VMs and CTs across all nodes. Raises on connection failure."""
+    def get_all_guests(self, with_completeness=False):
+        """Get all VMs and CTs across all nodes. Raises on connection failure.
+
+        By default returns just the guest list (backward compatible). Pass
+        ``with_completeness=True`` to instead get a ``(guests, complete)``
+        tuple, where ``complete`` is False if any per-node VM or CT listing
+        failed — callers that use the result to prune "stale" records must
+        check this before treating a short/empty list as authoritative.
+        """
         nodes = self.get_nodes()
         if not nodes:
             raise RuntimeError("No nodes returned from Proxmox API. Check API token permissions (need VM.Audit or PVEAuditor role).")
@@ -195,6 +211,8 @@ class ProxmoxClient:
             raise RuntimeError(f"Could not list guests: {'; '.join(errors)}")
 
         logger.info(f"Total guests discovered: {len(guests)} ({len(errors)} errors)")
+        if with_completeness:
+            return guests, not errors
         return guests
 
     def get_guest_ip(self, node, vmid, guest_type):

@@ -603,7 +603,13 @@ class TestPrometheusUpgradeRoute:
             # Stub the background spawn so the job thread doesn't run during the
             # test (it has no request/login context); we only assert the view's
             # synchronous response — which is where the missing-return bug lived.
-            with patch("routes.prometheus_app._threading.Thread"), \
+            import contextlib
+            import importlib.util
+            # With gevent installed the route spawns a greenlet instead of a
+            # thread; stub that path too so the job never runs during the test.
+            gevent_stub = (patch("gevent.spawn") if importlib.util.find_spec("gevent")
+                           else contextlib.nullcontext())
+            with patch("routes.prometheus_app._threading.Thread"), gevent_stub, \
                  patch("apps.prometheus_app.run_prometheus_upgrade", return_value=(True, "")):
                 resp = auth_client.post("/prometheus/upgrade", follow_redirects=False)
             assert resp.status_code == 302

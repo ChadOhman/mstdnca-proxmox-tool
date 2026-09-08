@@ -162,18 +162,31 @@ WorkingDirectory=$APP_DIR
 Environment=MSTDNCA_DATA_DIR=$DATA_DIR
 Environment=MSTDNCA_SECRET_KEY=$SECRET_DIR/secret.key
 Environment=FLASK_SECRET_KEY_FILE=$SECRET_DIR/flask_secret
+# mstdnca-setup: default for HTTP-only LAN installs so the browser sends the
+# session cookie back over plain HTTP (see config.py). Remove this line (and
+# restart the service) to require HTTPS; scripts/update.sh will not re-add it.
 Environment=SESSION_COOKIE_SECURE=0
 ExecStart=$APP_DIR/venv/bin/gunicorn --worker-class gevent --bind 0.0.0.0:5000 --workers 1 --timeout 120 "app:create_app()"
 Restart=always
 RestartSec=5
+# Hardening directives that cannot break the app (verified against clients/ssh_client.py,
+# core/scanner.py, and scripts/update.sh, which runs as a child of this service):
+# - NoNewPrivileges: the app never needs to gain privileges beyond what it starts with.
+# - PrivateTmp: the app does not share /tmp with other services.
+# - ProtectHome=read-only: nothing here reads/writes ~/.ssh, ~/.gitconfig or other home
+#   dotfiles on THIS host (SSH credentials to managed hosts are stored in the DB, not
+#   loaded via paramiko.load_system_host_keys); read-only (not "true") so that if pip's
+#   cache under /root/.cache/pip is present during a self-update it degrades to
+#   "cache disabled" instead of a write error, rather than hiding /root outright.
+# ProtectSystem is intentionally NOT set to strict/full: the app writes $DATA_DIR and
+# $SECRET_DIR (under /var/lib/mstdnca and /etc/mstdnca) at runtime and during self-update.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-# Install gevent for websocket support in production
-source venv/bin/activate
-pip install --quiet gevent
 
 systemctl daemon-reload
 systemctl enable "$APP_NAME"
