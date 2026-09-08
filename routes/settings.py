@@ -270,23 +270,48 @@ def save_scan():
     service_check_interval = request.form.get("service_check_interval", "5").strip()
     service_check_enabled = "service_check_enabled" in request.form
 
-    Setting.set("scan_interval", interval)
+    from core.scheduler import parse_interval
+
+    # Validate the intervals before persisting: an out-of-range or non-numeric
+    # value used to reach IntervalTrigger() and crash-loop the app at boot.
+    labels = {
+        "scan_interval": "Scan interval",
+        "discovery_interval": "Discovery interval",
+        "service_check_interval": "Service check interval",
+    }
+    rejected = []
+    for key, raw in (
+        ("scan_interval", interval),
+        ("discovery_interval", discovery_interval),
+        ("service_check_interval", service_check_interval),
+    ):
+        value, error = parse_interval(key, raw)
+        if error:
+            rejected.append(f"{labels[key]} {error}")
+        else:
+            Setting.set(key, str(value))
+
     Setting.set("scan_enabled", "true" if enabled else "false")
-    Setting.set("discovery_interval", discovery_interval)
     Setting.set("discovery_enabled", "true" if discovery_enabled else "false")
-    Setting.set("service_check_interval", service_check_interval)
     Setting.set("service_check_enabled", "true" if service_check_enabled else "false")
 
     log_action("settings_scan_save", "settings", resource_name="scan_discovery")
     db.session.commit()
 
     try:
-        from core.scheduler import reschedule_jobs
-        reschedule_jobs(int(interval), int(discovery_interval), int(service_check_interval))
+        from core.scheduler import interval_setting, reschedule_jobs
+        reschedule_jobs(
+            interval_setting("scan_interval"),
+            interval_setting("discovery_interval"),
+            interval_setting("service_check_interval"),
+        )
     except Exception:
         logger.warning("Failed to reschedule background jobs", exc_info=True)
 
-    flash("Scan & discovery settings saved.", "success")
+    if rejected:
+        flash("Some settings were not saved: " + "; ".join(rejected) + ".", "error")
+    else:
+        flash("Scan & discovery settings saved.", "success")
     return redirect(url_for("settings.index"))
 
 

@@ -11,6 +11,10 @@ empty database. We therefore split the coverage:
     thread, same DB connection) with the per-host ``_run_apply`` worker stubbed,
     so no real SSH happens.
 """
+from unittest.mock import MagicMock
+
+import pytest
+
 import routes.hosts as hosts_mod
 from auth.credential_store import encrypt
 from models import AuditLog, Credential, HostUpdatePackage, ProxmoxHost, Role, User, db
@@ -285,3 +289,66 @@ class TestApplyAllStatus:
         resp = auth_client.get("/hosts/updates/apply-all/progress")
         assert resp.status_code == 200
         assert b"Updating All Hosts" in resp.data
+
+
+# ---------------------------------------------------------------------------
+# Issue #126 — the orchestrator must always release the bulk slot
+# ---------------------------------------------------------------------------
+
+
+class TestBulkApplyAlwaysUnwinds:
+    def _seed_items(self, items, total):
+        with _bulk_apply_lock:
+            _bulk_apply["running"] = True
+            _bulk_apply["total"] = total
+            _bulk_apply["done"] = 0
+            _bulk_apply["items"] = items
+
+    def test_escaped_exception_still_clears_running(self, app, monkeypatch):
+        # ProxmoxHost.query.get() runs outside the per-host try block, so an
+        # error there used to wedge the feature until the process restarted.
+        bad = MagicMock()
+        bad.query.get.side_effect = RuntimeError("db exploded")
+        monkeypatch.setattr(hosts_mod, "ProxmoxHost", bad)
+
+        _reset_bulk()
+        self._seed_items([{"host_id": 99123, "name": "_bulk-unwind-host",
+                           "state": "pending", "reason": None}], total=1)
+        try:
+            with pytest.raises(RuntimeError):
+                hosts_mod._run_bulk_apply(app)
+            with _bulk_apply_lock:
+                assert _bulk_apply["running"] is False
+        finally:
+            _reset_bulk()
+
+    def test_worker_exception_does_not_leave_host_job_running(self, app, monkeypatch):
+        cred_id = _make_credential(app, "_bulk-job-cred")
+        host_id = _make_host(app, "_bulk-job-host", ssh_credential_id=cred_id, pending=1)
+
+        def fake_apply(*_args, **_kwargs):
+            raise RuntimeError("ssh died")
+
+        monkeypatch.setattr(hosts_mod, "_run_apply", fake_apply)
+
+        _reset_bulk()
+        self._seed_items([{"host_id": host_id, "name": "_bulk-job-host",
+                           "state": "pending", "reason": None}], total=1)
+        try:
+            hosts_mod._run_bulk_apply(app)
+            with _apply_lock:
+                job = _apply_jobs.get(host_id)
+                assert job["running"] is False
+                assert job["success"] is False
+            with _bulk_apply_lock:
+                assert _bulk_apply["running"] is False
+                assert _bulk_apply["items"][0]["state"] == "failed"
+        finally:
+            _apply_jobs.pop(host_id, None)
+            _cleanup_hosts(app, host_id)
+            with app.app_context():
+                c = Credential.query.get(cred_id)
+                if c:
+                    db.session.delete(c)
+                    db.session.commit()
+            _reset_bulk()

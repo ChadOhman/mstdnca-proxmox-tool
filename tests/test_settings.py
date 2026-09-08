@@ -2,6 +2,8 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from models import Setting
 
 
@@ -915,3 +917,63 @@ class TestApplyUpdateTokenEnv:
         env = mpopen.call_args.kwargs.get("env")
         assert env is not None
         assert "GITHUB_TOKEN" not in env
+
+
+# ---------------------------------------------------------------------------
+# Issue #126 — interval validation on POST /settings/scan
+# ---------------------------------------------------------------------------
+
+
+class TestScanIntervalValidation:
+    _GOOD = {"scan_interval": "6", "discovery_interval": "4", "service_check_interval": "5"}
+
+    def _seed_known_good(self, app):
+        from models import db
+        with app.app_context():
+            for key, value in self._GOOD.items():
+                Setting.set(key, value)
+            db.session.commit()
+
+    def _post(self, auth_client, **overrides):
+        # Keep the enabled flags on so this class doesn't disable scanning or
+        # discovery for whatever test runs next (the app fixture is session-scoped).
+        data = dict(self._GOOD, scan_enabled="on", discovery_enabled="on",
+                    service_check_enabled="on")
+        data.update(overrides)
+        return auth_client.post("/settings/scan", data=data, follow_redirects=True)
+
+    @pytest.mark.parametrize("bad", ["0", "-3", "6h", "", "abc", "99999"])
+    def test_bad_scan_interval_keeps_old_value(self, app, auth_client, bad):
+        self._seed_known_good(app)
+        resp = self._post(auth_client, scan_interval=bad)
+        assert resp.status_code == 200
+        assert "not saved" in resp.get_data(as_text=True)
+        with app.app_context():
+            assert Setting.get("scan_interval") == "6"
+
+    def test_bad_discovery_interval_keeps_old_value(self, app, auth_client):
+        self._seed_known_good(app)
+        self._post(auth_client, discovery_interval="0")
+        with app.app_context():
+            assert Setting.get("discovery_interval") == "4"
+
+    def test_bad_service_check_interval_keeps_old_value(self, app, auth_client):
+        self._seed_known_good(app)
+        self._post(auth_client, service_check_interval="not-a-number")
+        with app.app_context():
+            assert Setting.get("service_check_interval") == "5"
+
+    def test_one_bad_field_does_not_block_the_others(self, app, auth_client):
+        self._seed_known_good(app)
+        self._post(auth_client, scan_interval="0", discovery_interval="12")
+        with app.app_context():
+            assert Setting.get("scan_interval") == "6"
+            assert Setting.get("discovery_interval") == "12"
+        self._seed_known_good(app)
+
+    def test_valid_values_are_saved_normalised(self, app, auth_client):
+        self._seed_known_good(app)
+        self._post(auth_client, scan_interval=" 8 ")
+        with app.app_context():
+            assert Setting.get("scan_interval") == "8"
+        self._seed_known_good(app)

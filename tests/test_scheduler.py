@@ -18,6 +18,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Imported at collection time, before any _SysModulesPatch window: auth.audit
+# binds `models` at import, so a lazy first import from inside a mocked window
+# would leave it holding MagicMocks for the rest of the session.
+from auth.audit import log_action
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1769,6 +1774,534 @@ class TestPersistHostPackages:
             assert pkgs["pkg2"] == "important"
             assert pkgs["pkg3"] == "normal"
             assert pkgs["pkg4"] == "normal"
+
+
+# ---------------------------------------------------------------------------
+# Issue #126 — background-job reliability
+#
+# These classes use the real app fixture from conftest (no local override), so
+# they exercise the real DB/session behaviour the scheduler depends on.
+# ---------------------------------------------------------------------------
+
+
+class TestLogActionOutsideRequestContext:
+    """Scheduler jobs run under an app context only — log_action must not raise."""
+
+    def test_writes_audit_row_without_request_context(self, app):
+        from models import AuditLog, db
+
+        with app.app_context():
+            log_action("_sched_audit_test", "system", resource_name="nightly")
+            db.session.commit()
+            row = AuditLog.query.filter_by(action="_sched_audit_test").first()
+            try:
+                assert row is not None
+                assert row.user_id is None
+                assert row.ip_address is None
+            finally:
+                if row:
+                    db.session.delete(row)
+                    db.session.commit()
+
+    def test_broadcast_username_falls_back_to_system(self, app):
+        from models import AuditLog, db
+
+        with app.app_context():
+            with patch("core.collaboration.collab_hub.broadcast") as mock_broadcast:
+                log_action("_sched_audit_bc", "system")
+                assert mock_broadcast.call_args.args[0]["username"] == "system"
+
+                log_action("_sched_audit_bc", "system", actor="scheduler")
+                assert mock_broadcast.call_args.args[0]["username"] == "scheduler"
+
+            db.session.rollback()
+            AuditLog.query.filter_by(action="_sched_audit_bc").delete()
+            db.session.commit()
+
+
+class TestMaintenanceWindowParsing:
+    def test_parse_window_time_accepts_zero_padded(self):
+        from datetime import time as _time
+
+        from core.scheduler import parse_window_time
+        assert parse_window_time("02:00") == _time(2, 0)
+        assert parse_window_time(" 23:59 ") == _time(23, 59)
+
+    @pytest.mark.parametrize("bad", ["", None, "2:00", "24:00", "23:60", "abc", "0200", "23:0"])
+    def test_parse_window_time_rejects_bad_values(self, bad):
+        from core.scheduler import parse_window_time
+        assert parse_window_time(bad) is None
+
+
+class TestInMaintenanceWindow:
+    """A window spanning midnight must fire on both sides of it (#126)."""
+
+    def _window(self, day="daily", start="23:00", end="02:00"):
+        from types import SimpleNamespace
+        return SimpleNamespace(name="nightly", day_of_week=day, start_time=start, end_time=end)
+
+    def test_wraparound_matches_before_midnight(self):
+        from datetime import datetime as _dt
+
+        from core.scheduler import _in_maintenance_window
+        assert _in_maintenance_window(self._window(), _dt(2026, 1, 5, 23, 30))
+
+    def test_wraparound_matches_after_midnight(self):
+        from datetime import datetime as _dt
+
+        from core.scheduler import _in_maintenance_window
+        assert _in_maintenance_window(self._window(), _dt(2026, 1, 6, 1, 0))
+
+    def test_wraparound_excludes_midday(self):
+        from datetime import datetime as _dt
+
+        from core.scheduler import _in_maintenance_window
+        assert not _in_maintenance_window(self._window(), _dt(2026, 1, 5, 12, 0))
+
+    def test_same_day_window(self):
+        from datetime import datetime as _dt
+
+        from core.scheduler import _in_maintenance_window
+        w = self._window(start="02:00", end="05:00")
+        assert _in_maintenance_window(w, _dt(2026, 1, 5, 3, 0))
+        assert not _in_maintenance_window(w, _dt(2026, 1, 5, 6, 0))
+
+    def test_day_name_matched_case_insensitively(self):
+        from datetime import datetime as _dt
+
+        from core.scheduler import _in_maintenance_window
+        # 2026-01-05 is a Monday, 2026-01-06 a Tuesday.
+        assert _in_maintenance_window(self._window(day="Monday"), _dt(2026, 1, 5, 23, 30))
+        assert not _in_maintenance_window(self._window(day="MONDAY"), _dt(2026, 1, 6, 23, 30))
+
+    def test_invalid_times_never_match(self):
+        from datetime import datetime as _dt
+
+        from core.scheduler import _in_maintenance_window
+        assert not _in_maintenance_window(self._window(start="2am", end="5am"),
+                                          _dt(2026, 1, 5, 3, 0))
+
+
+class TestRunAutoUpdatesWindow:
+    """End-to-end: _run_auto_updates honours a midnight-spanning window."""
+
+    def _seed(self, app, name):
+        from models import Guest, MaintenanceWindow, UpdatePackage, db
+        with app.app_context():
+            window = MaintenanceWindow(name=f"win-{name}", day_of_week="daily",
+                                       start_time="23:00", end_time="02:00", enabled=True)
+            db.session.add(window)
+            db.session.flush()
+            guest = Guest(name=name, guest_type="ct", enabled=True, auto_update=True,
+                          power_state="running", maintenance_window_id=window.id)
+            db.session.add(guest)
+            db.session.flush()
+            db.session.add(UpdatePackage(guest_id=guest.id, package_name="bash",
+                                         status="pending", severity="normal"))
+            db.session.commit()
+            return guest.id, window.id
+
+    def _cleanup(self, app, guest_id, window_id):
+        from models import Guest, MaintenanceWindow, db
+        with app.app_context():
+            g = Guest.query.get(guest_id)
+            if g:
+                db.session.delete(g)
+            w = MaintenanceWindow.query.get(window_id)
+            if w:
+                db.session.delete(w)
+            db.session.commit()
+
+    def _run_at(self, app, when):
+        from datetime import datetime as _dt
+
+        import core.scheduler as sched_mod
+
+        applied = []
+
+        def fake_apply(guest, dist_upgrade=False):
+            applied.append(guest.name)
+            return True, "ok"
+
+        with patch("core.scanner.apply_updates", side_effect=fake_apply), \
+             patch("core.update_history.record_update_history"), \
+             patch("core.notifier.send_updates_applied_notification"), \
+             patch.object(sched_mod, "datetime", wraps=_dt) as mock_dt:
+            mock_dt.now.return_value = when
+            sched_mod._run_auto_updates(app)
+        return applied
+
+    def test_fires_before_midnight(self, app):
+        from datetime import datetime as _dt
+        gid, wid = self._seed(app, "_auto-win-a")
+        try:
+            assert "_auto-win-a" in self._run_at(app, _dt(2026, 1, 5, 23, 30))
+        finally:
+            self._cleanup(app, gid, wid)
+
+    def test_fires_after_midnight(self, app):
+        from datetime import datetime as _dt
+        gid, wid = self._seed(app, "_auto-win-b")
+        try:
+            assert "_auto-win-b" in self._run_at(app, _dt(2026, 1, 6, 1, 0))
+        finally:
+            self._cleanup(app, gid, wid)
+
+    def test_does_not_fire_at_midday(self, app):
+        from datetime import datetime as _dt
+        gid, wid = self._seed(app, "_auto-win-c")
+        try:
+            assert "_auto-win-c" not in self._run_at(app, _dt(2026, 1, 5, 12, 0))
+        finally:
+            self._cleanup(app, gid, wid)
+
+
+class TestIntervalValidation:
+    def test_parse_interval_accepts_in_range(self):
+        from core.scheduler import parse_interval
+        assert parse_interval("scan_interval", "12") == (12, None)
+        assert parse_interval("scan_interval", " 6 ") == (6, None)
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "6h", "", None, "99999", "1.5"])
+    def test_parse_interval_rejects_bad_values(self, bad):
+        from core.scheduler import parse_interval
+        value, error = parse_interval("scan_interval", bad)
+        assert value is None
+        assert error
+
+    def test_interval_setting_falls_back_on_garbage(self, app):
+        from core.scheduler import interval_setting
+        from models import Setting, db
+        with app.app_context():
+            original = Setting.get("scan_interval", "6")
+            try:
+                Setting.set("scan_interval", "6h")
+                db.session.commit()
+                assert interval_setting("scan_interval") == 6
+            finally:
+                Setting.set("scan_interval", original)
+                db.session.commit()
+
+    def test_interval_setting_clamps_out_of_range(self, app):
+        from core.scheduler import interval_setting
+        from models import Setting, db
+        with app.app_context():
+            original = Setting.get("service_check_interval", "5")
+            try:
+                Setting.set("service_check_interval", "0")
+                db.session.commit()
+                assert interval_setting("service_check_interval") == 1
+            finally:
+                Setting.set("service_check_interval", original)
+                db.session.commit()
+
+    def test_init_scheduler_boots_with_unusable_stored_interval(self, app):
+        """A bad stored value must never raise inside create_app()."""
+        from datetime import timedelta as _td
+
+        import core.scheduler as sched_mod
+        from models import Setting, db
+
+        with app.app_context():
+            original = Setting.get("scan_interval", "6")
+            Setting.set("scan_interval", "every-six-hours")
+            db.session.commit()
+
+        sched_mod._scheduler = None
+        try:
+            with patch("core.scheduler.BackgroundScheduler") as MockBGS:
+                MockBGS.return_value = MagicMock()
+                result = sched_mod.init_scheduler(app)
+            assert result is MockBGS.return_value
+
+            triggers = {
+                c.kwargs.get("id"): c.kwargs.get("trigger")
+                for c in MockBGS.return_value.add_job.call_args_list
+            }
+            assert triggers["scan_all"].interval == _td(hours=6)
+        finally:
+            sched_mod._scheduler = None
+            with app.app_context():
+                Setting.set("scan_interval", original)
+                db.session.commit()
+
+
+class TestSchedulerJobDefaults:
+    """21 jobs on a 10-thread pool need a real misfire grace window (#126)."""
+
+    def test_job_defaults_and_executor_are_configured(self, app):
+        import core.scheduler as sched_mod
+
+        sched_mod._scheduler = None
+        try:
+            with patch("core.scheduler.BackgroundScheduler") as MockBGS:
+                MockBGS.return_value = MagicMock()
+                sched_mod.init_scheduler(app)
+
+            kwargs = MockBGS.call_args.kwargs
+            assert kwargs["job_defaults"]["misfire_grace_time"] == sched_mod.JOB_MISFIRE_GRACE_SECONDS
+            assert sched_mod.JOB_MISFIRE_GRACE_SECONDS >= 60
+            assert kwargs["job_defaults"]["coalesce"] is True
+            assert "default" in kwargs["executors"]
+        finally:
+            sched_mod._scheduler = None
+
+    def test_init_scheduler_still_idempotent(self, app):
+        import core.scheduler as sched_mod
+
+        sched_mod._scheduler = None
+        try:
+            with patch("core.scheduler.BackgroundScheduler") as MockBGS:
+                MockBGS.return_value = MagicMock()
+                first = sched_mod.init_scheduler(app)
+                second = sched_mod.init_scheduler(app)
+            assert first is second
+            MockBGS.assert_called_once()
+        finally:
+            sched_mod._scheduler = None
+
+
+class TestScanAllGuestsRollback:
+    """A guest whose scan poisons the session must not break the next guest."""
+
+    def test_failure_does_not_poison_next_guest(self, app):
+        from core.scanner import scan_all_guests
+        from models import Guest, db
+
+        with app.app_context():
+            bad = Guest(name="_rb-a-bad", guest_type="ct", enabled=True, power_state="running")
+            good = Guest(name="_rb-b-good", guest_type="ct", enabled=True, power_state="running")
+            db.session.add_all([bad, good])
+            db.session.commit()
+            bad_id, good_id = bad.id, good.id
+
+        def fake_scan(guest):
+            if guest.name == "_rb-a-bad":
+                # NOT NULL violation leaves the session needing a rollback.
+                db.session.add(Guest(name=None, guest_type="ct"))
+                db.session.commit()
+            db.session.commit()
+            return {"guest": guest.name}
+
+        try:
+            with app.app_context():
+                with patch("core.scanner.scan_guest", side_effect=fake_scan):
+                    results = scan_all_guests()
+                names = [r["guest"] for r in results]
+                assert "_rb-a-bad" not in names
+                assert "_rb-b-good" in names
+        finally:
+            with app.app_context():
+                db.session.rollback()
+                for gid in (bad_id, good_id):
+                    g = Guest.query.get(gid)
+                    if g:
+                        db.session.delete(g)
+                db.session.commit()
+
+
+class TestPollUnifiEventsBatching:
+    """#126: one IN(...) dedup query, a capped batch, and rollback on failure."""
+
+    _SETTINGS = {
+        "unifi_enabled": "true",
+        "unifi_api_poll_enabled": "true",
+        "unifi_base_url": "https://unifi.example",
+        "unifi_username": "admin",
+        "unifi_password": "encrypted",
+        "unifi_site": "default",
+    }
+
+    def _configure(self, app):
+        from models import Setting, db
+        with app.app_context():
+            saved = {k: Setting.get(k, "") for k in self._SETTINGS}
+            for k, v in self._SETTINGS.items():
+                Setting.set(k, v)
+            db.session.commit()
+            return saved
+
+    def _restore(self, app, saved):
+        from models import Setting, UnifiLogEntry, db
+        with app.app_context():
+            db.session.rollback()
+            for k, v in saved.items():
+                Setting.set(k, v)
+            UnifiLogEntry.query.filter_by(source="api").delete()
+            db.session.commit()
+
+    def _run(self, app, api_get):
+        import core.scheduler as sched_mod
+        client = MagicMock()
+        client._api_get.side_effect = api_get
+        with patch("auth.credential_store.decrypt", return_value="pw"), \
+             patch("clients.unifi_client.get_cached_client", return_value=client):
+            sched_mod._poll_unifi_events(app)
+        return client
+
+    def test_existing_rule_ids_are_not_reinserted(self, app):
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        from models import UnifiLogEntry, db
+        saved = self._configure(app)
+        try:
+            with app.app_context():
+                db.session.add(UnifiLogEntry(timestamp=_dt.now(_tz.utc), source="api",
+                                             log_type="system", rule_id="evt-1"))
+                db.session.commit()
+
+            events = [{"_id": "evt-1", "msg": "dup"}, {"_id": "evt-2", "msg": "new"}]
+            self._run(app, [events, []])
+
+            with app.app_context():
+                keys = {e.rule_id for e in UnifiLogEntry.query.filter_by(source="api").all()}
+                assert keys == {"evt-1", "evt-2"}
+                assert UnifiLogEntry.query.filter_by(source="api", rule_id="evt-1").count() == 1
+        finally:
+            self._restore(app, saved)
+
+    def test_duplicate_ids_within_one_batch_inserted_once(self, app):
+        from models import UnifiLogEntry
+        saved = self._configure(app)
+        try:
+            events = [{"_id": "evt-dup", "msg": "a"}, {"_id": "evt-dup", "msg": "b"}]
+            self._run(app, [events, []])
+            with app.app_context():
+                assert UnifiLogEntry.query.filter_by(source="api", rule_id="evt-dup").count() == 1
+        finally:
+            self._restore(app, saved)
+
+    def test_batch_is_capped(self, app):
+        import core.scheduler as sched_mod
+        from models import UnifiLogEntry
+        saved = self._configure(app)
+        try:
+            cap = sched_mod.UNIFI_POLL_MAX_EVENTS
+            events = [{"_id": f"evt-{i}", "msg": "x"} for i in range(cap + 50)]
+            self._run(app, [events, []])
+            with app.app_context():
+                assert UnifiLogEntry.query.filter_by(source="api").count() == cap
+        finally:
+            self._restore(app, saved)
+
+    def test_api_failure_rolls_back_and_does_not_raise(self, app):
+        from models import Setting, UnifiLogEntry, db
+        saved = self._configure(app)
+        try:
+            self._run(app, RuntimeError("controller down"))
+            with app.app_context():
+                assert UnifiLogEntry.query.filter_by(source="api").count() == 0
+                # Session is still usable — no PendingRollbackError.
+                Setting.set("_unifi_probe", "ok")
+                db.session.commit()
+                Setting.query.filter_by(key="_unifi_probe").delete()
+                db.session.commit()
+        finally:
+            self._restore(app, saved)
+
+
+class TestDiscoveryMacReuse:
+    """A changed MAC on the same guest type also signals VMID reuse (#126)."""
+
+    CRED_NAME = "_mac-reuse-cred"
+
+    def _seed(self, app, mac):
+        from auth import credential_store
+        from models import Credential, Guest, ProxmoxHost, ScanResult, Setting, UpdatePackage, db
+        with app.app_context():
+            # FK enforcement is on (#127): the guest must reference a real credential.
+            cred = Credential.query.filter_by(name=self.CRED_NAME).first()
+            if cred is None:
+                cred = Credential(name=self.CRED_NAME, username="root", auth_type="password",
+                                  encrypted_value=credential_store.encrypt("test-only-password"))
+                db.session.add(cred)
+                db.session.flush()
+            # Other suites toggle this off via POST /settings/scan and don't restore it.
+            Setting.set("discovery_enabled", "true")
+            host = ProxmoxHost(name="_mac-pve", hostname="10.9.9.9", host_type="pve",
+                               auth_type="token", api_token_id="t@pam!x", api_token_secret="s")
+            db.session.add(host)
+            db.session.flush()
+            guest = Guest(name="old", guest_type="ct", vmid=777, proxmox_host_id=host.id,
+                          mac_address=mac, status="up-to-date", power_state="running",
+                          auto_update=True, credential_id=cred.id)
+            db.session.add(guest)
+            db.session.flush()
+            db.session.add(UpdatePackage(guest_id=guest.id, package_name="p", status="pending"))
+            db.session.add(ScanResult(guest_id=guest.id, total_updates=1))
+            db.session.commit()
+            return host.id, guest.id
+
+    def _cleanup(self, app, host_id):
+        from models import Guest, ProxmoxHost, db
+        with app.app_context():
+            db.session.rollback()
+            for g in Guest.query.filter_by(proxmox_host_id=host_id).all():
+                db.session.delete(g)
+            h = ProxmoxHost.query.get(host_id)
+            if h:
+                db.session.delete(h)
+            db.session.commit()
+
+    def _discover(self, app, mac):
+        import core.scheduler as sched_mod
+        client = MagicMock()
+        client.get_local_node_name.return_value = "node1"
+        node_guests = [
+            {"vmid": 777, "name": "rebuilt", "type": "ct", "status": "running",
+             "node": "node1", "tags": ""},
+        ]
+        client.get_node_guests.return_value = (node_guests, True)
+        client.get_all_guests.return_value = (node_guests, True)
+        client.get_replication_map.return_value = {}
+        client.get_guest_ip.return_value = "10.9.9.50"
+        client.get_guest_mac.return_value = mac
+        with patch("clients.proxmox_api.ProxmoxClient", return_value=client):
+            sched_mod._run_discovery(app)
+
+    def test_changed_mac_clears_stale_data(self, app):
+        from models import Guest
+        host_id, guest_id = self._seed(app, "AA:BB:CC:DD:EE:01")
+        try:
+            self._discover(app, "AA:BB:CC:DD:EE:99")
+            with app.app_context():
+                g = Guest.query.get(guest_id)
+                assert g.mac_address == "AA:BB:CC:DD:EE:99"
+                assert g.status == "unknown"
+                assert len(g.updates) == 0
+                assert len(g.scan_results) == 0
+                # Deliberately preserved — a MAC can also change legitimately.
+                assert g.auto_update is True
+                from models import Credential
+                assert g.credential_id == Credential.query.filter_by(name=self.CRED_NAME).first().id
+        finally:
+            self._cleanup(app, host_id)
+
+    def test_same_mac_keeps_stale_data(self, app):
+        from models import Guest
+        host_id, guest_id = self._seed(app, "AA:BB:CC:DD:EE:01")
+        try:
+            self._discover(app, "aa:bb:cc:dd:ee:01")  # case-insensitive match
+            with app.app_context():
+                g = Guest.query.get(guest_id)
+                assert g.status == "up-to-date"
+                assert len(g.updates) == 1
+                assert len(g.scan_results) == 1
+        finally:
+            self._cleanup(app, host_id)
+
+    def test_missing_mac_is_not_treated_as_reuse(self, app):
+        from models import Guest
+        host_id, guest_id = self._seed(app, "AA:BB:CC:DD:EE:01")
+        try:
+            self._discover(app, "")
+            with app.app_context():
+                g = Guest.query.get(guest_id)
+                assert g.status == "up-to-date"
+                assert len(g.updates) == 1
+        finally:
+            self._cleanup(app, host_id)
 
 
 # ---------------------------------------------------------------------------
