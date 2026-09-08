@@ -2110,8 +2110,10 @@ class TestDiscoveryMacReuse:
     """A changed MAC on the same guest type also signals VMID reuse (#126)."""
 
     def _seed(self, app, mac):
-        from models import Guest, ProxmoxHost, ScanResult, UpdatePackage, db
+        from models import Guest, ProxmoxHost, ScanResult, Setting, UpdatePackage, db
         with app.app_context():
+            # Other suites toggle this off via POST /settings/scan and don't restore it.
+            Setting.set("discovery_enabled", "true")
             host = ProxmoxHost(name="_mac-pve", hostname="10.9.9.9", host_type="pve",
                                auth_type="token", api_token_id="t@pam!x", api_token_secret="s")
             db.session.add(host)

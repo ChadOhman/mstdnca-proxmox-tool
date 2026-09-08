@@ -862,7 +862,10 @@ class TestScanIntervalValidation:
             db.session.commit()
 
     def _post(self, auth_client, **overrides):
-        data = dict(self._GOOD)
+        # Keep the enabled flags on so this class doesn't disable scanning or
+        # discovery for whatever test runs next (the app fixture is session-scoped).
+        data = dict(self._GOOD, scan_enabled="on", discovery_enabled="on",
+                    service_check_enabled="on")
         data.update(overrides)
         return auth_client.post("/settings/scan", data=data, follow_redirects=True)
 
