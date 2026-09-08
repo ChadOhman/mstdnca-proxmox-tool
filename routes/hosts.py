@@ -826,41 +826,47 @@ def _run_bulk_apply(app_ctx):
         with _bulk_apply_lock:
             items = list(_bulk_apply["items"])
 
-        for item in items:
-            host_id = item["host_id"]
-            with _bulk_apply_lock:
-                item["state"] = "running"
-
-            host = ProxmoxHost.query.get(host_id)
-            if not host or not host.ssh_credential:
+        try:
+            for item in items:
+                host_id = item["host_id"]
                 with _bulk_apply_lock:
-                    item["state"] = "skipped"
-                    item["reason"] = "No SSH credential configured"
+                    item["state"] = "running"
+
+                host = ProxmoxHost.query.get(host_id)
+                if not host or not host.ssh_credential:
+                    with _bulk_apply_lock:
+                        item["state"] = "skipped"
+                        item["reason"] = "No SSH credential configured"
+                        _bulk_apply["done"] += 1
+                    continue
+
+                with _apply_lock:
+                    _apply_jobs[host_id] = {"log": [], "running": True, "success": None, "cancelled": False}
+
+                try:
+                    _run_apply(host_id, host.hostname, host.ssh_credential, app_ctx)
+                    with _apply_lock:
+                        success = bool(_apply_jobs.get(host_id, {}).get("success"))
+                except Exception as e:
+                    logger.error("Bulk host apply error for host %s: %s", host_id, e)
+                    success = False
+                finally:
+                    # The job we reserved above must never stay "running".
+                    with _apply_lock:
+                        job = _apply_jobs.get(host_id)
+                        if job and job.get("running"):
+                            job["running"] = False
+                            if job.get("success") is None:
+                                job["success"] = False
+
+                with _bulk_apply_lock:
+                    item["state"] = "success" if success else "failed"
                     _bulk_apply["done"] += 1
-                continue
-
-            with _apply_lock:
-                _apply_jobs[host_id] = {"log": [], "running": True, "success": None, "cancelled": False}
-
-            try:
-                _run_apply(host_id, host.hostname, host.ssh_credential, app_ctx)
-                with _apply_lock:
-                    success = bool(_apply_jobs.get(host_id, {}).get("success"))
-            except Exception as e:
-                logger.error("Bulk host apply error for host %s: %s", host_id, e)
-                success = False
-                with _apply_lock:
-                    job = _apply_jobs.get(host_id)
-                    if job:
-                        job["running"] = False
-                        job["success"] = False
-
+        finally:
+            # Always release the bulk slot, even if something escaped the loop —
+            # otherwise the feature is wedged until the process restarts.
             with _bulk_apply_lock:
-                item["state"] = "success" if success else "failed"
-                _bulk_apply["done"] += 1
-
-        with _bulk_apply_lock:
-            _bulk_apply["running"] = False
+                _bulk_apply["running"] = False
 
 
 @bp.route("/updates/apply-all", methods=["POST"])

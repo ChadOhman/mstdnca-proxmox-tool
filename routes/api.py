@@ -43,6 +43,11 @@ _bulk_update = {
 }
 _bulk_update_lock = threading.Lock()
 
+# Bounds for _poll_proxmox_task so a task that never reports completion (host
+# rebooted mid-task, UPID gone) can't pin a poller thread until restart.
+PROXMOX_TASK_POLL_DEADLINE_SECONDS = 6 * 60 * 60
+PROXMOX_TASK_POLL_MAX_STATUS_ERRORS = 30
+
 
 class UpdateJob:
     """Tracks a background guest update."""
@@ -350,26 +355,26 @@ def apply(guest_id):
                     return redirect(url_for("guests.detail", guest_id=guest_id))
                 return redirect(url_for("dashboard.index"))
 
-    # Check if an update is already running for this guest
+    dist_upgrade = request.form.get("dist_upgrade") == "1"
+
+    # Reserve the slot atomically: check-and-set under a single lock hold, so two
+    # concurrent requests can't both pass the "already running" check and start
+    # duplicate apt runs on the same guest.
+    job = UpdateJob(guest_id, guest.name)
     with _jobs_lock:
         existing = _update_jobs.get(guest_id)
         if existing and existing.running:
             flash(f"Updates are already being applied to '{guest.name}'.", "warning")
             return redirect(url_for("api.update_progress", guest_id=guest_id))
-
-    dist_upgrade = request.form.get("dist_upgrade") == "1"
+        _update_jobs[guest_id] = job
 
     log_action("guest_update", "guest", resource_id=guest.id, resource_name=guest.name,
                details={"dist_upgrade": dist_upgrade})
     db.session.commit()
 
-    # Create the job and start the background thread
+    # Start the background thread
     from flask import current_app
     app = current_app._get_current_object()
-
-    job = UpdateJob(guest_id, guest.name)
-    with _jobs_lock:
-        _update_jobs[guest_id] = job
 
     initiated_by = current_user.username
 
@@ -443,65 +448,70 @@ def _run_bulk_update(app, guest_ids, dist_upgrade, enforce_snapshot, initiated_b
     with app.app_context():
         from routes.guests import auto_snapshot_if_needed, guest_requires_snapshot
 
-        for guest_id in guest_ids:
-            with _bulk_update_lock:
-                item = next((i for i in _bulk_update["items"] if i["guest_id"] == guest_id), None)
-                if item:
-                    item["state"] = "running"
+        try:
+            for guest_id in guest_ids:
+                with _bulk_update_lock:
+                    item = next((i for i in _bulk_update["items"] if i["guest_id"] == guest_id), None)
+                    if item:
+                        item["state"] = "running"
 
-            guest = Guest.query.get(guest_id)
-            if not guest:
+                guest = Guest.query.get(guest_id)
+                if not guest:
+                    with _bulk_update_lock:
+                        if item:
+                            item["state"] = "skipped"
+                            item["reason"] = "Guest not found"
+                        _bulk_update["done"] += 1
+                    continue
+
+                # Snapshot gating for non-admins, mirroring the single-guest apply().
+                if enforce_snapshot and guest_requires_snapshot(guest):
+                    try:
+                        ok, msg = auto_snapshot_if_needed(guest)
+                    except Exception as e:
+                        ok, msg = False, str(e)
+                    if not ok:
+                        with _bulk_update_lock:
+                            if item:
+                                item["state"] = "skipped"
+                                item["reason"] = f"Snapshot required but failed: {msg}"
+                            _bulk_update["done"] += 1
+                        continue
+
+                # Dedupe against any in-flight single-guest job.
+                with _jobs_lock:
+                    existing = _update_jobs.get(guest_id)
+                    if existing and existing.running:
+                        with _bulk_update_lock:
+                            if item:
+                                item["state"] = "skipped"
+                                item["reason"] = "An update is already running for this guest"
+                            _bulk_update["done"] += 1
+                        continue
+                    _update_jobs[guest_id] = UpdateJob(guest_id, guest.name)
+
+                try:
+                    _run_update_background(app, guest_id, dist_upgrade, initiated_by=initiated_by)
+                    job = _update_jobs.get(guest_id)
+                    success = bool(job.success) if job else False
+                except Exception as e:
+                    logger.error("Bulk guest update error for guest %s: %s", guest_id, e)
+                    success = False
+                finally:
+                    # The job we reserved above must never stay "running".
+                    job = _update_jobs.get(guest_id)
+                    if job and job.running:
+                        job.finish(False)
+
                 with _bulk_update_lock:
                     if item:
-                        item["state"] = "skipped"
-                        item["reason"] = "Guest not found"
+                        item["state"] = "success" if success else "failed"
                     _bulk_update["done"] += 1
-                continue
-
-            # Snapshot gating for non-admins, mirroring the single-guest apply().
-            if enforce_snapshot and guest_requires_snapshot(guest):
-                try:
-                    ok, msg = auto_snapshot_if_needed(guest)
-                except Exception as e:
-                    ok, msg = False, str(e)
-                if not ok:
-                    with _bulk_update_lock:
-                        if item:
-                            item["state"] = "skipped"
-                            item["reason"] = f"Snapshot required but failed: {msg}"
-                        _bulk_update["done"] += 1
-                    continue
-
-            # Dedupe against any in-flight single-guest job.
-            with _jobs_lock:
-                existing = _update_jobs.get(guest_id)
-                if existing and existing.running:
-                    with _bulk_update_lock:
-                        if item:
-                            item["state"] = "skipped"
-                            item["reason"] = "An update is already running for this guest"
-                        _bulk_update["done"] += 1
-                    continue
-                _update_jobs[guest_id] = UpdateJob(guest_id, guest.name)
-
-            try:
-                _run_update_background(app, guest_id, dist_upgrade, initiated_by=initiated_by)
-                job = _update_jobs.get(guest_id)
-                success = bool(job.success) if job else False
-            except Exception as e:
-                logger.error("Bulk guest update error for guest %s: %s", guest_id, e)
-                success = False
-                job = _update_jobs.get(guest_id)
-                if job and job.running:
-                    job.finish(False)
-
+        finally:
+            # Always release the bulk slot, even if something escaped the loop —
+            # otherwise the feature is wedged until the process restarts.
             with _bulk_update_lock:
-                if item:
-                    item["state"] = "success" if success else "failed"
-                _bulk_update["done"] += 1
-
-        with _bulk_update_lock:
-            _bulk_update["running"] = False
+                _bulk_update["running"] = False
 
 
 @bp.route("/apply-all", methods=["POST"])
@@ -538,6 +548,22 @@ def apply_all():
         flash("No guests with pending updates are available to update.", "info")
         return redirect(url_for("guests.index"))
 
+    items = [{"guest_id": g.id, "name": g.name, "state": "pending", "reason": None} for g in targets]
+    guest_ids = [g.id for g in targets]
+
+    # Authoritative check-and-set: one lock hold, so two concurrent requests
+    # can't both reserve the single bulk slot. The check above is only a cheap
+    # early exit.
+    with _bulk_update_lock:
+        if _bulk_update.get("running"):
+            flash("A bulk guest update is already running.", "warning")
+            return redirect(url_for("api.apply_all_progress"))
+        _bulk_update["running"] = True
+        _bulk_update["started_at"] = datetime.now(timezone.utc).isoformat()
+        _bulk_update["total"] = len(items)
+        _bulk_update["done"] = 0
+        _bulk_update["items"] = items
+
     # Per-guest audit rows (parity with single apply) plus one bulk summary row.
     for guest in targets:
         log_action("guest_update", "guest", resource_id=guest.id, resource_name=guest.name,
@@ -545,15 +571,6 @@ def apply_all():
     log_action("guest_update_all", "system", resource_name="all guests",
                details={"targets": len(targets), "dist_upgrade": dist_upgrade})
     db.session.commit()
-
-    items = [{"guest_id": g.id, "name": g.name, "state": "pending", "reason": None} for g in targets]
-    guest_ids = [g.id for g in targets]
-    with _bulk_update_lock:
-        _bulk_update["running"] = True
-        _bulk_update["started_at"] = datetime.now(timezone.utc).isoformat()
-        _bulk_update["total"] = len(items)
-        _bulk_update["done"] = 0
-        _bulk_update["items"] = items
 
     from flask import current_app
     app = current_app._get_current_object()
@@ -692,8 +709,18 @@ def _poll_proxmox_task(app, job_key):
         try:
             client = ProxmoxClient(job.host_model)
 
+            deadline = time.monotonic() + PROXMOX_TASK_POLL_DEADLINE_SECONDS
+            status_errors = 0
+
             while True:
                 time.sleep(2)
+
+                # Wall-clock deadline: a task that never reports "stopped" (host
+                # rebooted, UPID vanished) must not pin this thread forever.
+                if time.monotonic() >= deadline:
+                    job.append("\n[Error] Timed out waiting for the Proxmox task to finish.\n")
+                    job.finish(False)
+                    return
 
                 try:
                     log_lines = client.get_task_log(job.node, job.upid, start=job._last_log_line)
@@ -709,6 +736,7 @@ def _poll_proxmox_task(app, job_key):
 
                 try:
                     status = client.get_task_status(job.node, job.upid)
+                    status_errors = 0
                     if status.get("status") == "stopped":
                         exit_status = status.get("exitstatus", "")
                         if exit_status == "OK":
@@ -721,12 +749,21 @@ def _poll_proxmox_task(app, job_key):
                             job.finish(False)
                         return
                 except Exception as e:
+                    status_errors += 1
                     logger.debug(f"Error fetching task status: {e}")
+                    if status_errors >= PROXMOX_TASK_POLL_MAX_STATUS_ERRORS:
+                        job.append(f"\n[Error] Lost contact with the Proxmox task: {e}\n")
+                        job.finish(False)
+                        return
 
         except Exception as e:
             logger.error(f"Proxmox task polling error for {job_key}: {e}", exc_info=True)
             job.append(f"\n[Error] {e}\n")
             job.finish(False)
+        finally:
+            # Never leave a job stuck "running" if anything escaped above.
+            if job.running:
+                job.finish(False)
 
 
 def start_proxmox_job(guest, job_type, upid, node):

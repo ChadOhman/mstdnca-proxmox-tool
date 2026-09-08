@@ -773,3 +773,89 @@ class TestModerationAdminGate:
                     f"{method} {path} was allowed for a non-admin moderator"
         finally:
             self._cleanup(app)
+
+
+# ---------------------------------------------------------------------------
+# Issue #126 — auto-ban safety floor and moderator-role exclusion
+# ---------------------------------------------------------------------------
+
+
+class TestModerationAutoBanSafety:
+    """An empty Mastodon email set must never trigger a mass ban."""
+
+    def _configure(self, app):
+        from auth.credential_store import encrypt
+        from models import Setting
+        Setting.set("moderation_peertube_api_url", "https://pt.example.com")
+        Setting.set("moderation_peertube_api_token", encrypt("test-only-token"))
+        Setting.set("moderation_auto_ban_enabled", "true")
+
+    @patch("auth.audit.log_action")
+    @patch("core.moderation.ban_peertube_user")
+    @patch("core.moderation.fetch_peertube_users")
+    @patch("core.moderation.fetch_mastodon_emails")
+    def test_empty_mastodon_set_aborts_auto_ban(self, mock_masto, mock_pt, mock_ban,
+                                                _mock_audit, app):
+        from core.moderation import run_moderation_check
+
+        with app.app_context():
+            self._configure(app)
+            mock_masto.return_value = (set(), None)
+            mock_pt.return_value = ([
+                {"id": 2, "username": "alice", "email": "alice@example.com", "role": 2},
+                {"id": 3, "username": "bob", "email": "bob@example.com", "role": 2},
+            ], None)
+
+            ok, result = run_moderation_check()
+
+            assert ok is False
+            mock_ban.assert_not_called()
+            assert any("empty" in e.lower() for e in result["errors"])
+
+    @patch("auth.audit.log_action")
+    @patch("core.moderation.ban_peertube_user")
+    @patch("core.moderation.fetch_peertube_users")
+    @patch("core.moderation.fetch_mastodon_emails")
+    def test_empty_mastodon_set_still_reports_when_not_banning(self, mock_masto, mock_pt,
+                                                              mock_ban, _mock_audit, app):
+        """Dry-run mode (auto_ban off) is still allowed to list unmatched users."""
+        from core.moderation import run_moderation_check
+        from models import Setting
+
+        with app.app_context():
+            self._configure(app)
+            Setting.set("moderation_auto_ban_enabled", "false")
+            mock_masto.return_value = (set(), None)
+            mock_pt.return_value = ([
+                {"id": 2, "username": "alice", "email": "alice@example.com", "role": 2},
+            ], None)
+
+            ok, result = run_moderation_check()
+
+            assert ok is True
+            assert len(result["unmatched"]) == 1
+            mock_ban.assert_not_called()
+
+    @patch("auth.audit.log_action")
+    @patch("core.moderation.ban_peertube_user")
+    @patch("core.moderation.fetch_peertube_users")
+    @patch("core.moderation.fetch_mastodon_emails")
+    def test_moderators_are_skipped(self, mock_masto, mock_pt, mock_ban, _mock_audit, app):
+        from core.moderation import run_moderation_check
+
+        with app.app_context():
+            self._configure(app)
+            mock_masto.return_value = ({"alice@example.com"}, None)
+            mock_pt.return_value = ([
+                {"id": 1, "username": "admin", "email": "admin@pt.com", "role": 0},
+                {"id": 4, "username": "mod", "email": "mod@pt.com", "role": 1},
+                {"id": 2, "username": "alice", "email": "alice@example.com", "role": 2},
+            ], None)
+            mock_ban.return_value = (True, None)
+
+            ok, result = run_moderation_check()
+
+            assert ok is True
+            assert result["skipped_admins"] == 2
+            assert result["unmatched"] == []
+            mock_ban.assert_not_called()

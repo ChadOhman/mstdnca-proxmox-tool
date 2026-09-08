@@ -6,6 +6,8 @@ thread, so target selection + permissions are tested via HTTP; the orchestrator
 itself is tested by calling ``_run_bulk_update`` directly with the per-guest
 ``_run_update_background`` worker stubbed (no real SSH).
 """
+import pytest
+
 import routes.api as api_mod
 from models import AuditLog, Guest, Role, Tag, UpdatePackage, User, db
 from routes.api import UpdateJob, _bulk_update, _bulk_update_lock, _update_jobs
@@ -323,3 +325,137 @@ class TestApplyAllStatus:
         resp = auth_client.get("/api/apply-all/progress")
         assert resp.status_code == 200
         assert b"Updating All Guests" in resp.data
+
+
+# ---------------------------------------------------------------------------
+# Issue #126 — duplicate-launch guards are atomic, orchestrators always unwind
+# ---------------------------------------------------------------------------
+
+class TestApplyDuplicateLaunchGuard:
+    """Reservation happens under one lock hold, before the audit row is written."""
+
+    def test_duplicate_apply_is_rejected_without_audit_row(self, app, auth_client):
+        gid = _make_guest(app, "_dup-apply-guest", pending=1)
+        _update_jobs[gid] = UpdateJob(gid, "_dup-apply-guest")  # running=True
+        try:
+            with app.app_context():
+                before = AuditLog.query.filter_by(action="guest_update",
+                                                  resource_id=gid).count()
+
+            resp = auth_client.post(f"/api/apply/{gid}", follow_redirects=False)
+            assert resp.status_code == 302
+            assert f"/api/apply/{gid}/progress" in resp.headers["Location"]
+
+            with app.app_context():
+                after = AuditLog.query.filter_by(action="guest_update",
+                                                 resource_id=gid).count()
+            assert after == before
+        finally:
+            _update_jobs.pop(gid, None)
+            _cleanup_guests(app, gid)
+
+    def test_successful_apply_reserves_the_job(self, app, auth_client, monkeypatch):
+        gid = _make_guest(app, "_ok-apply-guest", pending=1)
+        started = []
+        monkeypatch.setattr(api_mod.threading, "Thread",
+                            lambda *a, **k: type("T", (), {"start": lambda s: started.append(1)})())
+        with app.app_context():
+            before = AuditLog.query.filter_by(action="guest_update", resource_id=gid).count()
+        try:
+            resp = auth_client.post(f"/api/apply/{gid}", follow_redirects=False)
+            assert resp.status_code == 302
+            assert gid in _update_jobs
+            assert _update_jobs[gid].running is True
+            assert started == [1]
+            with app.app_context():
+                after = AuditLog.query.filter_by(action="guest_update", resource_id=gid).count()
+            assert after == before + 1
+        finally:
+            _update_jobs.pop(gid, None)
+            with app.app_context():
+                AuditLog.query.filter_by(action="guest_update", resource_id=gid).delete()
+                db.session.commit()
+            _cleanup_guests(app, gid)
+
+
+class TestApplyAllDuplicateLaunchGuard:
+    def test_second_launch_while_running_is_rejected(self, app, auth_client, monkeypatch):
+        gid = _make_guest(app, "_dup-applyall-guest", pending=1)
+        monkeypatch.setattr(api_mod.threading, "Thread",
+                            lambda *a, **k: type("T", (), {"start": lambda s: None})())
+        _reset_bulk()
+        try:
+            first = auth_client.post("/api/apply-all", follow_redirects=False)
+            assert first.status_code == 302
+            with _bulk_update_lock:
+                assert _bulk_update["running"] is True
+                total = _bulk_update["total"]
+
+            second = auth_client.post("/api/apply-all", follow_redirects=False)
+            assert second.status_code == 302
+            assert "/api/apply-all/progress" in second.headers["Location"]
+            with _bulk_update_lock:
+                # The second request must not have re-seeded the run.
+                assert _bulk_update["total"] == total
+        finally:
+            with app.app_context():
+                AuditLog.query.filter(AuditLog.action.in_(("guest_update", "guest_update_all"))) \
+                    .filter(AuditLog.resource_id == gid).delete(synchronize_session=False)
+                db.session.commit()
+            _cleanup_guests(app, gid)
+            _reset_bulk()
+
+
+class TestBulkUpdateAlwaysUnwinds:
+    def test_escaped_exception_still_clears_running(self, app, monkeypatch):
+        gid = _make_guest(app, "_bulk-unwind-guest", pending=1)
+
+        def boom(_guest):
+            raise RuntimeError("snapshot subsystem exploded")
+
+        # guest_requires_snapshot() is called outside the per-guest try block.
+        monkeypatch.setattr("routes.guests.guest_requires_snapshot", boom)
+
+        _reset_bulk()
+        with _bulk_update_lock:
+            _bulk_update["running"] = True
+            _bulk_update["total"] = 1
+            _bulk_update["items"] = [
+                {"guest_id": gid, "name": "_bulk-unwind-guest", "state": "pending", "reason": None},
+            ]
+        try:
+            with pytest.raises(RuntimeError):
+                api_mod._run_bulk_update(app, [gid], False, True)
+            with _bulk_update_lock:
+                assert _bulk_update["running"] is False
+        finally:
+            _update_jobs.pop(gid, None)
+            _cleanup_guests(app, gid)
+            _reset_bulk()
+
+    def test_worker_exception_does_not_leave_job_running(self, app, monkeypatch):
+        gid = _make_guest(app, "_bulk-job-unwind", pending=1)
+
+        def fake_bg(app_, guest_id, dist, **kwargs):
+            raise RuntimeError("ssh died")
+
+        monkeypatch.setattr(api_mod, "_run_update_background", fake_bg)
+
+        _reset_bulk()
+        with _bulk_update_lock:
+            _bulk_update["running"] = True
+            _bulk_update["total"] = 1
+            _bulk_update["items"] = [
+                {"guest_id": gid, "name": "_bulk-job-unwind", "state": "pending", "reason": None},
+            ]
+        try:
+            api_mod._run_bulk_update(app, [gid], False, False)
+            assert _update_jobs[gid].running is False
+            assert _update_jobs[gid].success is False
+            with _bulk_update_lock:
+                assert _bulk_update["running"] is False
+                assert _bulk_update["items"][0]["state"] == "failed"
+        finally:
+            _update_jobs.pop(gid, None)
+            _cleanup_guests(app, gid)
+            _reset_bulk()

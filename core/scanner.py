@@ -1225,6 +1225,35 @@ def detect_services(guest):
     db.session.commit()
 
 
+def _notify_service_transition(guest, service_key, unit_name, old_status, new_status):
+    """Dispatch Discord + push alerts for a service status transition.
+
+    Shared by both status-writing paths (`_upsert_service` during the periodic
+    scan and `check_service_statuses` during the frequent health check) so an
+    alert fires whichever one observes the transition first.  Notifications are
+    best-effort and never propagate.
+    """
+    if new_status == "failed" and old_status != "failed":
+        event, sender = "service_failed", "send_service_failed_notification"
+    elif new_status == "running" and old_status == "failed":
+        event, sender = "service_recovered", "send_service_recovery_notification"
+    else:
+        return
+
+    try:
+        from core import notifier
+        if notifier.guest_matches_notify_tags(guest):
+            getattr(notifier, sender)(guest.name, service_key)
+    except Exception:
+        logger.debug(f"Service {event} notification failed for {unit_name}", exc_info=True)
+
+    try:
+        from core.push_notifier import dispatch_push_alerts
+        dispatch_push_alerts(guest, event, {"service": service_key, "unit": unit_name})
+    except Exception:
+        logger.debug(f"Service {event} push alert failed for {unit_name}", exc_info=True)
+
+
 def _upsert_service(guest, service_key, unit_name, default_port, status, now):
     """Create or update a GuestService record."""
     try:
@@ -1239,30 +1268,7 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
             existing.status = status
             existing.last_checked = now
             # Notifications on state transitions
-            if status == "failed" and old_status != "failed":
-                try:
-                    from core.notifier import guest_matches_notify_tags, send_service_failed_notification
-                    if guest_matches_notify_tags(guest):
-                        send_service_failed_notification(guest.name, service_key)
-                except Exception:
-                    pass
-                try:
-                    from core.push_notifier import dispatch_push_alerts
-                    dispatch_push_alerts(guest, "service_failed", {"service": service_key, "unit": unit_name})
-                except Exception:
-                    pass
-            elif status == "running" and old_status == "failed":
-                try:
-                    from core.notifier import guest_matches_notify_tags, send_service_recovery_notification
-                    if guest_matches_notify_tags(guest):
-                        send_service_recovery_notification(guest.name, service_key)
-                except Exception:
-                    pass
-                try:
-                    from core.push_notifier import dispatch_push_alerts
-                    dispatch_push_alerts(guest, "service_recovered", {"service": service_key, "unit": unit_name})
-                except Exception:
-                    pass
+            _notify_service_transition(guest, service_key, unit_name, old_status, status)
         else:
             svc = GuestService(
                 guest_id=guest.id,
@@ -1274,18 +1280,7 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
                 auto_detected=True,
             )
             db.session.add(svc)
-            if status == "failed":
-                try:
-                    from core.notifier import guest_matches_notify_tags, send_service_failed_notification
-                    if guest_matches_notify_tags(guest):
-                        send_service_failed_notification(guest.name, service_key)
-                except Exception:
-                    pass
-                try:
-                    from core.push_notifier import dispatch_push_alerts
-                    dispatch_push_alerts(guest, "service_failed", {"service": service_key, "unit": unit_name})
-                except Exception:
-                    pass
+            _notify_service_transition(guest, service_key, unit_name, None, status)
     elif status == "stopped" and existing:
         existing.status = status
         existing.last_checked = now
@@ -1307,8 +1302,10 @@ def check_service_statuses(guest):
     lines = (stdout or "").strip().split("\n")
     now = datetime.now(timezone.utc)
 
+    transitions = []
     for i, svc in enumerate(guest.services):
         status_str = lines[i].strip() if i < len(lines) else "unknown"
+        old_status = svc.status
         if status_str == "active":
             svc.status = "running"
         elif status_str == "inactive":
@@ -1318,8 +1315,15 @@ def check_service_statuses(guest):
         else:
             svc.status = "unknown"
         svc.last_checked = now
+        if svc.status != old_status:
+            transitions.append((svc.service_name, svc.unit_name, old_status, svc.status))
 
     db.session.commit()
+
+    # Alert after the commit so the new status is durable before anyone is
+    # paged, and so a later scan/_upsert_service pass sees no transition left.
+    for service_key, unit_name, old_status, new_status in transitions:
+        _notify_service_transition(guest, service_key, unit_name, old_status, new_status)
 
 
 def service_action(guest, service, action):
@@ -3075,6 +3079,9 @@ def scan_all_guests():
             result = scan_guest(guest)
             results.append(result)
         except Exception as e:
+            # Roll back first: a failed guest must not leave the shared session
+            # in a pending-rollback state that poisons every later guest.
+            db.session.rollback()
             logger.error(f"Unexpected error scanning {guest.name}: {e}")
     return results
 
