@@ -8,10 +8,26 @@ to refresh gauge values.  The registry is exposed via a /metrics endpoint
 
 Uses a custom CollectorRegistry to avoid conflicts with the default global
 registry and any future WSGI middleware.
+
+Metric lifecycle
+-----------------
+Several collection loops (host, guest, service, APT) call their update_*()
+function once per entity from a shared refresh cycle in core/scheduler.py, so
+this module has no explicit "cycle complete" signal from the caller. To avoid
+exporting stale series forever for deleted/renamed guests, hosts, or services,
+each of these groups is tracked by ``_prune_cycle()``: a gap of more than
+``_CYCLE_GAP_SECONDS`` between calls for the same group is treated as the
+boundary between one full refresh and the next, and any label combination not
+touched during the cycle that just finished is removed from its collectors.
+
+UniFi device/health metrics are different: the caller already passes the full
+current list on every call, so those are pruned by direct set-difference
+against the previous call's labels for that site — no timing heuristic needed.
 """
 
 import logging
 import threading
+import time
 
 from prometheus_client import CollectorRegistry, Gauge, Info, generate_latest
 
@@ -31,14 +47,12 @@ HOST_MEM_USED = Gauge("mstdnca_host_memory_used_bytes", "Host memory used in byt
                       ["host_id", "host_name", "host_type"], registry=registry)
 HOST_MEM_TOTAL = Gauge("mstdnca_host_memory_total_bytes", "Host memory total in bytes",
                        ["host_id", "host_name", "host_type"], registry=registry)
-HOST_NET_IN = Gauge("mstdnca_host_network_in_bytes_per_sec", "Host network inbound bytes/sec",
-                    ["host_id", "host_name", "host_type"], registry=registry)
-HOST_NET_OUT = Gauge("mstdnca_host_network_out_bytes_per_sec", "Host network outbound bytes/sec",
-                     ["host_id", "host_name", "host_type"], registry=registry)
 HOST_ROOTFS = Gauge("mstdnca_host_rootfs_used_percent", "Host rootfs usage percentage",
                     ["host_id", "host_name", "host_type"], registry=registry)
 HOST_UPTIME = Gauge("mstdnca_host_uptime_seconds", "Host uptime in seconds",
                     ["host_id", "host_name", "host_type"], registry=registry)
+
+_HOST_COLLECTORS = [HOST_CPU, HOST_MEM_USED, HOST_MEM_TOTAL, HOST_ROOTFS, HOST_UPTIME]
 
 # ---------------------------------------------------------------------------
 # Guest metrics (labels: guest_id, guest_name, guest_type, host_name, vmid)
@@ -56,6 +70,8 @@ GUEST_NET_OUT = Gauge("mstdnca_guest_network_out_bytes_per_sec", "Guest network 
 GUEST_POWER = Gauge("mstdnca_guest_power_state", "Guest power state (1=running, 0=stopped)",
                     ["guest_id", "guest_name", "guest_type", "host_name", "vmid"], registry=registry)
 
+_GUEST_COLLECTORS = [GUEST_CPU, GUEST_MEM_USED, GUEST_MEM_TOTAL, GUEST_NET_IN, GUEST_NET_OUT, GUEST_POWER]
+
 # ---------------------------------------------------------------------------
 # Service health (labels: service_id, service_name, guest_name, unit_name)
 # ---------------------------------------------------------------------------
@@ -63,6 +79,8 @@ SVC_UP = Gauge("mstdnca_service_up", "Service status (1=running, 0=not running)"
                ["service_id", "service_name", "guest_name", "unit_name"], registry=registry)
 SVC_MEMORY = Gauge("mstdnca_service_memory_bytes", "Service memory usage in bytes",
                    ["service_id", "service_name", "guest_name", "unit_name"], registry=registry)
+
+_SERVICE_COLLECTORS = [SVC_UP, SVC_MEMORY]
 
 # ---------------------------------------------------------------------------
 # PostgreSQL (labels: service_id, guest_name)
@@ -165,6 +183,11 @@ UNIFI_DEV_RX = Gauge("mstdnca_unifi_device_rx_bytes", "UniFi device RX bytes",
 UNIFI_DEV_UPLINK_SPEED = Gauge("mstdnca_unifi_device_uplink_speed_mbps", "UniFi device uplink speed",
                                _UNIFI_DEV_LABELS, registry=registry)
 
+_UNIFI_DEV_COLLECTORS = [
+    UNIFI_DEV_CPU, UNIFI_DEV_MEM, UNIFI_DEV_UPTIME, UNIFI_DEV_TEMP,
+    UNIFI_DEV_LOAD1, UNIFI_DEV_CLIENTS, UNIFI_DEV_TX, UNIFI_DEV_RX, UNIFI_DEV_UPLINK_SPEED,
+]
+
 # ---------------------------------------------------------------------------
 # UniFi — per-AP radio (labels: site_name, device_mac, device_name, radio)
 # ---------------------------------------------------------------------------
@@ -177,6 +200,8 @@ UNIFI_RADIO_CLIENTS = Gauge("mstdnca_unifi_radio_clients", "UniFi AP radio clien
                             _UNIFI_RADIO_LABELS, registry=registry)
 UNIFI_RADIO_TX_POWER = Gauge("mstdnca_unifi_radio_tx_power", "UniFi AP radio TX power",
                              _UNIFI_RADIO_LABELS, registry=registry)
+
+_UNIFI_RADIO_COLLECTORS = [UNIFI_RADIO_CHANNEL, UNIFI_RADIO_CU, UNIFI_RADIO_CLIENTS, UNIFI_RADIO_TX_POWER]
 
 # ---------------------------------------------------------------------------
 # UniFi — site health (labels: site_name, subsystem)
@@ -200,6 +225,11 @@ UNIFI_SPEEDTEST_DL = Gauge("mstdnca_unifi_speedtest_download_mbps", "UniFi last 
 UNIFI_SPEEDTEST_UL = Gauge("mstdnca_unifi_speedtest_upload_mbps", "UniFi last speedtest upload",
                            ["site_name"], registry=registry)
 
+_UNIFI_WAN_COLLECTORS = [
+    UNIFI_WAN_LATENCY, UNIFI_WAN_TX_RATE, UNIFI_WAN_RX_RATE, UNIFI_WAN_UPTIME,
+    UNIFI_SPEEDTEST_DL, UNIFI_SPEEDTEST_UL,
+]
+
 # ---------------------------------------------------------------------------
 # APT updates (labels: guest_id, guest_name)
 # ---------------------------------------------------------------------------
@@ -209,6 +239,8 @@ APT_SECURITY = Gauge("mstdnca_guest_security_updates", "Pending security updates
                      ["guest_id", "guest_name"], registry=registry)
 APT_REBOOT = Gauge("mstdnca_guest_reboot_required", "Reboot required (1=yes, 0=no)",
                    ["guest_id", "guest_name"], registry=registry)
+
+_APT_COLLECTORS = [APT_PENDING, APT_SECURITY, APT_REBOOT]
 
 # ---------------------------------------------------------------------------
 # Application version info (labels: app_name)
@@ -220,6 +252,57 @@ APP_INFO = Info("mstdnca_app", "Application version information",
 
 
 # ---------------------------------------------------------------------------
+# Metric lifecycle helpers
+# ---------------------------------------------------------------------------
+
+# Gap between calls for the same group that marks the boundary between one
+# full refresh cycle and the next (see module docstring). Comfortably shorter
+# than the scheduler's collection interval (default 60s) while still long
+# enough to cover a full per-entity loop.
+_CYCLE_GAP_SECONDS = 30
+
+# group_name -> {"cycle_start": monotonic ts, "last_call": monotonic ts, "seen": {label_tuple: ts}}
+_cycle_state = {}
+
+# site_name -> set of label tuples currently exported, for groups whose caller
+# already supplies the full current list on every call.
+_unifi_device_labels = {}
+_unifi_radio_labels = {}
+_unifi_health_labels = {}
+_unifi_wan_present = {}
+
+
+def _remove_labels(collectors, label_tuple):
+    """Remove `label_tuple` from every collector in `collectors`, ignoring collectors
+    that never had a series for it."""
+    for collector in collectors:
+        try:
+            collector.remove(*label_tuple)
+        except KeyError:
+            pass
+
+
+def _prune_cycle(group, label_tuple, collectors):
+    """Record `label_tuple` as refreshed in `group`'s current cycle.
+
+    If the gap since the last call to this group exceeds `_CYCLE_GAP_SECONDS`, the
+    previous cycle is considered finished: any label combination not touched during
+    it is removed from `collectors`. Must be called with `_lock` held.
+    """
+    now = time.monotonic()
+    state = _cycle_state.setdefault(group, {"cycle_start": now, "last_call": now, "seen": {}})
+    if now - state["last_call"] > _CYCLE_GAP_SECONDS:
+        cycle_start = state["cycle_start"]
+        stale = [lbl for lbl, ts in state["seen"].items() if ts < cycle_start]
+        for lbl in stale:
+            _remove_labels(collectors, lbl)
+            del state["seen"][lbl]
+        state["cycle_start"] = now
+    state["last_call"] = now
+    state["seen"][label_tuple] = now
+
+
+# ---------------------------------------------------------------------------
 # Update functions — called from scheduler/scanner after each collection
 # ---------------------------------------------------------------------------
 
@@ -228,6 +311,8 @@ def update_host_metrics(host_id, host_name, host_type, status):
     labels = [str(host_id), host_name, host_type]
     with _lock:
         try:
+            _prune_cycle("host", tuple(labels), _HOST_COLLECTORS)
+
             cpu = status.get("cpu")
             if cpu is not None:
                 HOST_CPU.labels(*labels).set(round(cpu * 100, 2))
@@ -256,6 +341,8 @@ def update_guest_metrics(guest_id, guest_name, guest_type, host_name, vmid, stat
     labels = [str(guest_id), guest_name, guest_type, host_name, str(vmid)]
     with _lock:
         try:
+            _prune_cycle("guest", tuple(labels), _GUEST_COLLECTORS)
+
             cpu = status.get("cpu")
             maxcpu = status.get("maxcpu", 1) or 1
             if cpu is not None:
@@ -286,6 +373,8 @@ def update_service_health(service_id, service_name, guest_name, unit_name, statu
     labels = [str(service_id), service_name, guest_name, unit_name]
     with _lock:
         try:
+            _prune_cycle("service", tuple(labels), _SERVICE_COLLECTORS)
+
             running = 1 if status in ("running", "active") else 0
             SVC_UP.labels(*labels).set(running)
             if memory_bytes is not None:
@@ -406,11 +495,20 @@ def update_unifi_metrics(site_name, device_count=None, client_count=None):
 
 
 def update_unifi_device_metrics(site_name, devices):
-    """Update per-device and per-radio UniFi metrics."""
+    """Update per-device and per-radio UniFi metrics.
+
+    `devices` is the full current device list for `site_name` on every call, so
+    any device/radio label combination previously exported for this site but not
+    present this time is removed (deleted/renamed devices stop being exported).
+    """
     with _lock:
         try:
+            new_device_labels = set()
+            new_radio_labels = set()
+
             for d in devices:
-                labels = [site_name, d.get("mac", ""), d.get("name", ""), d.get("type", "")]
+                labels = (site_name, d.get("mac", ""), d.get("name", ""), d.get("type", ""))
+                new_device_labels.add(labels)
                 cpu = d.get("cpu")
                 if cpu is not None:
                     UNIFI_DEV_CPU.labels(*labels).set(cpu)
@@ -441,7 +539,8 @@ def update_unifi_device_metrics(site_name, devices):
                 # Per-radio metrics
                 for r in d.get("radio_table", []):
                     radio_name = r.get("name") or r.get("radio", "unknown")
-                    rlabels = [site_name, d.get("mac", ""), d.get("name", ""), radio_name]
+                    rlabels = (site_name, d.get("mac", ""), d.get("name", ""), radio_name)
+                    new_radio_labels.add(rlabels)
                     if r.get("channel"):
                         UNIFI_RADIO_CHANNEL.labels(*rlabels).set(r["channel"])
                     if r.get("cu_total") is not None:
@@ -450,24 +549,45 @@ def update_unifi_device_metrics(site_name, devices):
                         UNIFI_RADIO_CLIENTS.labels(*rlabels).set(r["num_sta"])
                     if r.get("tx_power"):
                         UNIFI_RADIO_TX_POWER.labels(*rlabels).set(r["tx_power"])
+
+            stale_devices = _unifi_device_labels.get(site_name, set()) - new_device_labels
+            for lbl in stale_devices:
+                _remove_labels(_UNIFI_DEV_COLLECTORS, lbl)
+            _unifi_device_labels[site_name] = new_device_labels
+
+            stale_radios = _unifi_radio_labels.get(site_name, set()) - new_radio_labels
+            for lbl in stale_radios:
+                _remove_labels(_UNIFI_RADIO_COLLECTORS, lbl)
+            _unifi_radio_labels[site_name] = new_radio_labels
         except Exception:
             logger.debug("Failed to update UniFi device metrics", exc_info=True)
 
 
 def update_unifi_health_metrics(site_name, health_data):
-    """Update UniFi site health and WAN metrics."""
+    """Update UniFi site health and WAN metrics.
+
+    `health_data` is the full current subsystem list for `site_name` on every call,
+    so subsystems (and WAN metrics, when the "wan" subsystem disappears) that were
+    previously exported but are no longer present are removed.
+    """
     _HEALTH_MAP = {"ok": 1, "warning": 2, "error": 3}
     with _lock:
         try:
+            new_health_labels = set()
+            wan_present = False
+
             for subsystem in health_data:
                 name = subsystem.get("subsystem", "")
                 if not name:
                     continue
+                labels = (site_name, name)
+                new_health_labels.add(labels)
                 status = subsystem.get("status", "unknown")
-                UNIFI_HEALTH_STATUS.labels(site_name, name).set(_HEALTH_MAP.get(status, 0))
+                UNIFI_HEALTH_STATUS.labels(*labels).set(_HEALTH_MAP.get(status, 0))
 
                 # WAN-specific metrics
                 if name == "wan":
+                    wan_present = True
                     latency = subsystem.get("latency")
                     if latency is not None:
                         UNIFI_WAN_LATENCY.labels(site_name).set(_to_num(latency))
@@ -486,6 +606,15 @@ def update_unifi_health_metrics(site_name, health_data):
                     speedtest_ul = subsystem.get("speedtest_lastrun_upload")
                     if speedtest_ul is not None:
                         UNIFI_SPEEDTEST_UL.labels(site_name).set(_to_num(speedtest_ul))
+
+            stale_health = _unifi_health_labels.get(site_name, set()) - new_health_labels
+            for lbl in stale_health:
+                _remove_labels([UNIFI_HEALTH_STATUS], lbl)
+            _unifi_health_labels[site_name] = new_health_labels
+
+            if _unifi_wan_present.get(site_name, False) and not wan_present:
+                _remove_labels(_UNIFI_WAN_COLLECTORS, (site_name,))
+            _unifi_wan_present[site_name] = wan_present
         except Exception:
             logger.debug("Failed to update UniFi health metrics", exc_info=True)
 
@@ -495,6 +624,8 @@ def update_apt_metrics(guest_id, guest_name, pending, security, reboot_required)
     labels = [str(guest_id), guest_name]
     with _lock:
         try:
+            _prune_cycle("apt", tuple(labels), _APT_COLLECTORS)
+
             APT_PENDING.labels(*labels).set(pending)
             APT_SECURITY.labels(*labels).set(security)
             APT_REBOOT.labels(*labels).set(1 if reboot_required else 0)

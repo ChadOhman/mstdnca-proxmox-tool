@@ -207,6 +207,68 @@ class TestIpmiRoutes:
         assert "42" in html  # CPU temp
 
     @patch("routes.ipmi._get_redfish_client")
+    def test_index_logs_out_bmc_session_on_success(self, mock_client, auth_client, ipmi_host):
+        """A fresh RedfishClient is created per request; without an explicit logout
+        each dashboard load leaks a BMC Redfish session (issue #128)."""
+        mock = MagicMock()
+        mock.get_health_snapshot.return_value = _mock_snapshot()
+        mock_client.return_value = mock
+        resp = auth_client.get("/ipmi/")
+        assert resp.status_code == 200
+        mock.logout.assert_called_once()
+
+    @patch("routes.ipmi._get_redfish_client")
+    def test_index_logs_out_bmc_session_on_exception(self, mock_client, auth_client, ipmi_host):
+        """logout() must run even when the client raises mid-request (try/finally,
+        not just a call at the end of the happy path)."""
+        mock = MagicMock()
+        mock.get_health_snapshot.side_effect = RuntimeError("BMC unreachable")
+        mock_client.return_value = mock
+        resp = auth_client.get("/ipmi/")
+        assert resp.status_code == 200
+        mock.logout.assert_called_once()
+
+    @patch("routes.ipmi._get_redfish_client")
+    def test_detail_page_logs_out_once_for_two_client_calls(self, mock_client, auth_client, ipmi_host):
+        """detail() uses the client twice (snapshot + SEL) — logout must fire once,
+        after both calls, not once per call."""
+        mock = MagicMock()
+        mock.get_health_snapshot.return_value = _mock_snapshot()
+        mock.get_sel_entries.return_value = []
+        mock_client.return_value = mock
+        resp = auth_client.get(f"/ipmi/host/{ipmi_host}")
+        assert resp.status_code == 200
+        mock.logout.assert_called_once()
+
+    @patch("routes.ipmi._get_redfish_client")
+    def test_test_connection_logs_out(self, mock_client, auth_client, ipmi_host):
+        mock = MagicMock()
+        mock.test_connection.return_value = (True, "Connected")
+        mock_client.return_value = mock
+        # Don't follow the redirect: the detail page it lands on would create and
+        # log out a second RedfishClient, which would muddy this assertion.
+        auth_client.post(f"/ipmi/host/{ipmi_host}/test", follow_redirects=False)
+        mock.logout.assert_called_once()
+
+    @patch("routes.ipmi._get_redfish_client")
+    def test_sel_page_logs_out(self, mock_client, auth_client, ipmi_host):
+        mock = MagicMock()
+        mock.get_sel_entries.return_value = []
+        mock_client.return_value = mock
+        auth_client.get(f"/ipmi/host/{ipmi_host}/sel")
+        mock.logout.assert_called_once()
+
+    def test_no_client_does_not_attempt_logout(self, auth_client, ipmi_host, app):
+        """When IPMI isn't configured, _get_redfish_client() returns None — logout()
+        must not be called on None."""
+        with app.app_context():
+            host = ProxmoxHost.query.get(ipmi_host)
+            host.ipmi_enabled = False
+            db.session.commit()
+        resp = auth_client.get("/ipmi/")
+        assert resp.status_code == 200
+
+    @patch("routes.ipmi._get_redfish_client")
     def test_detail_page(self, mock_client, auth_client, ipmi_host):
         mock = MagicMock()
         mock.get_health_snapshot.return_value = _mock_snapshot()
