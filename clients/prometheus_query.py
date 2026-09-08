@@ -73,6 +73,23 @@ _TIMEFRAMES = {
 }
 
 
+def escape_label_value(value):
+    """Escape a value for safe interpolation into a PromQL string literal.
+
+    PromQL string literals follow Go string-escaping rules: a backslash must
+    be escaped first (so it doesn't swallow the next escape), then a double
+    quote, then a literal newline. Without this, a value such as
+    ``x"} or up{job=~".*`` closes the label matcher early and injects an
+    arbitrary additional selector into the query (PromQL injection), which
+    can be used to exfiltrate unrelated metrics or craft a query expensive
+    enough to DoS the shared Prometheus.
+    """
+    if value is None:
+        return ""
+    value = str(value)
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 class PrometheusQueryClient:
     """Thin client around the Prometheus HTTP API."""
 
@@ -142,7 +159,7 @@ class PrometheusQueryClient:
         source = "node_exporter" if target else "mstdnca"
 
         if target:
-            inst = f'instance="{target}"'
+            inst = f'instance="{escape_label_value(target)}"'
             cpu_data = self._range_single(
                 f'100 - (avg(rate(node_cpu_seconds_total{{mode="idle",{inst}}}[{rate_interval}])) * 100)',
                 start, end, step,
@@ -162,14 +179,14 @@ class PrometheusQueryClient:
             )
         else:
             vmid_str = str(vmid)
-            cpu_data = self._range_single(f'mstdnca_guest_cpu_usage_percent{{vmid="{vmid_str}"}}', start, end, step)
-            mem_used = self._range_single(f'mstdnca_guest_memory_used_bytes{{vmid="{vmid_str}"}}', start, end, step)
-            mem_total = self._range_single(f'mstdnca_guest_memory_total_bytes{{vmid="{vmid_str}"}}', start, end, step)
+            cpu_data = self._range_single(f'mstdnca_guest_cpu_usage_percent{{vmid="{escape_label_value(vmid_str)}"}}', start, end, step)
+            mem_used = self._range_single(f'mstdnca_guest_memory_used_bytes{{vmid="{escape_label_value(vmid_str)}"}}', start, end, step)
+            mem_total = self._range_single(f'mstdnca_guest_memory_total_bytes{{vmid="{escape_label_value(vmid_str)}"}}', start, end, step)
             netin = self._range_single(
-                f'mstdnca_guest_network_in_bytes_per_sec{{vmid="{vmid_str}"}}', start, end, step,
+                f'mstdnca_guest_network_in_bytes_per_sec{{vmid="{escape_label_value(vmid_str)}"}}', start, end, step,
             )
             netout = self._range_single(
-                f'mstdnca_guest_network_out_bytes_per_sec{{vmid="{vmid_str}"}}', start, end, step,
+                f'mstdnca_guest_network_out_bytes_per_sec{{vmid="{escape_label_value(vmid_str)}"}}', start, end, step,
             )
 
         return self._build_guest_result(cpu_data, mem_used, mem_total, netin, netout, source)
@@ -235,12 +252,12 @@ class PrometheusQueryClient:
 
         hid = str(host_id)
 
-        cpu_data = self._range_single(f'mstdnca_host_cpu_usage_percent{{host_id="{hid}"}}', start, end, step)
-        mem_used = self._range_single(f'mstdnca_host_memory_used_bytes{{host_id="{hid}"}}', start, end, step)
-        mem_total = self._range_single(f'mstdnca_host_memory_total_bytes{{host_id="{hid}"}}', start, end, step)
-        netin = self._range_single(f'mstdnca_host_network_in_bytes_per_sec{{host_id="{hid}"}}', start, end, step)
-        netout = self._range_single(f'mstdnca_host_network_out_bytes_per_sec{{host_id="{hid}"}}', start, end, step)
-        rootfs = self._range_single(f'mstdnca_host_rootfs_used_percent{{host_id="{hid}"}}', start, end, step)
+        cpu_data = self._range_single(f'mstdnca_host_cpu_usage_percent{{host_id="{escape_label_value(hid)}"}}', start, end, step)
+        mem_used = self._range_single(f'mstdnca_host_memory_used_bytes{{host_id="{escape_label_value(hid)}"}}', start, end, step)
+        mem_total = self._range_single(f'mstdnca_host_memory_total_bytes{{host_id="{escape_label_value(hid)}"}}', start, end, step)
+        netin = self._range_single(f'mstdnca_host_network_in_bytes_per_sec{{host_id="{escape_label_value(hid)}"}}', start, end, step)
+        netout = self._range_single(f'mstdnca_host_network_out_bytes_per_sec{{host_id="{escape_label_value(hid)}"}}', start, end, step)
+        rootfs = self._range_single(f'mstdnca_host_rootfs_used_percent{{host_id="{escape_label_value(hid)}"}}', start, end, step)
 
         timestamps = cpu_data.get("timestamps") or mem_used.get("timestamps") or []
         utz = _user_tz()
@@ -310,7 +327,7 @@ class PrometheusQueryClient:
         timestamps = []
 
         for metric_name in metric_names:
-            result = self._range_single(f'{metric_name}{{service_id="{sid}"}}', start, end, step)
+            result = self._range_single(f'{metric_name}{{service_id="{escape_label_value(sid)}"}}', start, end, step)
             all_series[metric_name] = result.get("values", [])
             if not timestamps and result.get("timestamps"):
                 timestamps = result["timestamps"]
@@ -332,7 +349,7 @@ class PrometheusQueryClient:
         dur, step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
         end = time.time()
         start = end - dur
-        inst = f'instance="{target}"'
+        inst = f'instance="{escape_label_value(target)}"'
         rate_interval = f"{max(step * 2, 120)}s"
 
         queries = {
@@ -355,7 +372,7 @@ class PrometheusQueryClient:
         dur, step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
         end = time.time()
         start = end - dur
-        inst = f'instance="{target}"'
+        inst = f'instance="{escape_label_value(target)}"'
         rate_interval = f"{max(step * 2, 120)}s"
 
         queries = {
@@ -377,7 +394,7 @@ class PrometheusQueryClient:
         dur, step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
         end = time.time()
         start = end - dur
-        inst = f'instance="{target}"'
+        inst = f'instance="{escape_label_value(target)}"'
 
         queries = {
             "cluster_health": f'elasticsearch_cluster_health_status{{{inst}}}',
@@ -399,7 +416,7 @@ class PrometheusQueryClient:
         dur, step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
         end = time.time()
         start = end - dur
-        inst = f'instance="{target}"'
+        inst = f'instance="{escape_label_value(target)}"'
         ri = f"{max(step * 2, 120)}s"
 
         # Helper for summary average: rate(sum) / rate(count)
@@ -447,7 +464,7 @@ class PrometheusQueryClient:
         dur, step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
         end = time.time()
         start = end - dur
-        inst = f'instance="{target}"'
+        inst = f'instance="{escape_label_value(target)}"'
 
         queries = {
             "power_consumption_watts": f"ipmi_dcmi_power_consumption_watts{{{inst}}}",
@@ -464,7 +481,7 @@ class PrometheusQueryClient:
         dur, step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
         end = time.time()
         start = end - dur
-        inst = f'instance="{target}"'
+        inst = f'instance="{escape_label_value(target)}"'
 
         queries = {
             "conferences": f"jitsi_jvb_conferences{{{inst}}}",
@@ -513,12 +530,12 @@ class PrometheusQueryClient:
         mac = device_mac.lower()
 
         queries = {
-            "cpu": f'mstdnca_unifi_device_cpu_percent{{device_mac="{mac}"}}',
-            "memory": f'mstdnca_unifi_device_memory_percent{{device_mac="{mac}"}}',
-            "clients": f'mstdnca_unifi_device_clients{{device_mac="{mac}"}}',
-            "tx_bytes": f'mstdnca_unifi_device_tx_bytes{{device_mac="{mac}"}}',
-            "rx_bytes": f'mstdnca_unifi_device_rx_bytes{{device_mac="{mac}"}}',
-            "temperature": f'mstdnca_unifi_device_temperature_celsius{{device_mac="{mac}"}}',
+            "cpu": f'mstdnca_unifi_device_cpu_percent{{device_mac="{escape_label_value(mac)}"}}',
+            "memory": f'mstdnca_unifi_device_memory_percent{{device_mac="{escape_label_value(mac)}"}}',
+            "clients": f'mstdnca_unifi_device_clients{{device_mac="{escape_label_value(mac)}"}}',
+            "tx_bytes": f'mstdnca_unifi_device_tx_bytes{{device_mac="{escape_label_value(mac)}"}}',
+            "rx_bytes": f'mstdnca_unifi_device_rx_bytes{{device_mac="{escape_label_value(mac)}"}}',
+            "temperature": f'mstdnca_unifi_device_temperature_celsius{{device_mac="{escape_label_value(mac)}"}}',
         }
 
         all_series = {}
@@ -555,13 +572,13 @@ class PrometheusQueryClient:
         start = end - dur
 
         queries = {
-            "clients": f'mstdnca_unifi_client_count{{site_name="{site_name}"}}',
-            "devices": f'mstdnca_unifi_device_count{{site_name="{site_name}"}}',
-            "wan_latency": f'mstdnca_unifi_wan_latency_ms{{site_name="{site_name}"}}',
-            "wan_tx": f'mstdnca_unifi_wan_tx_bytes_per_sec{{site_name="{site_name}"}}',
-            "wan_rx": f'mstdnca_unifi_wan_rx_bytes_per_sec{{site_name="{site_name}"}}',
-            "speedtest_dl": f'mstdnca_unifi_speedtest_download_mbps{{site_name="{site_name}"}}',
-            "speedtest_ul": f'mstdnca_unifi_speedtest_upload_mbps{{site_name="{site_name}"}}',
+            "clients": f'mstdnca_unifi_client_count{{site_name="{escape_label_value(site_name)}"}}',
+            "devices": f'mstdnca_unifi_device_count{{site_name="{escape_label_value(site_name)}"}}',
+            "wan_latency": f'mstdnca_unifi_wan_latency_ms{{site_name="{escape_label_value(site_name)}"}}',
+            "wan_tx": f'mstdnca_unifi_wan_tx_bytes_per_sec{{site_name="{escape_label_value(site_name)}"}}',
+            "wan_rx": f'mstdnca_unifi_wan_rx_bytes_per_sec{{site_name="{escape_label_value(site_name)}"}}',
+            "speedtest_dl": f'mstdnca_unifi_speedtest_download_mbps{{site_name="{escape_label_value(site_name)}"}}',
+            "speedtest_ul": f'mstdnca_unifi_speedtest_upload_mbps{{site_name="{escape_label_value(site_name)}"}}',
         }
 
         all_series = {}
@@ -609,14 +626,14 @@ class PrometheusQueryClient:
         start = end - dur
         p = self._unpoller_prefix()
         site = site_name or Setting.get("unpoller_site_name", "default")
-        lbl = f'site_name="{site}",name="{device_name}"'
+        lbl = f'site_name="{escape_label_value(site)}",name="{escape_label_value(device_name)}"'
 
         queries = {
-            "cpu": f'{p}_device_system_cpu{{site_name="{site}",name="{device_name}"}}',
-            "memory": f'{p}_device_system_mem{{site_name="{site}",name="{device_name}"}}',
-            "clients": f'{p}_device_num_sta{{site_name="{site}",name="{device_name}"}}',
-            "temperature": f'{p}_device_general_temperature{{site_name="{site}",name="{device_name}"}}',
-            "uptime": f'{p}_device_uptime_seconds{{site_name="{site}",name="{device_name}"}}',
+            "cpu": f'{p}_device_system_cpu{{site_name="{escape_label_value(site)}",name="{escape_label_value(device_name)}"}}',
+            "memory": f'{p}_device_system_mem{{site_name="{escape_label_value(site)}",name="{escape_label_value(device_name)}"}}',
+            "clients": f'{p}_device_num_sta{{site_name="{escape_label_value(site)}",name="{escape_label_value(device_name)}"}}',
+            "temperature": f'{p}_device_general_temperature{{site_name="{escape_label_value(site)}",name="{escape_label_value(device_name)}"}}',
+            "uptime": f'{p}_device_uptime_seconds{{site_name="{escape_label_value(site)}",name="{escape_label_value(device_name)}"}}',
             "tx_bytes": f'{p}_device_stat_bytes_sent{{{lbl}}}',
             "rx_bytes": f'{p}_device_stat_bytes_received{{{lbl}}}',
         }
@@ -655,7 +672,7 @@ class PrometheusQueryClient:
         p = self._unpoller_prefix()
         site = site_name or Setting.get("unpoller_site_name", "default")
         mac = client_mac.lower()
-        lbl = f'site_name="{site}",mac="{mac}"'
+        lbl = f'site_name="{escape_label_value(site)}",mac="{escape_label_value(mac)}"'
         ri = f"{max(step * 2, 120)}s"
 
         queries = {
@@ -691,7 +708,7 @@ class PrometheusQueryClient:
         start = end - dur
         p = self._unpoller_prefix()
         site = site_name or Setting.get("unpoller_site_name", "default")
-        lbl = f'site_name="{site}",name="{device_name}",radio_name="{radio_name}"'
+        lbl = f'site_name="{escape_label_value(site)}",name="{escape_label_value(device_name)}",radio_name="{escape_label_value(radio_name)}"'
 
         queries = {
             "channel": f"{p}_device_radio_channel{{{lbl}}}",
@@ -723,7 +740,7 @@ class PrometheusQueryClient:
         start = end - dur
         p = self._unpoller_prefix()
         site = site_name or Setting.get("unpoller_site_name", "default")
-        lbl = f'site_name="{site}"'
+        lbl = f'site_name="{escape_label_value(site)}"'
 
         queries = {
             "clients": f"{p}_site_num_user{{{lbl}}}",
@@ -762,7 +779,7 @@ class PrometheusQueryClient:
         start = end - dur
         p = self._unpoller_prefix()
         site = site_name or Setting.get("unpoller_site_name", "default")
-        lbl = f'site_name="{site}"'
+        lbl = f'site_name="{escape_label_value(site)}"'
 
         queries = {
             "latency": f"{p}_site_latency_seconds{{{lbl}}}",
@@ -800,8 +817,8 @@ class PrometheusQueryClient:
         ri = f"{max(step * 2, 120)}s"
 
         # Query all DPI categories at once — unpoller labels by category
-        rx_query = f'rate({p}_site_dpi_receive_bytes{{site_name="{site}"}}[{ri}])'
-        tx_query = f'rate({p}_site_dpi_transmit_bytes{{site_name="{site}"}}[{ri}])'
+        rx_query = f'rate({p}_site_dpi_receive_bytes{{site_name="{escape_label_value(site)}"}}[{ri}])'
+        tx_query = f'rate({p}_site_dpi_transmit_bytes{{site_name="{escape_label_value(site)}"}}[{ri}])'
 
         try:
             rx_results = self.query_range(rx_query, start, end, step)

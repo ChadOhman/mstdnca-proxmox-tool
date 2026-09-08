@@ -365,6 +365,26 @@ class TestMetricsEndpoint:
             Setting.set("prometheus_auth_token", "")
             db.session.commit()
 
+    @patch("routes.prometheus_metrics.hmac.compare_digest")
+    def test_token_compared_with_constant_time_digest(self, mock_compare, app, client):
+        """The bearer/query token must be checked via hmac.compare_digest, not `!=`
+        (timing side-channel; GHSA-gj96-qjq5-q57h)."""
+        mock_compare.return_value = True
+        with app.app_context():
+            from models import Setting, db
+            Setting.set("prometheus_auth_token", "test-only-secret-token")
+            db.session.commit()
+
+        resp = client.get("/metrics", headers={"Authorization": "Bearer whatever-value"})
+
+        assert resp.status_code == 200
+        mock_compare.assert_called_once_with("whatever-value", "test-only-secret-token")
+
+        with app.app_context():
+            from models import Setting, db
+            Setting.set("prometheus_auth_token", "")
+            db.session.commit()
+
 
 # ---------------------------------------------------------------------------
 # Query client tests
@@ -521,6 +541,80 @@ class TestPrometheusQueryClient:
             data = client.get_unpoller_wan_history(timeframe="hour")
         assert data["source"] == "unpoller"
         assert data["labels"] == []
+
+
+class TestEscapeLabelValue:
+    """Unit tests for the PromQL label-value escaper (GHSA-gj96-qjq5-q57h)."""
+
+    def test_escapes_backslash_and_quote(self):
+        from clients.prometheus_query import escape_label_value
+        assert escape_label_value('a"b\\c') == 'a\\"b\\\\c'
+
+    def test_escapes_newline(self):
+        from clients.prometheus_query import escape_label_value
+        assert escape_label_value("a\nb") == "a\\nb"
+
+    def test_none_returns_empty_string(self):
+        from clients.prometheus_query import escape_label_value
+        assert escape_label_value(None) == ""
+
+    def test_backslash_escaped_before_quote_to_avoid_double_unescape(self):
+        """Order matters: escaping the quote before the backslash would let a
+        trailing backslash in the input swallow the quote's escape."""
+        from clients.prometheus_query import escape_label_value
+        assert escape_label_value('\\"') == '\\\\\\"'
+
+
+class TestPromqlInjectionEscaping:
+    """A device/radio name crafted to break out of a PromQL label matcher must
+    be escaped, not interpolated raw (GHSA-gj96-qjq5-q57h)."""
+
+    @patch("clients.prometheus_query.requests.get")
+    def test_unpoller_device_history_escapes_injected_name(self, mock_get, app):
+        from clients.prometheus_query import PrometheusQueryClient
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": "success", "data": {"resultType": "matrix", "result": []}}
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        malicious = 'evil"} or up{job=~".*'
+        client = PrometheusQueryClient(base_url="http://localhost:9090")
+        with app.app_context():
+            client.get_unpoller_device_history(malicious, timeframe="hour")
+
+        queries_sent = [c.kwargs["params"]["query"] for c in mock_get.call_args_list]
+        assert queries_sent, "expected at least one range query to have been issued"
+
+        # The escaped form (quotes backslash-escaped) must appear...
+        escaped = malicious.replace("\\", "\\\\").replace('"', '\\"')
+        assert any(escaped in q for q in queries_sent)
+        # ...and the raw, unescaped injection must never appear -- that would
+        # mean the label matcher closed early and the "or up{...}" selector
+        # was injected as live PromQL.
+        assert not any(malicious in q for q in queries_sent)
+
+    @patch("clients.prometheus_query.requests.get")
+    def test_unpoller_radio_history_escapes_injected_names(self, mock_get, app):
+        from clients.prometheus_query import PrometheusQueryClient
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": "success", "data": {"resultType": "matrix", "result": []}}
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        malicious_device = 'dev"} or up{'
+        malicious_radio = 'radio"} or up{'
+        client = PrometheusQueryClient(base_url="http://localhost:9090")
+        with app.app_context():
+            client.get_unpoller_radio_history(malicious_device, malicious_radio, timeframe="hour")
+
+        queries_sent = [c.kwargs["params"]["query"] for c in mock_get.call_args_list]
+        assert queries_sent
+        assert not any(malicious_device in q for q in queries_sent)
+        assert not any(malicious_radio in q for q in queries_sent)
 
 
 # ---------------------------------------------------------------------------

@@ -77,6 +77,64 @@ class TestDiscordSettings:
             # The route only saves webhook_url when it is non-empty
             assert Setting.get("discord_webhook_url") == "https://discord.com/api/webhooks/existing/url"
 
+    def test_save_discord_rejects_non_discord_host(self, app, auth_client):
+        """A webhook URL pointed at a non-Discord host must be rejected on save
+        (GHSA-gj96-qjq5-q57h): otherwise urlopen() would happily POST to it."""
+        with app.app_context():
+            Setting.set("discord_webhook_url", "")
+
+        resp = auth_client.post(
+            "/settings/discord",
+            data={"discord_webhook_url": "https://evil.example.com/api/webhooks/1/tok"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            assert Setting.get("discord_webhook_url") != "https://evil.example.com/api/webhooks/1/tok"
+
+    def test_save_discord_rejects_non_https_scheme(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_webhook_url", "")
+
+        resp = auth_client.post(
+            "/settings/discord",
+            data={"discord_webhook_url": "http://discord.com/api/webhooks/1/tok"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            assert Setting.get("discord_webhook_url") != "http://discord.com/api/webhooks/1/tok"
+
+    def test_save_discord_rejects_file_scheme(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_webhook_url", "")
+
+        resp = auth_client.post(
+            "/settings/discord",
+            data={"discord_webhook_url": "file:///etc/passwd"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            assert Setting.get("discord_webhook_url") != "file:///etc/passwd"
+
+    def test_save_discord_rejects_wrong_path(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_webhook_url", "")
+
+        resp = auth_client.post(
+            "/settings/discord",
+            data={"discord_webhook_url": "https://discord.com/not-a-webhook"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            assert Setting.get("discord_webhook_url") != "https://discord.com/not-a-webhook"
+
 
 class TestDiscordWebhookMasking:
     """GHSA-qq45-f2h2-9j4q: the Discord webhook URL must never be rendered into
