@@ -48,9 +48,10 @@
 
                     <div class="mb-3">
                         <label class="form-label">Auth Token</label>
-                        <input type="text" class="form-control font-monospace" name="prometheus_auth_token"
-                               value="{{ settings.auth_token }}" placeholder="Optional bearer token">
-                        <div class="form-text">Optional token to secure the <code>/metrics</code> endpoint. If set, Prometheus must include it.</div>
+                        <input type="password" class="form-control font-monospace" name="prometheus_auth_token"
+                               value="" autocomplete="off"
+                               placeholder="{{ '(set — leave blank to keep)' if settings.auth_token_set else 'Optional bearer token' }}">
+                        <div class="form-text">Optional token to secure the <code>/metrics</code> endpoint. If set, Prometheus must include it. Leave blank to keep the current token.</div>
                     </div>
 
                     <div class="mb-3">
@@ -762,9 +763,9 @@ function testConnection() {
         .then(r => r.json())
         .then(data => {
             if (data.ok) {
-                result.innerHTML = '<small class="text-success"><i class="bi bi-check-circle"></i> ' + data.message + '</small>';
+                result.innerHTML = '<small class="text-success"><i class="bi bi-check-circle"></i> ' + escHtml(data.message) + '</small>';
             } else {
-                result.innerHTML = '<small class="text-danger"><i class="bi bi-x-circle"></i> ' + (data.error || 'Connection failed') + '</small>';
+                result.innerHTML = '<small class="text-danger"><i class="bi bi-x-circle"></i> ' + escHtml(data.error || 'Connection failed') + '</small>';
             }
             btn.disabled = false;
         })

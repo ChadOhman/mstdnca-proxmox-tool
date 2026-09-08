@@ -7,6 +7,7 @@ set, the request must include it as a Bearer token in the Authorization header
 or as a ``token`` query parameter.
 """
 
+import hmac
 import logging
 
 from flask import Blueprint, Response, request
@@ -33,7 +34,7 @@ def metrics():
         else:
             token = request.args.get("token", "")
 
-        if token != expected_token:
+        if not hmac.compare_digest(token or "", expected_token):
             return Response("Unauthorized", status=401, content_type="text/plain")
     else:
         # No token configured — require session login

@@ -1,9 +1,12 @@
 import hashlib
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
+from core.url_safety import validate_outbound_url
 from models import Setting
 
 logger = logging.getLogger(__name__)
@@ -13,6 +16,49 @@ _COLOR_GREEN = 8505220   # #81c784
 _COLOR_CYAN = 5227511    # #4fc3f7
 _COLOR_YELLOW = 16761095  # #ffc107
 _COLOR_RED = 14431557    # #dc3545
+
+# Discord webhook URLs must land on one of these hosts, under the standard
+# webhook path. Without this, a saved "Discord webhook URL" is effectively an
+# arbitrary attacker/admin-influenceable outbound URL: urllib.request.urlopen
+# happily follows file://, ftp://, and internal http(s) targets (SSRF).
+_DISCORD_WEBHOOK_HOSTS = {"discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"}
+_DISCORD_WEBHOOK_PATH_PREFIX = "/api/webhooks/"
+
+# Cap how long a single Retry-After-driven retry is allowed to block for, so a
+# misbehaving (or malicious) endpoint can't stall the caller indefinitely.
+_MAX_RETRY_AFTER_SECONDS = 30
+
+
+def validate_discord_webhook_url(url):
+    """Validate a Discord webhook URL before it is saved or dispatched to.
+
+    Must be ``https://``, resolve to a public address, have its host in
+    :data:`_DISCORD_WEBHOOK_HOSTS`, and its path must start with
+    ``/api/webhooks/`` -- the standard Discord webhook path. Returns
+    ``(True, None)`` if valid, else ``(False, reason)``.
+    """
+    ok, reason = validate_outbound_url(url, allowed_hosts=_DISCORD_WEBHOOK_HOSTS, allowed_schemes=("https",))
+    if not ok:
+        return False, reason
+
+    path = urlparse(url.strip()).path
+    if not path.startswith(_DISCORD_WEBHOOK_PATH_PREFIX):
+        return False, f"url path must start with {_DISCORD_WEBHOOK_PATH_PREFIX}"
+
+    return True, None
+
+
+def _parse_retry_after(value):
+    """Parse a Retry-After header value (seconds) into a bounded float, or None."""
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, _MAX_RETRY_AFTER_SECONDS)
 
 
 def _get_discord_config():
@@ -39,7 +85,7 @@ def guest_matches_notify_tags(guest):
     return any(tag.id in wanted for tag in guest.tags)
 
 
-def _send_discord(embeds):
+def _send_discord(embeds, _allow_retry=True):
     """POST embeds to the configured Discord webhook. Returns (ok, message)."""
     config = _get_discord_config()
 
@@ -48,6 +94,15 @@ def _send_discord(embeds):
 
     if not config["webhook_url"]:
         return False, "Discord webhook URL not configured"
+
+    # Re-validate immediately before dispatch: covers webhook URLs persisted
+    # before this guard existed, and mitigates DNS-rebinding between save and
+    # send (SSRF).
+    ok, reason = validate_discord_webhook_url(config["webhook_url"])
+    if not ok:
+        msg = f"Discord webhook URL failed validation: {reason}"
+        logger.error(msg)
+        return False, msg
 
     payload = json.dumps({"embeds": embeds}).encode()
     req = urllib.request.Request(
@@ -65,6 +120,12 @@ def _send_discord(embeds):
                 return True, "Notification sent successfully"
             return False, f"Discord returned HTTP {resp.status}"
     except urllib.error.HTTPError as e:
+        if e.code == 429 and _allow_retry:
+            retry_after = _parse_retry_after(e.headers.get("Retry-After"))
+            if retry_after is not None:
+                logger.warning(f"Discord webhook rate-limited; retrying after {retry_after}s")
+                time.sleep(retry_after)
+                return _send_discord(embeds, _allow_retry=False)
         try:
             body = json.loads(e.read().decode())
             detail = body.get("message", "")

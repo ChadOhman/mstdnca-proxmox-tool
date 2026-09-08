@@ -268,6 +268,20 @@
         // ── Helpers ───────────────────────────────────────────────────────
         // escHtml is provided by static/esc.js
 
+        // Belt-and-suspenders client-side check mirroring the server-side
+        // validation in routes/api.py (collab_presence / collab_stream):
+        // only same-site relative paths are safe to use as a link href or
+        // navigation target. The server already rejects anything else, but
+        // we never trust `page` values as navigable without re-checking here.
+        function isSafePage(p) {
+            if (typeof p !== 'string' || p.length === 0 || p.length > 512) return false;
+            if (p.charAt(0) !== '/' || p.charAt(1) === '/') return false;   // must start with a single "/"
+            if (p.indexOf('\\') !== -1) return false;                      // no backslashes
+            var firstSlash = p.indexOf('/');
+            if (p.slice(0, firstSlash).indexOf(':') !== -1) return false;  // no scheme before the first "/"
+            return true;
+        }
+
         const PALETTE = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6',
                          '#ec4899','#14b8a6','#f97316','#06b6d4','#84cc16'];
         function avatarColor(name) {
@@ -370,7 +384,8 @@
 
         function makePopoverBody(u) {
             const session = window._collabSessions.find(s => s.owner_username === u.username);
-            const goLink = `<a href="${escHtml(u.page)}" class="text-info text-decoration-none">` +
+            const goHref = isSafePage(u.page) ? escHtml(u.page) : '#';
+            const goLink = `<a href="${goHref}" class="text-info text-decoration-none">` +
                            `<i class="bi bi-cursor"></i> ${escHtml(pageLabel(u.page))}</a>`;
             const isFollowing = _followingUser === u.username;
             const followHint = `<div class="mt-1 text-muted" style="font-size:0.7rem;">` +
@@ -440,7 +455,7 @@
                     } else {
                         startFollowing(uname);
                         const live = (window._collabPresence || []).find(x => x.username === uname);
-                        if (live && live.page && live.page !== window.location.pathname) {
+                        if (live && live.page && live.page !== window.location.pathname && isSafePage(live.page)) {
                             window.location.href = live.page;
                         }
                     }
@@ -473,7 +488,7 @@
                     stopFollowing(); // followed user went offline
                 } else if (target.following === ME) {
                     stopFollowing(); // mutual follow — they are following us, so we step back
-                } else if (target.page && target.page !== window.location.pathname) {
+                } else if (target.page && target.page !== window.location.pathname && isSafePage(target.page)) {
                     // A plain /terminal/<id> URL means the followed user has opened the
                     // terminal page but SSH hasn't been established yet (so no follow URL
                     // is in presence).  We must NOT navigate there — that would open a new
@@ -549,8 +564,8 @@
             if (skip.has(event.action)) return;
 
             const verb = ACTION_VERBS[event.action] || event.action.replace(/_/g, ' ');
-            const resource = event.resource_name ? ` <strong>${event.resource_name}</strong>` : '';
-            const html = `<strong>${event.username}</strong> ${verb}${resource}`;
+            const resource = event.resource_name ? ` <strong>${escHtml(event.resource_name)}</strong>` : '';
+            const html = `<strong>${escHtml(event.username)}</strong> ${escHtml(verb)}${resource}`;
 
             const id = 'ct' + Date.now();
             const div = document.createElement('div');

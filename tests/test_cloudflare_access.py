@@ -312,6 +312,56 @@ class TestFetchJwks:
         assert "example.cloudflareaccess.com" in captured_urls[0]
         assert "/cdn-cgi/access/certs" in captured_urls[0]
 
+    def test_refuses_to_fetch_for_invalid_team_domain(self, app):
+        """An .endswith()-style bypass string must never reach urlopen -- it's
+        used to build the JWKS fetch URL (SSRF primitive; GHSA-gj96-qjq5-q57h)."""
+        with app.app_context():
+            with patch("auth.cloudflare_access.urlopen") as mock_open:
+                keys = cloudflare_access._fetch_jwks("evil.com#.cloudflareaccess.com")
+
+        mock_open.assert_not_called()
+        assert keys == []
+
+    def test_refuses_suffix_bypass_domain(self, app):
+        with app.app_context():
+            with patch("auth.cloudflare_access.urlopen") as mock_open:
+                keys = cloudflare_access._fetch_jwks("evil.com.cloudflareaccess.com.evil.com")
+
+        mock_open.assert_not_called()
+        assert keys == []
+
+
+# ---------------------------------------------------------------------------
+# _is_valid_team_domain() -- shared strict validator used by the JWKS URL
+# builder above and the logout redirect in routes/auth.py.
+# ---------------------------------------------------------------------------
+
+class TestIsValidTeamDomain:
+    def test_accepts_well_formed_domain(self):
+        assert cloudflare_access._is_valid_team_domain("myteam.cloudflareaccess.com") is True
+
+    def test_accepts_hyphenated_and_numeric_team_names(self):
+        assert cloudflare_access._is_valid_team_domain("my-team-2.cloudflareaccess.com") is True
+
+    def test_rejects_endswith_bypass(self):
+        """A naive `.endswith(".cloudflareaccess.com")` check would accept this."""
+        assert cloudflare_access._is_valid_team_domain("evil.com#.cloudflareaccess.com") is False
+
+    def test_rejects_suffix_bypass(self):
+        assert cloudflare_access._is_valid_team_domain("evil.com.cloudflareaccess.com.evil.com") is False
+
+    def test_rejects_empty(self):
+        assert cloudflare_access._is_valid_team_domain("") is False
+
+    def test_rejects_none(self):
+        assert cloudflare_access._is_valid_team_domain(None) is False
+
+    def test_rejects_other_scheme_prefix(self):
+        assert cloudflare_access._is_valid_team_domain("https://myteam.cloudflareaccess.com") is False
+
+    def test_is_case_insensitive(self):
+        assert cloudflare_access._is_valid_team_domain("MyTeam.CloudflareAccess.com") is True
+
 
 # ---------------------------------------------------------------------------
 # Middleware: _check_cf_access (registered via init_cf_access)
@@ -595,3 +645,77 @@ class TestCfAccessSessionTracking:
                 assert "/login" in resp.headers["Location"]
         finally:
             self._disable(app)
+
+
+# POST /logout -- Cloudflare Access logout redirect (routes/auth.py)
+# ---------------------------------------------------------------------------
+
+class TestCfLogoutRedirect:
+    """A logged-out CF-provisioned user is redirected to the CF logout URL,
+    but only when team_domain is a strictly valid *.cloudflareaccess.com value.
+    A naive `.endswith()` check would accept "evil.com#.cloudflareaccess.com"
+    and turn this into an open redirect (GHSA-gj96-qjq5-q57h)."""
+
+    def _login_cf_user(self, app, email, team_domain="myteam.cloudflareaccess.com"):
+        with app.app_context():
+            Setting.set("cf_access_enabled", "true")
+            Setting.set("cf_access_team_domain", team_domain)
+            Setting.set("cf_access_audience", "aud123")
+            Setting.set("cf_access_bypass_local_auth", "false")
+            Setting.set("cf_access_auto_provision", "true")
+
+        c = app.test_client()
+        fake_payload = {"email": email, "name": "CF User"}
+        with patch("auth.cloudflare_access.validate_cf_token", return_value=fake_payload):
+            resp = c.get("/", headers={"Cf-Access-Jwt-Assertion": "fake.jwt.token"}, follow_redirects=False)
+        assert resp.status_code == 200
+        return c
+
+    def test_logout_redirects_to_valid_team_domain(self, app):
+        email = "logout_valid@example.com"
+        with app.app_context():
+            u = User.query.filter_by(username=email).first()
+            if u:
+                db.session.delete(u)
+                db.session.commit()
+
+        c = self._login_cf_user(app, email)
+        resp = c.post("/logout", follow_redirects=False)
+
+        assert resp.status_code == 302
+        assert resp.headers["Location"] == "https://myteam.cloudflareaccess.com/cdn-cgi/access/logout"
+
+        with app.app_context():
+            u = User.query.filter_by(username=email).first()
+            if u:
+                db.session.delete(u)
+                db.session.commit()
+
+    def test_logout_does_not_redirect_for_bypass_team_domain(self, app):
+        """An invalid (bypass-style) team_domain must fall back to the normal
+        /login redirect, not an attacker-controlled URL."""
+        email = "logout_bypass@example.com"
+        with app.app_context():
+            u = User.query.filter_by(username=email).first()
+            if u:
+                db.session.delete(u)
+                db.session.commit()
+
+        c = self._login_cf_user(app, email)
+        # Swap in a malicious value right before logout so the login step
+        # itself doesn't depend on the malicious domain being accepted.
+        with app.app_context():
+            Setting.set("cf_access_team_domain", "evil.com#.cloudflareaccess.com")
+
+        resp = c.post("/logout", follow_redirects=False)
+
+        assert resp.status_code == 302
+        location = resp.headers.get("Location", "")
+        assert "evil.com" not in location
+        assert "/login" in location
+
+        with app.app_context():
+            u = User.query.filter_by(username=email).first()
+            if u:
+                db.session.delete(u)
+                db.session.commit()

@@ -16,6 +16,7 @@ fetched and cached from https://<team-domain>/cdn-cgi/access/certs.
 
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
@@ -32,6 +33,16 @@ logger = logging.getLogger(__name__)
 _jwks_cache = {"keys": None, "fetched_at": 0}
 JWKS_CACHE_TTL = 3600  # 1 hour
 JWKS_STALE_MAX_AGE = 86400  # 24 hours — max age for stale key reuse
+
+# Must match exactly "<team>.cloudflareaccess.com" -- an .endswith() check
+# would accept "evil.com#.cloudflareaccess.com" or similar, and this value is
+# used to build both the JWKS fetch URL below and (elsewhere) a logout
+# redirect, so a loose check is an SSRF/open-redirect primitive.
+_TEAM_DOMAIN_RE = re.compile(r'^[a-z0-9-]+\.cloudflareaccess\.com$')
+
+
+def _is_valid_team_domain(team_domain):
+    return bool(team_domain) and bool(_TEAM_DOMAIN_RE.match(team_domain.lower()))
 
 
 def _get_cf_config():
@@ -52,6 +63,10 @@ def _fetch_jwks(team_domain):
     # Return cached keys if still valid
     if _jwks_cache["keys"] and (now - _jwks_cache["fetched_at"]) < JWKS_CACHE_TTL:
         return _jwks_cache["keys"]
+
+    if not _is_valid_team_domain(team_domain):
+        logger.error(f"Refusing to fetch JWKS: invalid Cloudflare team domain {team_domain!r}")
+        return []
 
     certs_url = f"https://{team_domain}/cdn-cgi/access/certs"
     try:

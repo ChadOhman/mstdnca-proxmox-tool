@@ -134,6 +134,57 @@ class TestValidateWebhookUrl:
         assert ok is False
 
 
+class TestDispatchDoesNotFollowRedirects:
+    """A redirect from an otherwise-valid public webhook host must not be
+    followed -- validate_webhook_url only vets the initial hostname, so an
+    attacker-controlled host answering "307 Location: http://169.254.169.254/..."
+    (or any internal address) must not result in a second request
+    (GHSA-gj96-qjq5-q57h)."""
+
+    def test_redirect_response_is_not_followed(self, app):
+        with app.app_context():
+            from models import Guest, ProxmoxHost, User, db
+
+            PushWebhook.query.delete()
+            db.session.commit()
+
+            user = User.query.filter_by(username="admin").first()
+            host = ProxmoxHost(name="pve-redir", hostname="pve-redir.local", host_type="pve")
+            db.session.add(host)
+            db.session.commit()
+            guest = Guest(name="web-redir", vmid=103, guest_type="ct", proxmox_host_id=host.id)
+            db.session.add(guest)
+            db.session.commit()
+
+            wh = PushWebhook(
+                user_id=user.id,
+                url="https://public-but-evil.example.com/push",
+                device_token="redir-token",
+                platform="ios",
+                events='["service_failed"]',
+            )
+            db.session.add(wh)
+            db.session.commit()
+
+            with patch("core.push_notifier.http_requests") as mock_http, \
+                    patch("core.push_notifier.validate_webhook_url", return_value=(True, None)):
+                mock_http.post.return_value = MagicMock(status_code=302, headers={"Location": "http://169.254.169.254/"})
+                from core.push_notifier import dispatch_push_alerts
+
+                dispatch_push_alerts(guest, "service_failed", {"service": "nginx"})
+
+                # Exactly one request -- requests itself must be told not to
+                # follow the redirect (allow_redirects=False), so there is no
+                # second request to the injected internal Location.
+                mock_http.post.assert_called_once()
+                _, call_kwargs = mock_http.post.call_args
+                assert call_kwargs.get("allow_redirects") is False
+
+            PushWebhook.query.delete()
+            Guest.query.filter_by(id=guest.id).delete()
+            db.session.commit()
+
+
 class TestDispatchSkipsUnsafeUrl:
     """dispatch_push_alerts must not POST to a webhook with an internal URL,
     even if one was stored before the registration guard existed."""
