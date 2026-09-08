@@ -925,7 +925,7 @@ def run_jitsi_upgrade(log_callback=None, skip_protection=False):
             log("(This may take several minutes...)")
             packages = " ".join(_JITSI_APT_PACKAGES)
             stdout, stderr, code = ssh.execute_sudo(
-                f"DEBIAN_FRONTEND=noninteractive apt-get upgrade -y {packages} 2>&1",
+                f"DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade {packages} 2>&1",
                 timeout=600
             )
             _log_cmd_output(log, stdout, stderr, code, max_chars=4000)
@@ -1132,9 +1132,9 @@ def run_cloudflare_configure(log_callback=None):
 
             log("")
             if warnings:
-                log(f"=== Cloudflare configuration complete with {warnings} warning(s) ===")
-            else:
-                log("=== Cloudflare configuration complete ===")
+                log(f"=== Cloudflare configuration FAILED with {warnings} warning(s) ===")
+                return False, "\n".join(log_lines)
+            log("=== Cloudflare configuration complete ===")
             return True, "\n".join(log_lines)
 
     except Exception as e:
@@ -2003,9 +2003,9 @@ def run_secure_domain_configure(log_callback=None):
 
             log("")
             if warnings:
-                log(f"=== Secure Domain configuration complete with {warnings} warning(s) ===")
-            else:
-                log(f"=== Secure Domain {action.lower().replace('ing', 'ed')} successfully ===")
+                log(f"=== Secure Domain configuration FAILED with {warnings} warning(s) ===")
+                return False, "\n".join(log_lines)
+            log(f"=== Secure Domain {action.lower().replace('ing', 'ed')} successfully ===")
             return True, "\n".join(log_lines)
 
     except Exception as e:

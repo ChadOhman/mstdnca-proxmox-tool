@@ -65,6 +65,25 @@ storage:
   client_overrides: '{peertube_dir}/storage/client-overrides/'
 """
 
+# RFC 1123 hostname: 1-253 chars, dot-separated labels of 1-63 alphanumerics/hyphens
+# that neither start nor end with a hyphen.
+_HOSTNAME_RE = re.compile(
+    r'^(?=.{1,253}\.?$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    r'(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$'
+)
+
+
+def _yaml_sq(value):
+    """Escape a value for interpolation into a single-quoted YAML scalar.
+
+    YAML escapes a literal single quote by doubling it; nothing else is special
+    inside a single-quoted scalar.  Every value substituted into
+    ``_PEERTUBE_PRODUCTION_YAML`` goes through this so a quote anywhere (the
+    instance URL, the DB user, a path) cannot break out of its scalar and
+    inject arbitrary YAML keys.
+    """
+    return str(value or "").replace("'", "''")
+
 
 # ---------------------------------------------------------------------------
 # Shell-safe PostgreSQL role creation
@@ -315,6 +334,8 @@ def run_peertube_install(log_callback=None):
     hostname = parsed.hostname
     if not hostname:
         return False, f"Could not parse hostname from Instance URL: {peertube_url}"
+    if not _HOSTNAME_RE.match(hostname):
+        return False, f"Instance URL hostname is not a valid hostname: {hostname!r}"
 
     try:
         _validate_shell_param(user, "PeerTube user")
@@ -325,14 +346,22 @@ def run_peertube_install(log_callback=None):
     except ValueError as e:
         return False, str(e)
 
-    # Decrypt DB password
+    # Decrypt DB password.  There is no safe default here: falling back to a
+    # literal well-known password would silently stand up an instance whose
+    # database credentials are public, so refuse to install instead.
     db_password = ""
     if db_password_encrypted:
         try:
             from auth.credential_store import decrypt
             db_password = decrypt(db_password_encrypted) or ""
         except Exception as e:
-            log(f"WARNING: Could not decrypt database password: {e}")
+            log(f"ERROR: Could not decrypt database password: {e}")
+            return False, "Could not decrypt the configured PeerTube database password"
+    if not db_password:
+        return False, (
+            "A PeerTube database password must be configured before installing "
+            "(Settings → PeerTube → Database password)."
+        )
 
     credential = app_guest.credential
     if not credential:
@@ -676,16 +705,15 @@ def run_peertube_install(log_callback=None):
             if not effective_db_host:
                 effective_db_host = "localhost"
 
-            # The password sits inside a single-quoted YAML scalar; escape any
-            # single quotes (YAML doubles them) so a crafted password cannot
-            # break out of the scalar and inject arbitrary YAML keys.
-            yaml_password = (db_password or "peertube").replace("'", "''")
+            # Every value lands inside a single-quoted YAML scalar; escape any
+            # single quotes (YAML doubles them) so a crafted value cannot break
+            # out of the scalar and inject arbitrary YAML keys.
             yaml_content = _PEERTUBE_PRODUCTION_YAML.format(
-                hostname=hostname,
-                db_host=effective_db_host,
-                db_user=user,
-                db_password=yaml_password,
-                peertube_dir=peertube_dir,
+                hostname=_yaml_sq(hostname),
+                db_host=_yaml_sq(effective_db_host),
+                db_user=_yaml_sq(user),
+                db_password=_yaml_sq(db_password),
+                peertube_dir=_yaml_sq(peertube_dir),
             )
 
             # Copy default.yaml first
@@ -773,13 +801,15 @@ def run_peertube_install(log_callback=None):
             if service_status == "active":
                 log("PeerTube service is active — install successful")
             else:
-                log(f"WARNING: PeerTube service is {service_status or 'unknown'}")
+                log(f"ERROR: PeerTube service is {service_status or 'unknown'}")
                 stdout, _, _ = ssh.execute_sudo(
                     "journalctl -u peertube -n 20 --no-pager 2>/dev/null", timeout=15
                 )
                 if (stdout or "").strip():
                     log("--- Recent service journal ---")
                     log((stdout or "").strip())
+                log("Install did not leave PeerTube running — reporting failure.")
+                return False, "\n".join(log_lines)
             log("")
 
             # --- Step 13: Detect and persist version ---
@@ -1186,25 +1216,43 @@ def run_peertube_upgrade(log_callback=None, skip_protection=False):
         if not db_credential:
             db_credential = Credential.query.filter_by(is_default=True).first()
 
+        # PeerTube appends the '_prod' suffix (see production.yaml database.suffix),
+        # so the live database is '<db_name>_prod', not '<db_name>'.
+        prod_db_name = f"{db_name}_prod"
+
         if db_credential:
             try:
                 with SSHClient.from_credential(db_guest.ip_address, db_credential) as ssh:
                     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                     dump_file = f"/tmp/peertube_backup_{timestamp}.sql"  # nosec B108 — remote SSH path, not a local temp file
-                    dump_cmd = f"su - postgres -c 'pg_dump {db_name} > {dump_file}'"
-                    log(f"Running: pg_dump {db_name} > {dump_file}")
+                    dump_cmd = f"su - postgres -c 'pg_dump {prod_db_name} > {dump_file}'"
+                    log(f"Running: pg_dump {prod_db_name} > {dump_file}")
                     stdout, stderr, code = ssh.execute_sudo(dump_cmd, timeout=300)
                     if code == 0:
                         log(f"Database backup saved to {dump_file}")
                     else:
-                        log(f"WARNING: pg_dump failed (exit {code})")
+                        log(f"ERROR: pg_dump failed (exit {code})")
                         _log_cmd_output(log, stdout, stderr, code, max_chars=1000)
-                        log("Continuing with upgrade despite pg_dump failure...")
+                        if not skip_protection:
+                            log("Aborting: the pre-upgrade database backup did not "
+                                "complete. Re-run with 'skip protection' to override.")
+                            return False, "\n".join(log_lines)
+                        log("Continuing with upgrade despite pg_dump failure "
+                            "(protection explicitly skipped)...")
             except Exception as e:
-                log(f"WARNING: Could not connect to DB guest for pg_dump: {e}")
-                log("Continuing with upgrade...")
+                log(f"ERROR: Could not connect to DB guest for pg_dump: {e}")
+                if not skip_protection:
+                    log("Aborting: the pre-upgrade database backup did not complete. "
+                        "Re-run with 'skip protection' to override.")
+                    return False, "\n".join(log_lines)
+                log("Continuing with upgrade (protection explicitly skipped)...")
         else:
-            log("WARNING: No SSH credential for DB guest — skipping pg_dump")
+            log("ERROR: No SSH credential for DB guest — cannot take a pg_dump backup")
+            if not skip_protection:
+                log("Aborting: the pre-upgrade database backup did not complete. "
+                    "Re-run with 'skip protection' to override.")
+                return False, "\n".join(log_lines)
+            log("Continuing with upgrade (protection explicitly skipped)...")
         log("")
     else:
         log(f"=== Step {step}: Skipping pg_dump (no DB guest configured) ===")
@@ -1253,7 +1301,8 @@ def run_peertube_upgrade(log_callback=None, skip_protection=False):
                 "systemctl is-active peertube 2>/dev/null", timeout=15
             )
             service_status = (stdout or "").strip()
-            if service_status == "active":
+            service_ok = service_status == "active"
+            if service_ok:
                 log("PeerTube service (peertube) is active — upgrade successful")
             else:
                 log(f"PeerTube service (peertube) is {service_status or 'unknown'} "
@@ -1269,10 +1318,11 @@ def run_peertube_upgrade(log_callback=None, skip_protection=False):
                     "systemctl is-active peertube 2>/dev/null", timeout=15
                 )
                 service_status = (stdout or "").strip()
-                if service_status == "active":
+                service_ok = service_status == "active"
+                if service_ok:
                     log("PeerTube service (peertube) started successfully.")
                 else:
-                    log(f"WARNING: PeerTube service (peertube) is still "
+                    log(f"ERROR: PeerTube service (peertube) is still "
                         f"{service_status or 'unknown'} after start attempt.")
                     # Show recent journal entries to aid diagnosis
                     stdout, _, _ = ssh.execute_sudo(
@@ -1284,6 +1334,13 @@ def run_peertube_upgrade(log_callback=None, skip_protection=False):
                         log((stdout or "").strip())
 
             log("")
+
+            if not service_ok:
+                # New code is deployed but the service is down: do not record
+                # the new version and do not report success.
+                log("Upgrade did not leave PeerTube running — reporting failure "
+                    "(version tracking left unchanged).")
+                return False, "\n".join(log_lines)
 
             # --- Step 6: Detect and persist new version ---
             step = 6
@@ -1318,12 +1375,13 @@ def run_peertube_upgrade(log_callback=None, skip_protection=False):
             step = 7
             log(f"=== Step {step}: Cleaning up pnpm store ===")
             stdout, stderr, code = ssh.execute_sudo(
-                f"sudo -u {user} pnpm store prune 2>&1 || true", timeout=60
+                f"sudo -u {user} pnpm store prune 2>&1", timeout=60
             )
             if code == 0:
                 log("pnpm store pruned")
             else:
-                log("pnpm store prune skipped or failed (non-fatal)")
+                log(f"pnpm store prune skipped or failed (exit {code}, non-fatal)")
+                _log_cmd_output(log, stdout, stderr, code, max_chars=500)
 
     except Exception as e:
         log(f"SSH ERROR: {e}")

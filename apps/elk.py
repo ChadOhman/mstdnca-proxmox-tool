@@ -703,8 +703,15 @@ def run_elk_install(log_callback=None):
                 env_cmd = f"printf '{env_content}\\n' > {elk_dir}/.env"
                 stdout, stderr, code = ssh.execute_sudo(env_cmd, timeout=10)
                 if code != 0:
-                    log(f"WARNING: Could not create .env (exit {code})")
+                    # The bare-metal systemd unit declares 'EnvironmentFile={elk_dir}/.env';
+                    # without the file systemd refuses to start the service, so a
+                    # failed write there is fatal rather than a warning.
                     _log_cmd_output(log, stdout, stderr, code, max_chars=500)
+                    if deploy_method == "bare-metal":
+                        log(f"ERROR: Could not create .env (exit {code}) — the systemd "
+                            f"unit requires {elk_dir}/.env to exist")
+                        return False, "\n".join(log_lines)
+                    log(f"WARNING: Could not create .env (exit {code})")
                 else:
                     log(f"Created {elk_dir}/.env")
             else:
@@ -747,7 +754,9 @@ def run_elk_install(log_callback=None):
                 if "running" in container_state.lower():
                     log(f"Docker container is running (state: {container_state})")
                 else:
-                    log(f"WARNING: Docker container state: {container_state or 'unknown'}")
+                    log(f"ERROR: Docker container state: {container_state or 'unknown'}")
+                    log("Install did not leave Elk running — reporting failure.")
+                    return False, "\n".join(log_lines)
                 log("")
 
             else:
@@ -821,13 +830,15 @@ def run_elk_install(log_callback=None):
                 if service_status == "active":
                     log("Elk service (elk) is active — install successful")
                 else:
-                    log(f"WARNING: Elk service (elk) is {service_status or 'unknown'}")
+                    log(f"ERROR: Elk service (elk) is {service_status or 'unknown'}")
                     stdout, _, _ = ssh.execute_sudo(
                         "journalctl -u elk -n 20 --no-pager 2>/dev/null", timeout=15
                     )
                     if (stdout or "").strip():
                         log("--- Recent service journal ---")
                         log((stdout or "").strip())
+                    log("Install did not leave Elk running — reporting failure.")
+                    return False, "\n".join(log_lines)
                 log("")
 
             # --- Final: Detect and persist version ---
@@ -859,6 +870,17 @@ def run_elk_install(log_callback=None):
 # ---------------------------------------------------------------------------
 # Upgrade
 # ---------------------------------------------------------------------------
+
+def _elk_stash_pop(ssh, elk_dir, log):
+    """Pop the stash created before 'git pull'. Returns True on success."""
+    stdout, stderr, code = ssh.execute_sudo(f"cd {elk_dir} && git stash pop", timeout=60)
+    _log_cmd_output(log, stdout, stderr, code, max_chars=1000)
+    if code != 0:
+        log(f"WARNING: git stash pop failed (exit {code}) — local changes remain stashed")
+        return False
+    log("Local changes restored from the stash")
+    return True
+
 
 def run_elk_upgrade(log_callback=None, skip_protection=False):
     """Upgrade an existing Elk installation.
@@ -921,12 +943,32 @@ def run_elk_upgrade(log_callback=None, skip_protection=False):
             # --- Step 2: Pull latest code ---
             step = 2
             log(f"=== Step {step}: Pulling latest code ===")
-            pull_cmd = f"cd {elk_dir} && git stash 2>/dev/null; git pull && git stash pop 2>/dev/null || true"
+            # Stash / pull / pop as three separate commands so each exit code is
+            # visible: chaining them with '|| true' made the failure check dead
+            # and could leave local changes stranded in the stash.
+            stdout, stderr, code = ssh.execute_sudo(
+                f"cd {elk_dir} && git stash", timeout=60
+            )
+            _log_cmd_output(log, stdout, stderr, code, max_chars=1000)
+            # 'git stash' exits 0 with "No local changes to save" when the tree
+            # is clean; only a real stash needs popping afterwards.
+            stashed = code == 0 and "No local changes" not in (stdout or "")
+            if code != 0:
+                log(f"ERROR: git stash failed (exit {code})")
+                return False, "\n".join(log_lines)
+
             log(f"Running: git pull in {elk_dir}")
-            stdout, stderr, code = ssh.execute_sudo(pull_cmd, timeout=120)
+            stdout, stderr, code = ssh.execute_sudo(f"cd {elk_dir} && git pull", timeout=120)
             _log_cmd_output(log, stdout, stderr, code, max_chars=2000)
             if code != 0:
                 log(f"ERROR: git pull failed (exit {code})")
+                if stashed:
+                    _elk_stash_pop(ssh, elk_dir, log)
+                return False, "\n".join(log_lines)
+
+            if stashed and not _elk_stash_pop(ssh, elk_dir, log):
+                log("ERROR: could not restore local changes from the stash "
+                    "(they are still available via 'git stash list')")
                 return False, "\n".join(log_lines)
             log("Code updated")
             log("")
@@ -955,10 +997,11 @@ def run_elk_upgrade(log_callback=None, skip_protection=False):
                     timeout=15,
                 )
                 container_state = (stdout or "").strip()
-                if "running" in container_state.lower():
+                service_ok = "running" in container_state.lower()
+                if service_ok:
                     log(f"Docker container is running (state: {container_state})")
                 else:
-                    log(f"WARNING: Docker container state: {container_state or 'unknown'}")
+                    log(f"ERROR: Docker container state: {container_state or 'unknown'}")
                 log("")
 
             else:
@@ -1009,7 +1052,8 @@ def run_elk_upgrade(log_callback=None, skip_protection=False):
                     "systemctl is-active elk 2>/dev/null", timeout=15
                 )
                 service_status = (stdout or "").strip()
-                if service_status == "active":
+                service_ok = service_status == "active"
+                if service_ok:
                     log("Elk service (elk) is active — upgrade successful")
                 else:
                     log(f"Elk service (elk) is {service_status or 'unknown'} "
@@ -1024,10 +1068,11 @@ def run_elk_upgrade(log_callback=None, skip_protection=False):
                         "systemctl is-active elk 2>/dev/null", timeout=15
                     )
                     service_status = (stdout or "").strip()
-                    if service_status == "active":
+                    service_ok = service_status == "active"
+                    if service_ok:
                         log("Elk service (elk) started successfully.")
                     else:
-                        log(f"WARNING: Elk service (elk) is still "
+                        log(f"ERROR: Elk service (elk) is still "
                             f"{service_status or 'unknown'} after start attempt.")
                         stdout, _, _ = ssh.execute_sudo(
                             "journalctl -u elk -n 20 --no-pager 2>/dev/null",
@@ -1037,6 +1082,13 @@ def run_elk_upgrade(log_callback=None, skip_protection=False):
                             log("--- Recent service journal ---")
                             log((stdout or "").strip())
                 log("")
+
+            if not service_ok:
+                # New code is deployed but Elk is down: do not record the new
+                # version and do not report success.
+                log("Upgrade did not leave Elk running — reporting failure "
+                    "(version tracking left unchanged).")
+                return False, "\n".join(log_lines)
 
             # --- Final: Detect and persist new version ---
             log("=== Detecting new version ===")
