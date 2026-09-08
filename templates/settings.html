@@ -14,15 +14,10 @@
                 <form method="post" action="/settings/discord">
                     <div class="mb-3">
                         <label class="form-label" for="discordWebhookUrl">Webhook URL</label>
-                        {% if safety_mode %}
-                        <input type="hidden" name="discord_webhook_url" value="{{ settings.discord_webhook_url or '' }}">
-                        <input type="text" class="form-control text-muted" id="discordWebhookUrl" value="hidden" disabled>
-                        {% else %}
-                        <input type="text" class="form-control" id="discordWebhookUrl" name="discord_webhook_url"
-                            value="{{ settings.discord_webhook_url or '' }}"
-                            placeholder="https://discord.com/api/webhooks/...">
-                        {% endif %}
-                        <div class="form-text">Create a webhook in Discord: Channel Settings &rarr; Integrations &rarr; Webhooks.</div>
+                        <input type="password" class="form-control" id="discordWebhookUrl" name="discord_webhook_url"
+                            value="" autocomplete="off" {% if safety_mode %}disabled{% endif %}
+                            placeholder="{{ '(set — leave blank to keep)' if settings.discord_webhook_url_set else 'https://discord.com/api/webhooks/...' }}">
+                        <div class="form-text">Create a webhook in Discord: Channel Settings &rarr; Integrations &rarr; Webhooks. Leave blank to keep the current webhook.</div>
                     </div>
                     <div class="form-check mb-3">
                         <input type="checkbox" class="form-check-input" name="discord_enabled" id="discordEnabled"
@@ -905,13 +900,14 @@
                 storageOpts += '<option value="' + st.storage + '">' + label + '</option>';
             });
 
-            tr.innerHTML = '<td><input type="hidden" name="tag_name" value="' + tagName + '"><span class="badge bg-secondary">' + tagName + '</span></td>'
+            const tagNameEsc = escHtml(tagName);
+            tr.innerHTML = '<td><input type="hidden" name="tag_name" value="' + tagNameEsc + '"><span class="badge bg-secondary">' + tagNameEsc + '</span></td>'
                 + '<td><select class="form-select form-select-sm font-monospace tag-storage-select" name="tag_storage" required>' + storageOpts + '</select></td>'
                 + '<td><select class="form-select form-select-sm" name="tag_mode">'
                 + '<option value="snapshot">Snapshot</option><option value="suspend">Suspend</option><option value="stop">Stop</option></select></td>'
                 + '<td><select class="form-select form-select-sm" name="tag_compress">'
                 + '<option value="zstd">ZSTD</option><option value="lzo">LZO</option><option value="gzip">GZIP</option><option value="0">None</option></select></td>'
-                + '<td><button type="button" class="btn btn-outline-danger btn-sm remove-tag-row" aria-label="Remove backup config for ' + tagName + '"><i class="bi bi-x-lg"></i></button></td>';
+                + '<td><button type="button" class="btn btn-outline-danger btn-sm remove-tag-row" aria-label="Remove backup config for ' + tagNameEsc + '"><i class="bi bi-x-lg"></i></button></td>';
             tbody.appendChild(tr);
 
             // Remove tag from the "add" dropdown
