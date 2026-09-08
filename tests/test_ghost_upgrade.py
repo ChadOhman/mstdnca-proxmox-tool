@@ -236,3 +236,89 @@ class TestGhostUpgradePostUpdatePermissions:
         # substring that also appears inside the sudoers NOPASSWD grant lines.
         restart_idx = ssh.index_of("systemctl restart ghost_example-site 2>&1")
         assert restart_idx > perms_idxs[1], ssh.calls
+
+
+class TestGhostUpgradeReportsServiceFailure:
+    """A dead service after 'ghost update' must not be reported as success (#125)."""
+
+    def _run(self, ssh, settings_sink=None):
+        fake_setting = MagicMock()
+        settings = _make_settings()
+        fake_setting.get.side_effect = lambda k, d="": settings.get(k, d)
+        if settings_sink is not None:
+            fake_setting.set.side_effect = lambda k, v: settings_sink.update({k: v})
+
+        fake_guest = MagicMock()
+        fake_guest.credential = MagicMock()
+        fake_guest.ip_address = "10.0.0.5"
+        fake_guest.name = "ghost-vm"
+        fake_guest_cls = MagicMock()
+        fake_guest_cls.query.get.return_value = fake_guest
+
+        with (
+            patch("apps.ghost.Setting", fake_setting),
+            patch("apps.ghost.Guest", fake_guest_cls),
+            patch("apps.ghost.SSHClient") as fake_sshclient,
+        ):
+            fake_sshclient.from_credential.return_value = ssh
+            return run_ghost_upgrade(skip_protection=True)
+
+    def _down_ssh(self):
+        ghost_cli_json = '{"name": "news-mstdn-ca", "active-version": "6.22.0"}'
+        return FakeSSH([
+            (".ghost-cli", (ghost_cli_json, "", 0)),
+            ("config.production.json", ('["ghost", "ghost"]', "", 0)),
+            ("SHOW GRANTS", ("GRANT ALL PRIVILEGES ON `ghost`.* TO `ghost`@`localhost`", "", 0)),
+            ("command -v systemctl", ("/usr/bin/systemctl", "", 0)),
+            ("npm install -g ghost-cli", ("ok", "", 0)),
+            ("ghost update", ("Finished", "", 0)),
+            ("is-active", ("failed", "", 3)),
+        ])
+
+    def test_returns_false_when_service_is_down(self):
+        ok, log = self._run(self._down_ssh())
+        assert ok is False
+        # The full log is preserved so the route records it against the failure.
+        assert "ghost update completed successfully" in log
+        assert "still failed after start attempt" in log
+
+    def test_does_not_persist_version_when_service_is_down(self):
+        written = {}
+        ok, _ = self._run(self._down_ssh(), settings_sink=written)
+        assert ok is False
+        assert "ghost_current_version" not in written
+        assert "ghost_update_available" not in written
+
+    def test_start_attempt_recovers_and_reports_success(self):
+        ghost_cli_json = '{"name": "news-mstdn-ca", "active-version": "6.22.0"}'
+        states = iter(["inactive", "active"])
+        ssh = FakeSSH([
+            (".ghost-cli", (ghost_cli_json, "", 0)),
+            ("config.production.json", ('["ghost", "ghost"]', "", 0)),
+            ("SHOW GRANTS", ("GRANT ALL PRIVILEGES ON `ghost`.* TO `ghost`@`localhost`", "", 0)),
+            ("command -v systemctl", ("/usr/bin/systemctl", "", 0)),
+            ("npm install -g ghost-cli", ("ok", "", 0)),
+            ("ghost update", ("Finished", "", 0)),
+            ("is-active", None),  # placeholder, replaced below
+        ])
+
+        def _execute_sudo(cmd, timeout=None):
+            ssh.calls.append(cmd)
+            if "is-active" in cmd:
+                return (next(states), "", 0)
+            if ".ghost-cli" in cmd:
+                return (ghost_cli_json, "", 0)
+            if "config.production.json" in cmd:
+                return ('["ghost", "ghost"]', "", 0)
+            if "SHOW GRANTS" in cmd:
+                return ("GRANT ALL PRIVILEGES ON `ghost`.* TO `ghost`@`localhost`", "", 0)
+            if "command -v systemctl" in cmd:
+                return ("/usr/bin/systemctl", "", 0)
+            return ("", "", 0)
+
+        ssh.execute_sudo = _execute_sudo
+
+        written = {}
+        ok, _ = self._run(ssh, settings_sink=written)
+        assert ok is True
+        assert written["ghost_current_version"] == "6.22.0"

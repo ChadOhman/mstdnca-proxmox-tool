@@ -6,6 +6,7 @@ Creates a dedicated user, systemd service, and generates an up.conf config file
 that connects to the UniFi controller using credentials from app settings.
 """
 
+import base64
 import json
 import logging
 import re
@@ -22,6 +23,27 @@ logger = logging.getLogger(__name__)
 
 GITHUB_REPO = "unpoller/unpoller"
 DEFAULT_PORT = 9130
+
+
+def _write_remote_file(ssh, content, path, mode="640", owner="root", group=None, timeout=15):
+    """Write `content` to `path` on the remote host atomically, with no
+    world-readable window and without a heredoc (whose terminator a value in
+    `content` — e.g. the UniFi password — could accidentally match and break out of).
+
+    Base64-encodes `content` and pipes it through `install`, which writes the
+    destination with its final mode/ownership in one step rather than creating it at
+    the shell's default umask and `chmod`/`chown`ing afterward.
+
+    Returns (success, stderr).
+    """
+    group = group or owner
+    b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    cmd = (
+        f"echo {b64} | base64 -d | "
+        f"install -m {mode} -o {owner} -g {group} /dev/stdin {path}"
+    )
+    stdout, stderr, code = ssh.execute_sudo(cmd, timeout=timeout)
+    return code == 0, stderr or stdout or ""
 
 
 # ---------------------------------------------------------------------------
@@ -292,20 +314,14 @@ def run_unpoller_install(log_callback=None):
                 _log("ERROR: Failed to install binary.")
                 return False, log_lines
 
-            # Generate config
+            # Generate config — written atomically with its final mode/ownership so
+            # the UniFi credentials it contains are never briefly world-readable.
             _log("Generating unpoller config...")
             conf = _generate_unpoller_config(config)
-            stdout, stderr, code = ssh.execute_sudo(
-                f"cat > /etc/unpoller/up.conf << 'UPEOF'\n{conf}\nUPEOF",
-                timeout=15,
-            )
-            _log_cmd_output(_log, stdout, stderr, code)
-            if code != 0:
-                _log("ERROR: Failed to write config.")
+            ok, err = _write_remote_file(ssh, conf, "/etc/unpoller/up.conf", mode="640", owner="root", group="unpoller")
+            if not ok:
+                _log(f"ERROR: Failed to write config: {err[:200]}")
                 return False, log_lines
-
-            # Secure the config file (contains credentials)
-            ssh.execute_sudo("chmod 640 /etc/unpoller/up.conf && chown root:unpoller /etc/unpoller/up.conf", timeout=10)
 
             # Create systemd service
             _log("Creating systemd service...")
@@ -349,16 +365,22 @@ def run_unpoller_install(log_callback=None):
             Setting.set("unpoller_update_available", "false")
             db.session.commit()
 
-            # Regenerate prometheus.yml to include unpoller scrape target
-            _log("Updating prometheus.yml with unpoller scrape target...")
-            _update_prometheus_config(ssh, guest, _log)
-
-            return True, log_lines
-
     except Exception as e:
         _log(f"FATAL ERROR: {e}")
         logger.exception("Unpoller install failed")
         return False, log_lines
+
+    # Regenerate prometheus.yml to include the unpoller scrape target. This uses
+    # apps.exporters._regenerate_prometheus_config() — this repo's single
+    # prometheus.yml generator — rather than a local copy, so this install no
+    # longer wipes out exporter scrape jobs another component added.
+    _log("Updating prometheus.yml with unpoller scrape target...")
+    from apps.exporters import _regenerate_prometheus_config
+    if not _regenerate_prometheus_config(_log):
+        _log("ERROR: Failed to update prometheus.yml with the unpoller scrape target.")
+        return False, log_lines
+
+    return True, log_lines
 
 
 # ---------------------------------------------------------------------------
@@ -731,16 +753,10 @@ def run_unpoller_reconfig(log_callback=None):
     try:
         with SSHClient.from_credential(guest.ip_address, credential) as ssh:
             conf = _generate_unpoller_config(config)
-            stdout, stderr, code = ssh.execute_sudo(
-                f"cat > /etc/unpoller/up.conf << 'UPEOF'\n{conf}\nUPEOF",
-                timeout=15,
-            )
-            _log_cmd_output(_log, stdout, stderr, code)
-            if code != 0:
-                _log("ERROR: Failed to write config.")
+            ok, err = _write_remote_file(ssh, conf, "/etc/unpoller/up.conf", mode="640", owner="root", group="unpoller")
+            if not ok:
+                _log(f"ERROR: Failed to write config: {err[:200]}")
                 return False, log_lines
-
-            ssh.execute_sudo("chmod 640 /etc/unpoller/up.conf && chown root:unpoller /etc/unpoller/up.conf", timeout=10)
 
             _log("Restarting unpoller...")
             stdout, stderr, code = ssh.execute_sudo("systemctl restart unpoller", timeout=30)
@@ -763,11 +779,7 @@ def run_unpoller_reconfig(log_callback=None):
 # ---------------------------------------------------------------------------
 
 def _get_config():
-    """Read all relevant settings into a dict.
-
-    The UniFi controller password is stored Fernet-encrypted, so it is decrypted
-    here; writing the ciphertext into up.conf would make unpoller fail auth.
-    """
+    """Read all relevant settings into a dict."""
     return {
         "guest_id": Setting.get("prometheus_guest_id", ""),
         "unifi_url": Setting.get("unifi_base_url", ""),
@@ -776,6 +788,9 @@ def _get_config():
         "unifi_site": Setting.get("unpoller_site_name", "default"),
         "metric_prefix": Setting.get("unpoller_metric_prefix", "unpoller"),
         "listen_port": Setting.get("unpoller_listen_port", str(DEFAULT_PORT)),
+        # Follow the app's existing UniFi controller verify-SSL setting (see
+        # routes/settings.py, clients/unifi_client.py) instead of hardcoding false.
+        "verify_ssl": Setting.get("unifi_verify_ssl", "false") == "true",
     }
 
 
@@ -802,6 +817,19 @@ def _get_unifi_password():
         return ""
 
 
+def _toml_escape(value):
+    """Escape `value` for embedding in a double-quoted TOML basic string.
+
+    TOML basic strings support \\, \\", \\n, \\r, \\t escapes and disallow a raw
+    newline/tab in the source — so anything typed into a UniFi URL/user/password
+    field (which could contain a `"` or an actual newline) is escaped rather than
+    interpolated as-is, which could otherwise break the file or inject new keys.
+    """
+    text = str(value)
+    text = text.replace("\\", "\\\\").replace('"', '\\"')
+    return text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+
 def _generate_unpoller_config(config):
     """Generate the unpoller up.conf TOML config file."""
     unifi_url = config.get("unifi_url", "")
@@ -810,6 +838,7 @@ def _generate_unpoller_config(config):
     site = config.get("unifi_site", "default")
     prefix = config.get("metric_prefix", "unpoller")
     port = config.get("listen_port", str(DEFAULT_PORT))
+    verify_ssl = "true" if config.get("verify_ssl") else "false"
 
     # Ensure URL has https:// prefix
     if unifi_url and not unifi_url.startswith("http"):
@@ -824,9 +853,9 @@ def _generate_unpoller_config(config):
 
 [prometheus]
   disable = false
-  http_listen = "0.0.0.0:{port}"
+  http_listen = "0.0.0.0:{_toml_escape(port)}"
   report_errors = false
-  namespace = "{prefix}"
+  namespace = "{_toml_escape(prefix)}"
 
 [influxdb]
   disable = true
@@ -835,17 +864,17 @@ def _generate_unpoller_config(config):
   disable = true
 
 [[unifi.controller]]
-  url = "{unifi_url}"
-  user = "{unifi_user}"
-  pass = "{unifi_pass}"
-  sites = ["{site}"]
+  url = "{_toml_escape(unifi_url)}"
+  user = "{_toml_escape(unifi_user)}"
+  pass = "{_toml_escape(unifi_pass)}"
+  sites = ["{_toml_escape(site)}"]
   save_ids = true
   save_events = false
   save_alarms = false
   save_anomalies = false
   save_dpi = true
   save_sites = true
-  verify_ssl = false
+  verify_ssl = {verify_ssl}
 """
 
 
@@ -868,37 +897,6 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 """
-
-
-def _update_prometheus_config(ssh, guest, _log):
-    """Regenerate prometheus.yml on the guest to include unpoller scrape target."""
-    try:
-        from apps.prometheus_app import _generate_prometheus_yml
-
-        mstdnca_url = Setting.get("prometheus_mstdnca_metrics_url", "")
-        auth_token = Setting.get("prometheus_auth_token", "")
-        extra_scrape = get_unpoller_scrape_config(guest.ip_address)
-        yml = _generate_prometheus_yml(mstdnca_url, auth_token, extra_scrape_configs=extra_scrape)
-
-        stdout, stderr, code = ssh.execute_sudo(
-            f"cat > /etc/prometheus/prometheus.yml << 'PROMEOF'\n{yml}\nPROMEOF",
-            timeout=15,
-        )
-        if code != 0:
-            _log("WARNING: Failed to update prometheus.yml.")
-            return
-
-        # Reload Prometheus to pick up the new config
-        stdout, stderr, code = ssh.execute_sudo(
-            "systemctl reload prometheus 2>/dev/null || systemctl restart prometheus",
-            timeout=30,
-        )
-        if code == 0:
-            _log("Prometheus config updated and reloaded.")
-        else:
-            _log("WARNING: Failed to reload Prometheus after config update.")
-    except Exception as e:
-        _log(f"WARNING: Could not update Prometheus config: {e}")
 
 
 def get_unpoller_scrape_config(guest_ip, port=None):

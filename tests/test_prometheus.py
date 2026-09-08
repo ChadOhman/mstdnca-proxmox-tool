@@ -128,6 +128,177 @@ class TestPrometheusExporter:
             assert "mstdnca_host_cpu_usage_percent" in output
             assert "mstdnca_host_uptime_seconds" in output
 
+    def test_host_net_gauges_removed(self):
+        """HOST_NET_IN/HOST_NET_OUT were declared but never populated (issue #128) —
+        the underlying data isn't available from clients/proxmox_api.py, so they were
+        removed rather than left as permanently-empty dead gauges."""
+        import clients.prometheus_exporter as exporter_module
+        assert not hasattr(exporter_module, "HOST_NET_IN")
+        assert not hasattr(exporter_module, "HOST_NET_OUT")
+
+
+# ---------------------------------------------------------------------------
+# Metric lifecycle — stale series pruning (issue #128)
+# ---------------------------------------------------------------------------
+
+class TestMetricsLifecycle:
+    """update_host_metrics/update_guest_metrics/update_service_health/update_apt_metrics
+    are called once per entity from a shared per-cycle loop in core/scheduler.py with no
+    explicit "cycle complete" signal. _prune_cycle() infers cycle boundaries from a gap
+    between calls to the same group, and removes any label combination not touched
+    during the cycle that just finished — so an entity has to be missing for one full
+    cycle (not just absent from a single call) before its series disappears. See the
+    clients/prometheus_exporter.py module docstring.
+    """
+
+    def test_guest_removed_after_a_full_missing_cycle(self, app):
+        import clients.prometheus_exporter as exporter_module
+        from clients.prometheus_exporter import get_metrics, update_guest_metrics
+        with app.app_context():
+            # Other tests in this module call update_guest_metrics() with the real
+            # clock, which advances the shared "guest" cycle-tracking state; reset it
+            # so this test's patched timestamps aren't compared against a stale
+            # real-time value from an earlier test.
+            exporter_module._cycle_state.pop("guest", None)
+            gstatus = {"cpu": 0.1, "maxcpu": 1, "status": "running"}
+
+            # Cycle 1: guest A is refreshed.
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=1000.0):
+                update_guest_metrics(9101, "lifecycle-guest-a", "lxc", "pve1", 9101, gstatus)
+            output = get_metrics().decode()
+            assert "lifecycle-guest-a" in output
+
+            # Cycle 2 starts (gap > threshold): only guest B is refreshed. Guest A
+            # isn't touched, but it was present for the cycle that just finished
+            # (cycle 1), so it must not vanish yet.
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=1000.0 + 60):
+                update_guest_metrics(9102, "lifecycle-guest-b", "lxc", "pve1", 9102, gstatus)
+            output = get_metrics().decode()
+            assert "lifecycle-guest-a" in output, "guest must survive one cycle after going missing"
+            assert "lifecycle-guest-b" in output
+
+            # Cycle 3 starts: guest A was absent for the entirety of cycle 2, so it
+            # is now pruned. Guest B (present in cycle 2) survives.
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=1000.0 + 120):
+                update_guest_metrics(9103, "lifecycle-guest-c", "lxc", "pve1", 9103, gstatus)
+            output = get_metrics().decode()
+            assert "lifecycle-guest-a" not in output, "guest missing for a full cycle must be pruned"
+            assert "lifecycle-guest-b" in output
+            assert "lifecycle-guest-c" in output
+
+    def test_host_removed_after_a_full_missing_cycle(self, app):
+        import clients.prometheus_exporter as exporter_module
+        from clients.prometheus_exporter import get_metrics, update_host_metrics
+        with app.app_context():
+            exporter_module._cycle_state.pop("host", None)
+            status = {"cpu": 0.1, "uptime": 10}
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=2000.0):
+                update_host_metrics(9201, "lifecycle-host-a", "pve", status)
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=2000.0 + 60):
+                update_host_metrics(9202, "lifecycle-host-b", "pve", status)
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=2000.0 + 120):
+                update_host_metrics(9203, "lifecycle-host-c", "pve", status)
+
+            output = get_metrics().decode()
+            assert "lifecycle-host-a" not in output
+            assert "lifecycle-host-b" in output
+            assert "lifecycle-host-c" in output
+
+    def test_service_removed_after_a_full_missing_cycle(self, app):
+        import clients.prometheus_exporter as exporter_module
+        from clients.prometheus_exporter import get_metrics, update_service_health
+        with app.app_context():
+            exporter_module._cycle_state.pop("service", None)
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=3000.0):
+                update_service_health(9301, "svc-a", "lifecycle-svc-guest-a", "svc-a.service", "running")
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=3000.0 + 60):
+                update_service_health(9302, "svc-b", "lifecycle-svc-guest-b", "svc-b.service", "running")
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=3000.0 + 120):
+                update_service_health(9303, "svc-c", "lifecycle-svc-guest-c", "svc-c.service", "running")
+
+            output = get_metrics().decode()
+            assert "lifecycle-svc-guest-a" not in output
+            assert "lifecycle-svc-guest-b" in output
+            assert "lifecycle-svc-guest-c" in output
+
+    def test_apt_removed_after_a_full_missing_cycle(self, app):
+        import clients.prometheus_exporter as exporter_module
+        from clients.prometheus_exporter import get_metrics, update_apt_metrics
+        with app.app_context():
+            exporter_module._cycle_state.pop("apt", None)
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=4000.0):
+                update_apt_metrics(9401, "lifecycle-apt-guest-a", 1, 0, False)
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=4000.0 + 60):
+                update_apt_metrics(9402, "lifecycle-apt-guest-b", 1, 0, False)
+            with patch("clients.prometheus_exporter.time.monotonic", return_value=4000.0 + 120):
+                update_apt_metrics(9403, "lifecycle-apt-guest-c", 1, 0, False)
+
+            output = get_metrics().decode()
+            assert "lifecycle-apt-guest-a" not in output
+            assert "lifecycle-apt-guest-b" in output
+            assert "lifecycle-apt-guest-c" in output
+
+    def test_unifi_device_removed_when_absent_from_next_call(self, app):
+        """update_unifi_device_metrics() always receives the FULL current device list,
+        so — unlike host/guest/service — a vanished device is pruned on the very next
+        call, no cycle-gap heuristic needed."""
+        from clients.prometheus_exporter import get_metrics, update_unifi_device_metrics
+        with app.app_context():
+            device = {"name": "AP-lifecycle", "mac": "aa:bb:cc:dd:ee:99", "type": "uap", "cpu": 5.0}
+            update_unifi_device_metrics("lifecycle-site", [device])
+            output = get_metrics().decode()
+            assert "AP-lifecycle" in output
+
+            update_unifi_device_metrics("lifecycle-site", [])
+            output = get_metrics().decode()
+            assert "AP-lifecycle" not in output
+
+    def test_unifi_radio_removed_when_device_loses_it(self, app):
+        from clients.prometheus_exporter import get_metrics, update_unifi_device_metrics
+        with app.app_context():
+            device = {
+                "name": "AP-radio-life", "mac": "aa:bb:cc:dd:ee:98", "type": "uap",
+                "radio_table": [{"name": "ra-life", "channel": 44}],
+            }
+            update_unifi_device_metrics("lifecycle-site-2", [device])
+            output = get_metrics().decode()
+            assert 'radio="ra-life"' in output
+
+            device_no_radio = {"name": "AP-radio-life", "mac": "aa:bb:cc:dd:ee:98", "type": "uap"}
+            update_unifi_device_metrics("lifecycle-site-2", [device_no_radio])
+            output = get_metrics().decode()
+            assert 'radio="ra-life"' not in output
+
+    def test_unifi_devices_scoped_per_site(self, app):
+        """Pruning a site's vanished devices must not touch another site's devices."""
+        from clients.prometheus_exporter import get_metrics, update_unifi_device_metrics
+        with app.app_context():
+            device_a = {"name": "AP-site-a", "mac": "aa:bb:cc:dd:ee:97", "type": "uap", "cpu": 1.0}
+            device_b = {"name": "AP-site-b", "mac": "aa:bb:cc:dd:ee:96", "type": "uap", "cpu": 2.0}
+            update_unifi_device_metrics("lifecycle-site-a", [device_a])
+            update_unifi_device_metrics("lifecycle-site-b", [device_b])
+
+            # Site A's device list is now empty; site B is untouched by this call.
+            update_unifi_device_metrics("lifecycle-site-a", [])
+
+            output = get_metrics().decode()
+            assert "AP-site-a" not in output
+            assert "AP-site-b" in output
+
+    def test_unifi_health_subsystem_and_wan_removed_when_absent(self, app):
+        from clients.prometheus_exporter import get_metrics, update_unifi_health_metrics
+        with app.app_context():
+            health = [{"subsystem": "wan", "status": "ok", "latency": 5}]
+            update_unifi_health_metrics("lifecycle-health-site", health)
+            output = get_metrics().decode()
+            assert 'site_name="lifecycle-health-site",subsystem="wan"' in output
+            assert 'mstdnca_unifi_wan_latency_ms{site_name="lifecycle-health-site"} 5.0' in output
+
+            update_unifi_health_metrics("lifecycle-health-site", [])
+            output = get_metrics().decode()
+            assert 'site_name="lifecycle-health-site",subsystem="wan"' not in output
+            assert 'mstdnca_unifi_wan_latency_ms{site_name="lifecycle-health-site"}' not in output
+
 
 # ---------------------------------------------------------------------------
 # /metrics endpoint tests
@@ -616,3 +787,100 @@ class TestPrometheusUpgradeRoute:
             assert resp.headers.get("Location", "").endswith("/prometheus/manage")
         finally:
             r._upgrade_job["running"] = False
+
+
+# ---------------------------------------------------------------------------
+# run_prometheus_install(): unified config generator (issue #128)
+# ---------------------------------------------------------------------------
+
+class TestRunPrometheusInstall:
+    """run_prometheus_install() writes a minimal bootstrap prometheus.yml so the
+    service has something valid to start with, then hands off to
+    apps.exporters._regenerate_prometheus_config() — the single generator — for the
+    full config. Previously it built its own local copy that only ever included the
+    unpoller job, silently dropping every exporter job on a Prometheus reinstall.
+    """
+
+    def _install_guest(self, app):
+        from models import Credential
+
+        cred = Credential(
+            name="prom-install-cred", username="root", auth_type="password",
+            encrypted_value="unused-in-mocked-ssh", is_default=True,
+        )
+        db.session.add(cred)
+        guest = Guest(name="prom-install-guest", vmid=600, guest_type="lxc", ip_address="10.0.0.220")
+        db.session.add(guest)
+        db.session.commit()
+        guest.credential_id = cred.id
+        db.session.commit()
+        return guest
+
+    @patch("apps.prometheus_app.SSHClient")
+    @patch("apps.prometheus_app._snapshot_guest", return_value=(True, "snapshot ok"))
+    def test_install_writes_bootstrap_then_delegates_to_unified_generator(self, mock_snap, MockSSH, app):
+        from apps.prometheus_app import run_prometheus_install
+
+        mock_ssh = MagicMock()
+        mock_ssh.execute_sudo.return_value = ("", "", 0)
+        mock_ssh.__enter__ = MagicMock(return_value=mock_ssh)
+        mock_ssh.__exit__ = MagicMock(return_value=False)
+        MockSSH.from_credential.return_value = mock_ssh
+
+        with app.app_context():
+            from models import Setting
+            guest = self._install_guest(app)
+            Setting.set("prometheus_guest_id", str(guest.id))
+            Setting.set("prometheus_latest_version", "2.50.0")
+            db.session.commit()
+
+            with patch("apps.exporters._regenerate_prometheus_config", return_value=True) as mock_regen:
+                ok, logs = run_prometheus_install()
+
+            assert ok is True, "\n".join(logs)
+            mock_regen.assert_called_once()
+
+        # A valid bootstrap config was written and Prometheus started BEFORE the
+        # unified generator ran (which needs `systemctl reload prometheus` to work).
+        calls = [str(c.args[0]) for c in mock_ssh.execute_sudo.call_args_list]
+        bootstrap_calls = [c for c in calls if "prometheus.yml << 'PROMEOF'" in c]
+        assert len(bootstrap_calls) == 1
+        start_index = next(i for i, c in enumerate(calls) if "systemctl start prometheus" in c)
+        bootstrap_index = next(i for i, c in enumerate(calls) if "prometheus.yml << 'PROMEOF'" in c)
+        assert bootstrap_index < start_index
+
+        with app.app_context():
+            from models import Setting
+            Setting.set("prometheus_guest_id", "")  # avoid leaking into other test files
+            db.session.commit()
+
+    @patch("apps.prometheus_app.SSHClient")
+    @patch("apps.prometheus_app._snapshot_guest", return_value=(True, "snapshot ok"))
+    def test_install_fails_when_full_config_validation_fails(self, mock_snap, MockSSH, app):
+        """A promtool failure on the full config must fail the install, not just
+        leave Prometheus running on the bootstrap-only config silently."""
+        from apps.prometheus_app import run_prometheus_install
+
+        mock_ssh = MagicMock()
+        mock_ssh.execute_sudo.return_value = ("", "", 0)
+        mock_ssh.__enter__ = MagicMock(return_value=mock_ssh)
+        mock_ssh.__exit__ = MagicMock(return_value=False)
+        MockSSH.from_credential.return_value = mock_ssh
+
+        with app.app_context():
+            from models import Setting
+            guest = self._install_guest(app)
+            Setting.set("prometheus_guest_id", str(guest.id))
+            Setting.set("prometheus_latest_version", "2.50.0")
+            Setting.set("prometheus_installed", "false")  # isolate from other tests in this class
+            db.session.commit()
+
+            with patch("apps.exporters._regenerate_prometheus_config", return_value=False):
+                ok, logs = run_prometheus_install()
+
+            assert ok is False
+            assert any("ERROR" in m for m in logs)
+            assert Setting.get("prometheus_installed", "false") != "true"
+
+            Setting.set("prometheus_guest_id", "")  # avoid leaking into other test files
+            db.session.commit()

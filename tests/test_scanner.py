@@ -3,6 +3,7 @@ scan_guest's guest_error push-notification dispatch, and the per-guest scan
 lock that keeps a user-triggered scan and scan_all_guests() from racing."""
 import threading
 import time as _time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from core.scanner import determine_severity, scan_guest
@@ -76,87 +77,73 @@ class TestScanGuestErrorPush:
 
 
 class TestScanGuestLock:
-    def _make_guest(self, app):
-        with app.app_context():
-            host = ProxmoxHost(name="pve1", hostname="pve1.local", host_type="pve")
-            db.session.add(host)
-            db.session.commit()
-            guest = Guest(name="web01", vmid=100, guest_type="ct", proxmox_host_id=host.id)
-            db.session.add(guest)
-            db.session.commit()
-            return guest.id
+    """scan_guest() wraps _scan_guest_locked() in a per-guest lock (item 11 of
+    #130).  These tests patch the locked body itself so the worker threads never
+    touch the shared in-memory SQLite connection (which is not safe to use from
+    several threads at once and produced spurious unhandled-thread exceptions)."""
 
-    def test_concurrent_scans_of_same_guest_are_serialised(self, app):
+    def test_concurrent_scans_of_same_guest_are_serialised(self):
         """A user-triggered scan and a scheduled scan_all_guests() run both
-        call scan_guest() for the same guest. The per-guest lock added for
-        item 11 must ensure they never execute _execute_on_guest concurrently."""
-        guest_id = self._make_guest(app)
-        state = {"concurrent": 0, "max_concurrent": 0}
+        call scan_guest() for the same guest; they must never execute the
+        locked body concurrently."""
+        guest = SimpleNamespace(id=990001, name="web01")
+        state = {"concurrent": 0, "max_concurrent": 0, "calls": 0}
         state_lock = threading.Lock()
 
-        def fake_execute_on_guest(guest):
+        def fake_locked(g):
             with state_lock:
                 state["concurrent"] += 1
+                state["calls"] += 1
                 state["max_concurrent"] = max(state["max_concurrent"], state["concurrent"])
             _time.sleep(0.05)
             with state_lock:
                 state["concurrent"] -= 1
-            return "", "", None
+            return None
 
-        def run_scan():
-            with app.app_context():
-                guest = Guest.query.get(guest_id)
-                with patch("core.scanner._execute_on_guest", side_effect=fake_execute_on_guest), \
-                     patch("core.push_notifier.dispatch_push_alerts"):
-                    scan_guest(guest)
+        with patch("core.scanner._scan_guest_locked", side_effect=fake_locked):
+            threads = [threading.Thread(target=scan_guest, args=(guest,)) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            assert not any(t.is_alive() for t in threads)
 
-        threads = [threading.Thread(target=run_scan) for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5)
-
+        assert state["calls"] == 4
         assert state["max_concurrent"] == 1
 
-    def test_scans_of_different_guests_are_not_serialised_against_each_other(self, app):
+    def test_scans_of_different_guests_are_not_serialised_against_each_other(self):
         """The lock is per-guest-id -- unrelated guests must still be able to
         scan concurrently."""
-        with app.app_context():
-            host = ProxmoxHost(name="pve1", hostname="pve1.local", host_type="pve")
-            db.session.add(host)
-            db.session.commit()
-            guest_a = Guest(name="a", vmid=101, guest_type="ct", proxmox_host_id=host.id)
-            guest_b = Guest(name="b", vmid=102, guest_type="ct", proxmox_host_id=host.id)
-            db.session.add_all([guest_a, guest_b])
-            db.session.commit()
-            guest_ids = [guest_a.id, guest_b.id]
-
+        guest_a = SimpleNamespace(id=990002, name="a")
+        guest_b = SimpleNamespace(id=990003, name="b")
         started = threading.Event()
         release = threading.Event()
+        calls = []
 
-        def blocking_execute(guest):
+        def blocking_locked(g):
+            calls.append(g.id)
             started.set()
             release.wait(timeout=5)
-            return "", "", None
+            return None
 
-        def run_scan(guest_id):
-            with app.app_context():
-                guest = Guest.query.get(guest_id)
-                with patch("core.scanner._execute_on_guest", side_effect=blocking_execute), \
-                     patch("core.push_notifier.dispatch_push_alerts"):
-                    scan_guest(guest)
+        with patch("core.scanner._scan_guest_locked", side_effect=blocking_locked):
+            t1 = threading.Thread(target=scan_guest, args=(guest_a,))
+            t2 = threading.Thread(target=scan_guest, args=(guest_b,))
+            try:
+                t1.start()
+                assert started.wait(timeout=5)
+                started.clear()
 
-        t1 = threading.Thread(target=run_scan, args=(guest_ids[0],))
-        t1.start()
-        assert started.wait(timeout=5)
-        started.clear()
+                t2.start()
+                # If the lock were global (not per-guest), t2 would block here
+                # and never enter the locked body until t1's is released.
+                assert started.wait(timeout=2)
+            finally:
+                release.set()
+                t1.join(timeout=10)
+                t2.join(timeout=10)
+            assert not t1.is_alive() and not t2.is_alive()
 
-        t2 = threading.Thread(target=run_scan, args=(guest_ids[1],))
-        t2.start()
-        # If the lock were global (not per-guest), t2 would block here and
-        # never call _execute_on_guest until t1's is released.
-        assert started.wait(timeout=2)
+        assert sorted(calls) == [guest_a.id, guest_b.id]
 
-        release.set()
-        t1.join(timeout=5)
-        t2.join(timeout=5)
+

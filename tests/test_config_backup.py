@@ -276,8 +276,11 @@ class TestDatabaseBackup:
         resp = viewer_client.get("/settings/config/backup-db")
         assert resp.status_code in (302, 403)
 
-    def test_backup_in_memory_db_reports_unavailable(self, auth_client):
-        """The test suite uses an in-memory DB, so there is no file to back up."""
+    def test_backup_without_file_backed_db_reports_unavailable(self, auth_client, monkeypatch):
+        """With no file-backed database (e.g. :memory:) there is nothing to back up."""
+        from core import config_backup
+
+        monkeypatch.setattr(config_backup, "_database_file_path", lambda: None)
         resp = auth_client.get("/settings/config/backup-db", follow_redirects=True)
         assert resp.status_code == 200
         assert b"Database backup is unavailable" in resp.data

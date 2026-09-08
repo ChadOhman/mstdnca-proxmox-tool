@@ -292,25 +292,24 @@ def run_prometheus_install(log_callback=None):
             )
             _log_cmd_output(_log, stdout, stderr, code)
 
-            # Generate prometheus.yml
-            mstdnca_url = config.get("mstdnca_metrics_url", "")
-            auth_token = Setting.get("prometheus_auth_token", "")
             retention_days = config.get("retention_days", "365")
 
-            _log("Generating prometheus.yml...")
-            extra_scrape = ""
-            if Setting.get("unpoller_installed", "false") == "true":
-                from apps.unpoller import get_unpoller_scrape_config
-                extra_scrape = get_unpoller_scrape_config(guest.ip_address)
-            yml = _generate_prometheus_yml(mstdnca_url, auth_token, extra_scrape_configs=extra_scrape)
-            # Write via heredoc to avoid shell escaping issues
+            # Write a minimal bootstrap prometheus.yml so the service has a valid
+            # config to start with. The full config (mstdnca + exporters + unpoller)
+            # is generated, validated with promtool, and reloaded right after start by
+            # apps.exporters._regenerate_prometheus_config() — this repo's single
+            # prometheus.yml generator, so install/uninstall of any one component
+            # never wipes out another component's scrape jobs.
+            _log("Writing bootstrap prometheus.yml...")
+            bootstrap_yml = _generate_prometheus_yml("")
             stdout, stderr, code = ssh.execute_sudo(
-                f"cat > /etc/prometheus/prometheus.yml << 'PROMEOF'\n{yml}\nPROMEOF",
+                f"cat > /etc/prometheus/prometheus.yml << 'PROMEOF'\n{bootstrap_yml}\nPROMEOF\n"
+                "chown prometheus:prometheus /etc/prometheus/prometheus.yml",
                 timeout=15,
             )
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
-                _log("ERROR: Failed to write prometheus.yml.")
+                _log("ERROR: Failed to write bootstrap prometheus.yml.")
                 return False, log_lines
 
             # Create systemd service
@@ -347,20 +346,28 @@ def run_prometheus_install(log_callback=None):
             # Clean up
             ssh.execute_sudo(f"rm -rf /tmp/prometheus.tar.gz /tmp/{extract_dir}", timeout=15)
 
-            _log(f"Prometheus v{latest} installed successfully.")
-
-            # Update settings
-            Setting.set("prometheus_installed", "true")
-            Setting.set("prometheus_current_version", latest)
-            Setting.set("prometheus_update_available", "false")
-            db.session.commit()
-
-            return True, log_lines
-
     except Exception as e:
         _log(f"FATAL ERROR: {e}")
         logger.exception("Prometheus install failed")
         return False, log_lines
+
+    # Generate, validate, and install the full prometheus.yml now that Prometheus
+    # is running and promtool is available to check it against.
+    _log("Generating full prometheus.yml...")
+    from apps.exporters import _regenerate_prometheus_config
+    if not _regenerate_prometheus_config(_log):
+        _log("ERROR: Failed to generate/validate the full prometheus.yml.")
+        return False, log_lines
+
+    _log(f"Prometheus v{latest} installed successfully.")
+
+    # Update settings
+    Setting.set("prometheus_installed", "true")
+    Setting.set("prometheus_current_version", latest)
+    Setting.set("prometheus_update_available", "false")
+    db.session.commit()
+
+    return True, log_lines
 
 
 # ---------------------------------------------------------------------------

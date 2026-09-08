@@ -216,6 +216,15 @@ def run_moderation_check(log_callback=None):
     result["total_mastodon_emails"] = len(mastodon_emails)
     log(f"Found {len(mastodon_emails)} active Mastodon email(s)")
 
+    # Safety floor: an empty Mastodon email set means *every* PeerTube user looks
+    # unmatched. Never let an unattended run ban the whole instance off the back
+    # of a silent query failure.
+    if auto_ban and not mastodon_emails:
+        msg = "Refusing to auto-ban: the Mastodon email set is empty"
+        log(f"ERROR: {msg}")
+        result["errors"].append(msg)
+        return False, result
+
     # Fetch PeerTube users
     log("Fetching PeerTube users...")
     pt_users, err = fetch_peertube_users(api_url, decrypted_token)
@@ -228,8 +237,8 @@ def run_moderation_check(log_callback=None):
 
     # Compare
     for user in pt_users:
-        # Skip PeerTube admin users (role 0 = admin, 1 = moderator)
-        if user["role"] == 0:
+        # Skip PeerTube staff accounts (role 0 = admin, 1 = moderator)
+        if user["role"] in (0, 1):
             result["skipped_admins"] += 1
             continue
 

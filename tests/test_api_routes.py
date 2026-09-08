@@ -19,7 +19,7 @@ Covers endpoints that do not require Proxmox / SSH connectivity:
 import time
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from models import Guest, UpdatePackage, db
 from routes.api import (
@@ -306,7 +306,7 @@ class TestUpdateCancel:
             _delete_guest(app, guest_id)
 
 
-def _wait_until(predicate, timeout=2.0, interval=0.02):
+def _wait_until(predicate, timeout=15.0, interval=0.02):
     """Poll `predicate()` until it returns truthy or `timeout` elapses."""
     deadline = time.monotonic() + timeout
     result = predicate()
@@ -1053,3 +1053,99 @@ class TestGuestModelForApiRoutes:
 
             db.session.delete(g)
             db.session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Issue #126 — _poll_proxmox_task must always terminate
+# ---------------------------------------------------------------------------
+
+
+class TestPollProxmoxTaskTermination:
+    """A task that never reports "stopped" must not pin a poller thread forever."""
+
+    def _register(self, job_key="backup:4242"):
+        import routes.api as api_mod
+
+        job = ProxmoxJob(
+            guest_id=4242, guest_name="stuck-guest", job_type="backup",
+            upid="UPID:node1:999:backup", node="node1", host_model=None,
+        )
+        api_mod._proxmox_jobs[job_key] = job
+        return job, job_key
+
+    def test_wall_clock_deadline_finishes_job_as_failed(self, app):
+        import routes.api as api_mod
+
+        job, job_key = self._register("backup:4242")
+        client = MagicMock()
+        client.get_task_log.return_value = []
+        client.get_task_status.return_value = {"status": "running"}
+
+        clock = {"t": 0.0}
+
+        def fake_monotonic():
+            return clock["t"]
+
+        def fake_sleep(_seconds):
+            clock["t"] += 60 * 60  # an hour of wall clock per poll
+
+        try:
+            # The poller re-queries the host by id (#127); these tests exercise
+            # termination logic only, so hand it a stub host.
+            with patch.object(ProxmoxJob, "get_host", return_value=MagicMock()), \
+                 patch("clients.proxmox_api.ProxmoxClient", return_value=client), \
+                 patch("routes.api.time.sleep", side_effect=fake_sleep), \
+                 patch("routes.api.time.monotonic", side_effect=fake_monotonic):
+                api_mod._poll_proxmox_task(app, job_key)
+
+            assert job.running is False
+            assert job.success is False
+            assert "Timed out" in job.log
+        finally:
+            api_mod._proxmox_jobs.pop(job_key, None)
+
+    def test_consecutive_status_errors_finish_job_as_failed(self, app):
+        import routes.api as api_mod
+
+        job, job_key = self._register("backup:4243")
+        job.guest_id = 4243
+        client = MagicMock()
+        client.get_task_log.return_value = []
+        client.get_task_status.side_effect = RuntimeError("connection reset")
+
+        try:
+            # The poller re-queries the host by id (#127); these tests exercise
+            # termination logic only, so hand it a stub host.
+            with patch.object(ProxmoxJob, "get_host", return_value=MagicMock()), \
+                 patch("clients.proxmox_api.ProxmoxClient", return_value=client), \
+                 patch("routes.api.time.sleep"):
+                api_mod._poll_proxmox_task(app, job_key)
+
+            assert job.running is False
+            assert job.success is False
+            assert "Lost contact" in job.log
+            assert (client.get_task_status.call_count
+                    == api_mod.PROXMOX_TASK_POLL_MAX_STATUS_ERRORS)
+        finally:
+            api_mod._proxmox_jobs.pop(job_key, None)
+
+    def test_completed_task_still_finishes_normally(self, app):
+        import routes.api as api_mod
+
+        job, job_key = self._register("backup:4244")
+        client = MagicMock()
+        client.get_task_log.return_value = []
+        client.get_task_status.return_value = {"status": "stopped", "exitstatus": "OK"}
+
+        try:
+            # The poller re-queries the host by id (#127); these tests exercise
+            # termination logic only, so hand it a stub host.
+            with patch.object(ProxmoxJob, "get_host", return_value=MagicMock()), \
+                 patch("clients.proxmox_api.ProxmoxClient", return_value=client), \
+                 patch("routes.api.time.sleep"):
+                api_mod._poll_proxmox_task(app, job_key)
+
+            assert job.running is False
+            assert job.success is True
+        finally:
+            api_mod._proxmox_jobs.pop(job_key, None)

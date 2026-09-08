@@ -1,10 +1,20 @@
 """Tests for unpoller automation (apps/unpoller.py and routes/unpoller.py)."""
 
+import base64
 import json
+import re
 from unittest.mock import MagicMock, patch
 
 from auth.credential_store import encrypt
-from models import Setting, db
+from models import Credential, Guest, Setting, db
+
+
+def _decode_written_file(cmd):
+    """Extract and base64-decode the payload from a _write_remote_file() command
+    (`echo <b64> | base64 -d | install ...`)."""
+    m = re.search(r"echo (\S+) \| base64 -d", cmd)
+    assert m, f"command does not look like a base64 atomic write: {cmd!r}"
+    return base64.b64decode(m.group(1)).decode("utf-8")
 
 # ---------------------------------------------------------------------------
 # apps/unpoller.py unit tests
@@ -70,6 +80,61 @@ class TestUnpollerConfig:
             result = get_unpoller_scrape_config("10.0.0.50", port="9999")
             assert '"10.0.0.50:9999"' in result
 
+    def test_verify_ssl_defaults_false(self, app):
+        """verify_ssl must follow the app's unifi_verify_ssl setting (issue #128) —
+        this checks the default (unset) case, which must stay false."""
+        from apps.unpoller import _generate_unpoller_config
+
+        with app.app_context():
+            config = {
+                "unifi_url": "https://10.0.0.1", "unifi_user": "admin", "unifi_pass": "test-only-unifi-pass",
+                "unifi_site": "default", "metric_prefix": "unpoller", "listen_port": "9130",
+                "verify_ssl": False,
+            }
+            result = _generate_unpoller_config(config)
+            assert "verify_ssl = false" in result
+
+    def test_verify_ssl_true_when_setting_enabled(self, app):
+        from apps.unpoller import _generate_unpoller_config
+
+        with app.app_context():
+            config = {
+                "unifi_url": "https://10.0.0.1", "unifi_user": "admin", "unifi_pass": "test-only-unifi-pass",
+                "unifi_site": "default", "metric_prefix": "unpoller", "listen_port": "9130",
+                "verify_ssl": True,
+            }
+            result = _generate_unpoller_config(config)
+            assert "verify_ssl = true" in result
+
+    def test_toml_escape_quote_and_newline(self, app):
+        from apps.unpoller import _toml_escape
+        assert _toml_escape('has"quote') == 'has\\"quote'
+        assert _toml_escape("line1\nline2") == "line1\\nline2"
+        assert _toml_escape("back\\slash") == "back\\\\slash"
+
+    def test_generated_config_with_special_chars_is_valid_toml(self, app):
+        """A password containing a `"` or a newline must not break the generated
+        up.conf (issue #128)."""
+        import tomllib
+
+        from apps.unpoller import _generate_unpoller_config
+
+        with app.app_context():
+            config = {
+                "unifi_url": "https://10.0.0.1",
+                "unifi_user": "admin",
+                "unifi_pass": 'wei"rd\npass\r\nword',
+                "unifi_site": "default",
+                "metric_prefix": "unpoller",
+                "listen_port": "9130",
+                "verify_ssl": False,
+            }
+            result = _generate_unpoller_config(config)
+            parsed = tomllib.loads(result)
+            controller = parsed["unifi"]["controller"][0]
+            assert controller["pass"] == 'wei"rd\npass\r\nword'
+            assert controller["url"] == "https://10.0.0.1"
+
 
 class TestUnpollerGetConfig:
     """Test _get_config reads settings correctly."""
@@ -83,6 +148,10 @@ class TestUnpollerGetConfig:
             assert config["unifi_site"] == "default"
             assert config["metric_prefix"] == "unpoller"
             assert config["listen_port"] == "9130"
+            # verify_ssl's default is covered by test_get_config_follows_unifi_verify_ssl_setting,
+            # which sets the underlying setting explicitly — unifi_verify_ssl is a
+            # shared, cross-test Setting and other tests (e.g. the settings-page
+            # save flow) may leave it toggled on in this session-scoped DB.
 
     def test_get_config_reads_settings(self, app):
         from apps.unpoller import _get_config
@@ -122,9 +191,23 @@ class TestUnpollerGetConfig:
             # A non-Fernet / corrupt value must not crash install/reconfigure.
             Setting.set("unifi_password", "not-a-valid-fernet-token")
             db.session.commit()
-
             config = _get_config()
             assert config["unifi_pass"] == ""
+
+    def test_get_config_follows_unifi_verify_ssl_setting(self, app):
+        """verify_ssl must track the app's existing UniFi verify-SSL setting (the
+        same one clients/unifi_client.py and routes/settings.py use) rather than
+        being hardcoded false."""
+        from apps.unpoller import _get_config
+
+        with app.app_context():
+            Setting.set("unifi_verify_ssl", "true")
+            db.session.commit()
+            assert _get_config()["verify_ssl"] is True
+
+            Setting.set("unifi_verify_ssl", "false")
+            db.session.commit()
+            assert _get_config()["verify_ssl"] is False
 
 
 class TestCheckUnpollerRelease:
@@ -202,6 +285,117 @@ class TestRunUnpollerInstall:
             ok, logs = run_unpoller_install()
             assert ok is False
             assert any("not found" in line.lower() for line in logs)
+
+    @patch("apps.unpoller.SSHClient")
+    @patch("apps.unpoller._snapshot_guest", return_value=(True, "snapshot ok"))
+    def test_up_conf_written_atomically_not_via_heredoc(self, mock_snap, MockSSH, app):
+        """up.conf (which carries the UniFi controller password) must be written
+        via base64+install, with its final mode/ownership set in the same step —
+        never a `cat > ... << 'UPEOF'` heredoc that a value in the config could
+        break out of, and never chmod'd/chown'd after a plain-umask create."""
+        from apps.unpoller import run_unpoller_install
+
+        mock_ssh = MagicMock()
+        mock_ssh.execute_sudo.return_value = ("", "", 0)
+        mock_ssh.__enter__ = MagicMock(return_value=mock_ssh)
+        mock_ssh.__exit__ = MagicMock(return_value=False)
+        MockSSH.from_credential.return_value = mock_ssh
+
+        with app.app_context():
+            cred = Credential(
+                name="up-install-cred", username="root", auth_type="password",
+                encrypted_value="unused-in-mocked-ssh", is_default=True,
+            )
+            db.session.add(cred)
+            guest = Guest(
+                name="up-install-guest", vmid=501, guest_type="lxc",
+                ip_address="10.0.0.55", credential_id=None,
+            )
+            db.session.add(guest)
+            db.session.commit()
+            guest.credential_id = cred.id
+            db.session.commit()
+
+            Setting.set("prometheus_guest_id", str(guest.id))
+            Setting.set("unifi_base_url", "https://udm.local")
+            Setting.set("unifi_username", "admin")
+            Setting.set("unifi_password", encrypt("test-only-unifi-pass"))
+            Setting.set("unpoller_latest_version", "1.2.3")
+            db.session.commit()
+
+            with patch("apps.exporters._regenerate_prometheus_config", return_value=True):
+                ok, logs = run_unpoller_install()
+
+            assert ok is True, "\n".join(logs)
+
+        calls = [str(c.args[0]) for c in mock_ssh.execute_sudo.call_args_list]
+        write_calls = [c for c in calls if "up.conf" in c and "install -m 640" in c]
+        assert len(write_calls) == 1
+        cmd = write_calls[0]
+        assert "cat >" not in cmd
+        assert "UPEOF" not in cmd
+        assert "install -m 640 -o root -g unpoller /dev/stdin /etc/unpoller/up.conf" in cmd
+        assert "test-only-unifi-pass" not in cmd  # raw password never appears in the command line
+
+        import tomllib
+        parsed = tomllib.loads(_decode_written_file(cmd))
+        assert parsed["unifi"]["controller"][0]["user"] == "admin"
+
+        # No separate chmod/chown call after the write — install sets them atomically.
+        assert not any("chmod 640" in c and "up.conf" in c for c in calls)
+
+        with app.app_context():
+            Setting.set("prometheus_guest_id", "")  # avoid leaking into other tests
+            db.session.commit()
+
+
+class TestRunUnpollerReconfig:
+    @patch("apps.unpoller.SSHClient")
+    def test_reconfig_writes_up_conf_atomically(self, MockSSH, app):
+        from apps.unpoller import run_unpoller_reconfig
+
+        mock_ssh = MagicMock()
+        mock_ssh.execute_sudo.return_value = ("", "", 0)
+        mock_ssh.__enter__ = MagicMock(return_value=mock_ssh)
+        mock_ssh.__exit__ = MagicMock(return_value=False)
+        MockSSH.from_credential.return_value = mock_ssh
+
+        with app.app_context():
+            cred = Credential(
+                name="up-reconf-cred", username="root", auth_type="password",
+                encrypted_value="unused-in-mocked-ssh", is_default=True,
+            )
+            db.session.add(cred)
+            guest = Guest(
+                name="up-reconf-guest", vmid=502, guest_type="lxc",
+                ip_address="10.0.0.56", credential_id=None,
+            )
+            db.session.add(guest)
+            db.session.commit()
+            guest.credential_id = cred.id
+            db.session.commit()
+
+            Setting.set("prometheus_guest_id", str(guest.id))
+            Setting.set("unifi_base_url", "https://udm.local")
+            Setting.set("unifi_username", "admin")
+            Setting.set("unifi_password", encrypt('pw"withquote'))
+            db.session.commit()
+
+            ok, logs = run_unpoller_reconfig()
+            assert ok is True, "\n".join(logs)
+
+        calls = [str(c.args[0]) for c in mock_ssh.execute_sudo.call_args_list]
+        write_calls = [c for c in calls if "up.conf" in c and "install -m 640" in c]
+        assert len(write_calls) == 1
+        assert "UPEOF" not in write_calls[0]
+
+        import tomllib
+        parsed = tomllib.loads(_decode_written_file(write_calls[0]))
+        assert parsed["unifi"]["controller"][0]["pass"] == 'pw"withquote'
+
+        with app.app_context():
+            Setting.set("prometheus_guest_id", "")  # avoid leaking into other tests
+            db.session.commit()
 
 
 class TestRunUnpollerUpgrade:

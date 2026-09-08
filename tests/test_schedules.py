@@ -196,3 +196,77 @@ class TestScheduleDelete:
     def test_delete_nonexistent_returns_404(self, auth_client):
         resp = auth_client.post("/schedules/999999/delete")
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Issue #126 — day/time validation on POST /schedules/add
+# ---------------------------------------------------------------------------
+
+
+class TestScheduleAddValidation:
+    def _post(self, auth_client, **overrides):
+        data = {
+            "name": "_test-validate",
+            "day_of_week": "monday",
+            "start_time": "03:00",
+            "end_time": "04:00",
+            "update_type": "upgrade",
+        }
+        data.update(overrides)
+        return auth_client.post("/schedules/add", data=data, follow_redirects=True)
+
+    def _assert_not_created(self, app, resp, needle):
+        assert resp.status_code == 200
+        assert needle in resp.get_data(as_text=True)
+        with app.app_context():
+            assert MaintenanceWindow.query.filter_by(name="_test-validate").count() == 0
+
+    @pytest.mark.parametrize("bad_time", ["3:00", "25:00", "03:60", "morning", "", "0300"])
+    def test_bad_start_time_rejected(self, app, auth_client, bad_time):
+        resp = self._post(auth_client, start_time=bad_time)
+        self._assert_not_created(app, resp, "HH:MM")
+
+    @pytest.mark.parametrize("bad_time", ["4:00", "24:01", "later"])
+    def test_bad_end_time_rejected(self, app, auth_client, bad_time):
+        resp = self._post(auth_client, end_time=bad_time)
+        self._assert_not_created(app, resp, "HH:MM")
+
+    @pytest.mark.parametrize("bad_day", ["someday", "mon", "", "0"])
+    def test_bad_day_rejected(self, app, auth_client, bad_day):
+        resp = self._post(auth_client, day_of_week=bad_day)
+        self._assert_not_created(app, resp, "weekday")
+
+    def test_day_is_normalised_to_lowercase(self, app, auth_client):
+        win_id = None
+        try:
+            resp = self._post(auth_client, day_of_week="Sunday")
+            assert resp.status_code == 200
+            with app.app_context():
+                w = MaintenanceWindow.query.filter_by(name="_test-validate").first()
+                assert w is not None
+                assert w.day_of_week == "sunday"
+                win_id = w.id
+        finally:
+            if win_id is not None:
+                with app.app_context():
+                    w = MaintenanceWindow.query.get(win_id)
+                    if w:
+                        db.session.delete(w)
+                        db.session.commit()
+
+    def test_midnight_spanning_window_is_accepted(self, app, auth_client):
+        win_id = None
+        try:
+            self._post(auth_client, start_time="23:00", end_time="02:00", day_of_week="daily")
+            with app.app_context():
+                w = MaintenanceWindow.query.filter_by(name="_test-validate").first()
+                assert w is not None
+                assert (w.start_time, w.end_time) == ("23:00", "02:00")
+                win_id = w.id
+        finally:
+            if win_id is not None:
+                with app.app_context():
+                    w = MaintenanceWindow.query.get(win_id)
+                    if w:
+                        db.session.delete(w)
+                        db.session.commit()

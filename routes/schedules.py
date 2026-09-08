@@ -2,6 +2,7 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 
 from auth.audit import log_action
+from core.scheduler import VALID_WINDOW_DAYS, parse_window_time
 from models import MaintenanceWindow, db
 
 bp = Blueprint("schedules", __name__)
@@ -33,11 +34,22 @@ def add():
         flash("Name is required.", "error")
         return redirect(url_for("schedules.index"))
 
+    # Validate before persisting: _run_auto_updates parses these into
+    # datetime.time, so a malformed value would silently disable the window.
+    day_of_week = (day_of_week or "").strip().lower()
+    if day_of_week not in VALID_WINDOW_DAYS:
+        flash("Day must be 'daily' or a weekday name.", "error")
+        return redirect(url_for("schedules.index"))
+
+    if parse_window_time(start_time) is None or parse_window_time(end_time) is None:
+        flash("Start and end times must be in zero-padded 24-hour HH:MM format.", "error")
+        return redirect(url_for("schedules.index"))
+
     window = MaintenanceWindow(
         name=name,
         day_of_week=day_of_week,
-        start_time=start_time,
-        end_time=end_time,
+        start_time=start_time.strip(),
+        end_time=end_time.strip(),
         update_type=update_type,
     )
     db.session.add(window)

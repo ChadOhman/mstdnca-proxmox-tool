@@ -1,12 +1,117 @@
 import logging
 from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
 
+from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 logger = logging.getLogger(__name__)
 
 _scheduler = None
+
+# Jobs fire on long intervals; APScheduler's default misfire_grace_time of 1s
+# silently drops a run whenever the pool is briefly saturated. Five minutes of
+# grace plus coalescing means a delayed run still happens, exactly once.
+JOB_MISFIRE_GRACE_SECONDS = 300
+JOB_EXECUTOR_THREADS = 10
+
+# Upper bound on UniFi events persisted per endpoint, per poll.
+UNIFI_POLL_MAX_EVENTS = 500
+
+# Bounds for user-configurable interval settings: key -> (min, max, default).
+# Enforced both on save (routes/settings.py) and on read (init_scheduler), so a
+# value written by an older build or a config import can never brick boot.
+INTERVAL_BOUNDS = {
+    "scan_interval": (1, 168, 6),                    # hours
+    "discovery_interval": (1, 168, 4),               # hours
+    "service_check_interval": (1, 1440, 5),          # minutes
+    "unifi_api_poll_interval": (1, 1440, 5),         # minutes
+    "prometheus_collect_interval": (10, 86400, 60),  # seconds
+    "moderation_check_interval_hours": (1, 8760, 24),
+}
+
+VALID_WINDOW_DAYS = frozenset({
+    "daily", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+})
+
+
+def parse_interval(key, raw):
+    """Validate a raw interval value against INTERVAL_BOUNDS.
+
+    Returns ``(value, None)`` on success or ``(None, message)`` on bad input.
+    """
+    low, high, _default = INTERVAL_BOUNDS.get(key, (1, 100000, 1))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, f"must be a whole number between {low} and {high}"
+    if value < low or value > high:
+        return None, f"must be between {low} and {high}"
+    return value, None
+
+
+def interval_setting(key):
+    """Read an interval Setting defensively.
+
+    A malformed or out-of-range stored value is clamped/replaced rather than
+    raised, so a bad value can never stop the app from booting.
+    """
+    from models import Setting
+
+    low, high, default = INTERVAL_BOUNDS[key]
+    raw = Setting.get(key, str(default))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s setting %r; falling back to %s", key, raw, default)
+        return default
+    if value < low or value > high:
+        logger.warning("Out-of-range %s setting %r; clamping to [%s, %s]", key, raw, low, high)
+        return max(low, min(high, value))
+    return value
+
+
+def parse_window_time(value):
+    """Parse a zero-padded ``HH:MM`` string into a ``datetime.time``.
+
+    Returns None when the value is missing or malformed.
+    """
+    text = (value or "").strip()
+    if len(text) != 5 or text[2] != ":" or not (text[:2].isdigit() and text[3:].isdigit()):
+        return None
+    hour, minute = int(text[:2]), int(text[3:])
+    if hour > 23 or minute > 59:
+        return None
+    return dtime(hour, minute)
+
+
+def _in_maintenance_window(window, now):
+    """Whether ``now`` (a naive local datetime) falls inside ``window``.
+
+    Handles windows that wrap past midnight (start > end) and compares the day
+    name case-insensitively.  A window with unparseable times never matches.
+    """
+    import calendar
+
+    day = (window.day_of_week or "").strip().lower()
+    if day != "daily" and day != calendar.day_name[now.weekday()].lower():
+        return False
+
+    start = parse_window_time(window.start_time)
+    end = parse_window_time(window.end_time)
+    if start is None or end is None:
+        logger.warning(
+            "Maintenance window '%s' has invalid times (%r-%r); skipping",
+            getattr(window, "name", "?"), window.start_time, window.end_time,
+        )
+        return False
+
+    current = now.time()
+    if start <= end:
+        return start <= current <= end
+    # Wrap-around window, e.g. 23:00 -> 02:00.
+    return current >= start or current <= end
 
 
 def _run_scan(app):
@@ -30,14 +135,10 @@ def _run_scan(app):
 def _run_auto_updates(app):
     """Apply updates to guests with auto-update enabled during their maintenance window."""
     with app.app_context():
-        import calendar
-
         from core.scanner import apply_updates
         from models import Guest
 
         now = datetime.now()
-        current_day = calendar.day_name[now.weekday()].lower()
-        current_time = now.strftime("%H:%M")
 
         apply_results = []
 
@@ -48,12 +149,8 @@ def _run_auto_updates(app):
             if not window or not window.enabled:
                 continue
 
-            # Check if current day matches
-            if window.day_of_week != "daily" and window.day_of_week != current_day:
-                continue
-
-            # Check if current time is within window
-            if not (window.start_time <= current_time <= window.end_time):
+            # Day + time match, including windows that wrap past midnight
+            if not _in_maintenance_window(window, now):
                 continue
 
             # Check if there are pending updates
@@ -125,15 +222,25 @@ def _check_mastodon_release(app):
         if Setting.get("mastodon_auto_upgrade", "false") == "true":
             logger.info("Auto-upgrade enabled, starting Mastodon upgrade...")
             from apps.mastodon import run_mastodon_upgrade
+            from apps.utils import upgrade_lock
             from auth.audit import log_action
             from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
             from models import db
-            send_upgrade_started_notification("mastodon", latest, "auto")
-            try:
-                ok, log_output = run_mastodon_upgrade()
-            except Exception as exc:
-                logger.exception("Mastodon auto-upgrade crashed")
-                ok, log_output = False, f"Auto-upgrade crashed: {exc}"
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("mastodon") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Mastodon auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("mastodon", latest, "auto")
+                try:
+                    ok, log_output = run_mastodon_upgrade()
+                except Exception as exc:
+                    logger.exception("Mastodon auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {exc}"
             log_action("mastodon_upgrade", "settings", resource_name="mastodon",
                        details={"status": "success" if ok else "error", "trigger": "auto"})
             db.session.commit()
@@ -178,15 +285,25 @@ def _check_ghost_release(app):
         if Setting.get("ghost_auto_upgrade", "false") == "true":
             logger.info("Auto-upgrade enabled, starting Ghost upgrade...")
             from apps.ghost import run_ghost_upgrade
+            from apps.utils import upgrade_lock
             from auth.audit import log_action
             from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
             from models import db
-            send_upgrade_started_notification("ghost", latest, "auto")
-            try:
-                ok, log_output = run_ghost_upgrade()
-            except Exception as exc:
-                logger.exception("Ghost auto-upgrade crashed")
-                ok, log_output = False, f"Auto-upgrade crashed: {exc}"
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("ghost") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Ghost auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("ghost", latest, "auto")
+                try:
+                    ok, log_output = run_ghost_upgrade()
+                except Exception as exc:
+                    logger.exception("Ghost auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {exc}"
             log_action("ghost_upgrade", "settings", resource_name="ghost",
                        details={"status": "success" if ok else "error", "trigger": "auto"})
             db.session.commit()
@@ -231,15 +348,25 @@ def _check_peertube_release(app):
         if Setting.get("peertube_auto_upgrade", "false") == "true":
             logger.info("Auto-upgrade enabled, starting PeerTube upgrade...")
             from apps.peertube import run_peertube_upgrade
+            from apps.utils import upgrade_lock
             from auth.audit import log_action
             from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
             from models import db
-            send_upgrade_started_notification("peertube", latest, "auto")
-            try:
-                ok, log_output = run_peertube_upgrade()
-            except Exception as exc:
-                logger.exception("PeerTube auto-upgrade crashed")
-                ok, log_output = False, f"Auto-upgrade crashed: {exc}"
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("peertube") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "PeerTube auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("peertube", latest, "auto")
+                try:
+                    ok, log_output = run_peertube_upgrade()
+                except Exception as exc:
+                    logger.exception("PeerTube auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {exc}"
             log_action("peertube_upgrade", "settings", resource_name="peertube",
                        details={"status": "success" if ok else "error", "trigger": "auto"})
             db.session.commit()
@@ -286,15 +413,25 @@ def _check_elk_release(app):
         if Setting.get("elk_auto_upgrade", "false") == "true":
             logger.info("Auto-upgrade enabled, starting Elk upgrade...")
             from apps.elk import run_elk_upgrade
+            from apps.utils import upgrade_lock
             from auth.audit import log_action
             from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
             from models import db
-            send_upgrade_started_notification("elk", latest, "auto")
-            try:
-                ok, log_output = run_elk_upgrade()
-            except Exception as exc:
-                logger.exception("Elk auto-upgrade crashed")
-                ok, log_output = False, f"Auto-upgrade crashed: {exc}"
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("elk") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Elk auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("elk", latest, "auto")
+                try:
+                    ok, log_output = run_elk_upgrade()
+                except Exception as exc:
+                    logger.exception("Elk auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {exc}"
             log_action("elk_upgrade", "settings", resource_name="elk",
                        details={"status": "success" if ok else "error", "trigger": "auto"})
             db.session.commit()
@@ -341,15 +478,25 @@ def _check_jitsi_release(app):
         if Setting.get("jitsi_auto_upgrade", "false") == "true":
             logger.info("Auto-upgrade enabled, starting Jitsi upgrade...")
             from apps.jitsi import run_jitsi_upgrade
+            from apps.utils import upgrade_lock
             from auth.audit import log_action
             from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
             from models import db
-            send_upgrade_started_notification("jitsi", latest, "auto")
-            try:
-                ok, log_output = run_jitsi_upgrade()
-            except Exception as exc:
-                logger.exception("Jitsi auto-upgrade crashed")
-                ok, log_output = False, f"Auto-upgrade crashed: {exc}"
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("jitsi") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Jitsi auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("jitsi", latest, "auto")
+                try:
+                    ok, log_output = run_jitsi_upgrade()
+                except Exception as exc:
+                    logger.exception("Jitsi auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {exc}"
             log_action("jitsi_upgrade", "settings", resource_name="jitsi",
                        details={"status": "success" if ok else "error", "trigger": "auto"})
             db.session.commit()
@@ -484,15 +631,24 @@ def _run_discovery(app):
                         for tag_name in tag_names:
                             guest.tags.append(_resolve_tag(tag_name))
                     else:
-                        # Detect VMID reuse: type changed means old guest was destroyed
+                        # Detect VMID reuse: a changed type, or a changed MAC on the
+                        # same type, means the old guest was destroyed and rebuilt.
+                        # Only the derived scan state is cleared — auto_update, the
+                        # maintenance window and the credential are deliberately
+                        # preserved, since a MAC can also change legitimately.
+                        reuse_reason = None
                         if existing.guest_type != g["type"]:
-                            old_type = existing.guest_type
+                            reuse_reason = f"type changed {existing.guest_type} -> {g['type']}"
                             existing.guest_type = g["type"]
+                        elif mac and existing.mac_address and mac.lower() != existing.mac_address.lower():
+                            reuse_reason = f"MAC changed {existing.mac_address} -> {mac}"
+
+                        if reuse_reason:
                             existing.clear_stale_data()
                             reused += 1
                             logger.warning(
-                                "VMID %s on '%s': type changed %s -> %s (reuse detected, stale data cleared)",
-                                vmid, host.name, old_type, g["type"],
+                                "VMID %s on '%s': %s (reuse detected, stale data cleared)",
+                                vmid, host.name, reuse_reason,
                             )
 
                         if ip:
@@ -514,6 +670,7 @@ def _run_discovery(app):
                     msg += f", {reused} VMID reuse(s) detected"
                 logger.info(msg)
             except Exception as e:
+                db.session.rollback()
                 logger.error(f"Scheduled discovery failed for '{host.name}': {e}")
 
 
@@ -573,6 +730,8 @@ def _check_host_updates(app):
                     "update_count": len(updates),
                 })
             except Exception as e:
+                from models import db
+                db.session.rollback()
                 logger.error(f"Failed to check host updates for '{host.name}': {e}")
 
         if host_results:
@@ -699,64 +858,89 @@ def _poll_unifi_events(app):
         geoip_db_path = Setting.get("unifi_geoip_db_path", "")
 
         added = 0
-        for endpoint, log_type in [
-            (f"/api/s/{site}/stat/event", "system"),
-            (f"/api/s/{site}/stat/alarm", "firewall"),
-        ]:
-            raw = client._api_get(endpoint)
-            if not raw:
-                continue
-            for evt in raw:
-                # Use the event's _id as dedup key
-                event_key = str(evt.get("_id", ""))
-                if event_key and UnifiLogEntry.query.filter_by(rule_id=event_key, source="api").first():
+        try:
+            for endpoint, log_type in [
+                (f"/api/s/{site}/stat/event", "system"),
+                (f"/api/s/{site}/stat/alarm", "firewall"),
+            ]:
+                # UnifiClient exposes no public events/alarms accessor, so the
+                # private _api_get is used here deliberately.
+                raw = client._api_get(endpoint)
+                if not raw:
                     continue
 
-                # Parse timestamp
-                ts_str = evt.get("datetime", "")
-                try:
-                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")) if ts_str else datetime.now(timezone.utc)
-                except ValueError:
-                    ts = datetime.now(timezone.utc)
+                # Cap the batch so one very chatty poll can't insert unbounded rows
+                # (and stays well under SQLite's bound-parameter limit below).
+                batch = list(raw)[:UNIFI_POLL_MAX_EVENTS]
 
-                src_ip = evt.get("src_ip") or evt.get("src") or None
-                dst_ip = evt.get("dst_ip") or evt.get("dst") or None
-                msg = evt.get("msg", "")
+                # One IN (...) lookup for the whole batch instead of a SELECT per event.
+                keys = [k for k in (str(evt.get("_id", "")) for evt in batch) if k]
+                known = set()
+                if keys:
+                    known = {
+                        row[0]
+                        for row in db.session.query(UnifiLogEntry.rule_id)
+                        .filter(UnifiLogEntry.source == "api", UnifiLogEntry.rule_id.in_(keys))
+                        .all()
+                    }
 
-                # GeoIP enrichment
-                geo = {}
-                if geoip_enabled and geoip_db_path:
-                    from clients import unifi_geoip
-                    ext_ip = src_ip or dst_ip
-                    if ext_ip:
-                        geo = unifi_geoip.lookup(ext_ip, geoip_db_path)
+                for evt in batch:
+                    # Use the event's _id as dedup key
+                    event_key = str(evt.get("_id", ""))
+                    if event_key and event_key in known:
+                        continue
+                    if event_key:
+                        known.add(event_key)
 
-                entry = UnifiLogEntry(
-                    timestamp=ts,
-                    source="api",
-                    log_type=log_type,
-                    action="block" if evt.get("key", "").endswith("_Blocked") else "allow",
-                    direction=None,
-                    src_ip=src_ip,
-                    dst_ip=dst_ip,
-                    src_port=evt.get("sport"),
-                    dst_port=evt.get("dport"),
-                    protocol=evt.get("proto"),
-                    interface=evt.get("iface"),
-                    rule_id=event_key or None,
-                    mac=evt.get("host"),
-                    msg=msg[:512] if msg else None,
-                    raw=None,
-                    country=geo.get("country"),
-                    country_code=geo.get("country_code"),
-                    city=geo.get("city"),
-                )
-                db.session.add(entry)
-                added += 1
+                    # Parse timestamp
+                    ts_str = evt.get("datetime", "")
+                    try:
+                        ts = (datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                              if ts_str else datetime.now(timezone.utc))
+                    except ValueError:
+                        ts = datetime.now(timezone.utc)
 
-        if added:
-            db.session.commit()
-            logger.info(f"UniFi API poll: added {added} new event(s).")
+                    src_ip = evt.get("src_ip") or evt.get("src") or None
+                    dst_ip = evt.get("dst_ip") or evt.get("dst") or None
+                    msg = evt.get("msg", "")
+
+                    # GeoIP enrichment
+                    geo = {}
+                    if geoip_enabled and geoip_db_path:
+                        from clients import unifi_geoip
+                        ext_ip = src_ip or dst_ip
+                        if ext_ip:
+                            geo = unifi_geoip.lookup(ext_ip, geoip_db_path)
+
+                    entry = UnifiLogEntry(
+                        timestamp=ts,
+                        source="api",
+                        log_type=log_type,
+                        action="block" if evt.get("key", "").endswith("_Blocked") else "allow",
+                        direction=None,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        src_port=evt.get("sport"),
+                        dst_port=evt.get("dport"),
+                        protocol=evt.get("proto"),
+                        interface=evt.get("iface"),
+                        rule_id=event_key or None,
+                        mac=evt.get("host"),
+                        msg=msg[:512] if msg else None,
+                        raw=None,
+                        country=geo.get("country"),
+                        country_code=geo.get("country_code"),
+                        city=geo.get("city"),
+                    )
+                    db.session.add(entry)
+                    added += 1
+
+            if added:
+                db.session.commit()
+                logger.info(f"UniFi API poll: added {added} new event(s).")
+        except Exception:
+            db.session.rollback()
+            logger.error("UniFi API poll failed", exc_info=True)
 
 
 def _purge_old_unifi_logs(app):
@@ -794,6 +978,8 @@ def _run_service_health_checks(app):
                 check_service_statuses(guest)
                 checked += 1
             except Exception as e:
+                from models import db
+                db.session.rollback()
                 logger.debug(f"Service check failed for {guest.name}: {e}")
 
         logger.info(f"Service health checks complete: {checked}/{len(guests)} guests checked.")
@@ -1092,6 +1278,7 @@ def _poll_ipmi_sensors(app):
                     db.session.commit()
                 client.logout()
             except Exception:
+                db.session.rollback()
                 logger.debug("IPMI poll failed for host %s (%s)", host.name, host.ipmi_address, exc_info=True)
 
 
@@ -1177,16 +1364,24 @@ def init_scheduler(app):
     if _scheduler is not None:
         return _scheduler
 
-    _scheduler = BackgroundScheduler()
+    _scheduler = BackgroundScheduler(
+        executors={"default": ThreadPoolExecutor(JOB_EXECUTOR_THREADS)},
+        job_defaults={
+            "misfire_grace_time": JOB_MISFIRE_GRACE_SECONDS,
+            "coalesce": True,
+            "max_instances": 1,
+        },
+    )
 
     with app.app_context():
-        from models import Setting
-        interval_hours = int(Setting.get("scan_interval", "6") or 6)
-        discovery_hours = int(Setting.get("discovery_interval", "4") or 4)
-        service_check_minutes = int(Setting.get("service_check_interval", "5") or 5)
-        unifi_poll_minutes = int(Setting.get("unifi_api_poll_interval", "5") or 5)
-        prometheus_collect_seconds = int(Setting.get("prometheus_collect_interval", "60") or 60)
-        moderation_hours = int(Setting.get("moderation_check_interval_hours", "24") or 24)
+        # interval_setting() clamps/falls back rather than raising, so a bad
+        # stored value can never take the app down at boot.
+        interval_hours = interval_setting("scan_interval")
+        discovery_hours = interval_setting("discovery_interval")
+        service_check_minutes = interval_setting("service_check_interval")
+        unifi_poll_minutes = interval_setting("unifi_api_poll_interval")
+        prometheus_collect_seconds = interval_setting("prometheus_collect_interval")
+        moderation_hours = interval_setting("moderation_check_interval_hours")
 
     # Discovery job - refresh hosts periodically
     _scheduler.add_job(

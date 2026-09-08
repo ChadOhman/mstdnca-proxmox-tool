@@ -760,6 +760,35 @@ def detect_services(guest):
     db.session.commit()
 
 
+def _notify_service_transition(guest, service_key, unit_name, old_status, new_status):
+    """Dispatch Discord + push alerts for a service status transition.
+
+    Shared by both status-writing paths (`_upsert_service` during the periodic
+    scan and `check_service_statuses` during the frequent health check) so an
+    alert fires whichever one observes the transition first.  Notifications are
+    best-effort and never propagate.
+    """
+    if new_status == "failed" and old_status != "failed":
+        event, sender = "service_failed", "send_service_failed_notification"
+    elif new_status == "running" and old_status == "failed":
+        event, sender = "service_recovered", "send_service_recovery_notification"
+    else:
+        return
+
+    try:
+        from core import notifier
+        if notifier.guest_matches_notify_tags(guest):
+            getattr(notifier, sender)(guest.name, service_key)
+    except Exception:
+        logger.debug(f"Service {event} notification failed for {unit_name}", exc_info=True)
+
+    try:
+        from core.push_notifier import dispatch_push_alerts
+        dispatch_push_alerts(guest, event, {"service": service_key, "unit": unit_name})
+    except Exception:
+        logger.debug(f"Service {event} push alert failed for {unit_name}", exc_info=True)
+
+
 def _upsert_service(guest, service_key, unit_name, default_port, status, now):
     """Create or update a GuestService record."""
     try:
@@ -774,30 +803,7 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
             existing.status = status
             existing.last_checked = now
             # Notifications on state transitions
-            if status == "failed" and old_status != "failed":
-                try:
-                    from core.notifier import guest_matches_notify_tags, send_service_failed_notification
-                    if guest_matches_notify_tags(guest):
-                        send_service_failed_notification(guest.name, service_key)
-                except Exception:
-                    pass
-                try:
-                    from core.push_notifier import dispatch_push_alerts
-                    dispatch_push_alerts(guest, "service_failed", {"service": service_key, "unit": unit_name})
-                except Exception:
-                    pass
-            elif status == "running" and old_status == "failed":
-                try:
-                    from core.notifier import guest_matches_notify_tags, send_service_recovery_notification
-                    if guest_matches_notify_tags(guest):
-                        send_service_recovery_notification(guest.name, service_key)
-                except Exception:
-                    pass
-                try:
-                    from core.push_notifier import dispatch_push_alerts
-                    dispatch_push_alerts(guest, "service_recovered", {"service": service_key, "unit": unit_name})
-                except Exception:
-                    pass
+            _notify_service_transition(guest, service_key, unit_name, old_status, status)
         else:
             svc = GuestService(
                 guest_id=guest.id,
@@ -809,18 +815,7 @@ def _upsert_service(guest, service_key, unit_name, default_port, status, now):
                 auto_detected=True,
             )
             db.session.add(svc)
-            if status == "failed":
-                try:
-                    from core.notifier import guest_matches_notify_tags, send_service_failed_notification
-                    if guest_matches_notify_tags(guest):
-                        send_service_failed_notification(guest.name, service_key)
-                except Exception:
-                    pass
-                try:
-                    from core.push_notifier import dispatch_push_alerts
-                    dispatch_push_alerts(guest, "service_failed", {"service": service_key, "unit": unit_name})
-                except Exception:
-                    pass
+            _notify_service_transition(guest, service_key, unit_name, None, status)
     elif status == "stopped" and existing:
         existing.status = status
         existing.last_checked = now
@@ -842,8 +837,10 @@ def check_service_statuses(guest):
     lines = (stdout or "").strip().split("\n")
     now = datetime.now(timezone.utc)
 
+    transitions = []
     for i, svc in enumerate(guest.services):
         status_str = lines[i].strip() if i < len(lines) else "unknown"
+        old_status = svc.status
         if status_str == "active":
             svc.status = "running"
         elif status_str == "inactive":
@@ -853,8 +850,15 @@ def check_service_statuses(guest):
         else:
             svc.status = "unknown"
         svc.last_checked = now
+        if svc.status != old_status:
+            transitions.append((svc.service_name, svc.unit_name, old_status, svc.status))
 
     db.session.commit()
+
+    # Alert after the commit so the new status is durable before anyone is
+    # paged, and so a later scan/_upsert_service pass sees no transition left.
+    for service_key, unit_name, old_status, new_status in transitions:
+        _notify_service_transition(guest, service_key, unit_name, old_status, new_status)
 
 
 def service_action(guest, service, action):
@@ -2647,8 +2651,50 @@ def scan_all_guests():
             result = scan_guest(guest)
             results.append(result)
         except Exception as e:
+            # Roll back first: a failed guest must not leave the shared session
+            # in a pending-rollback state that poisons every later guest.
+            db.session.rollback()
             logger.error(f"Unexpected error scanning {guest.name}: {e}")
     return results
+
+
+def _reconcile_applied_updates(guest, upgradable_output):
+    """Mark pending packages applied based on a post-upgrade upgradable list.
+
+    ``apt-get upgrade -y`` exits 0 even when packages are kept back (a new
+    dependency, a phased update, a held package), so a zero exit is not proof
+    that everything was installed.  Re-read ``apt list --upgradable`` and only
+    retire the rows whose package no longer appears there; anything still
+    listed stays pending and keeps the guest out of 'up-to-date'.
+
+    ``upgradable_output`` of None means the re-check itself could not be run —
+    in that case nothing is marked applied and the guest is left as-is.
+    """
+    if upgradable_output is None:
+        logger.warning(
+            f"Could not re-check upgradable packages on {guest.name}; "
+            "leaving pending updates untouched"
+        )
+        return
+
+    still_upgradable = {p["name"] for p in parse_upgradable(upgradable_output or "")}
+    now = datetime.now(timezone.utc)
+    kept_back = []
+    for pkg in guest.pending_updates():
+        if pkg.package_name in still_upgradable:
+            kept_back.append(pkg.package_name)
+            continue
+        pkg.status = "applied"
+        pkg.applied_at = now
+
+    if kept_back:
+        logger.info(
+            f"{len(kept_back)} package(s) kept back on {guest.name}: {', '.join(sorted(kept_back))}"
+        )
+        guest.status = "updates-available"
+    else:
+        guest.status = "up-to-date"
+    db.session.commit()
 
 
 def apply_updates(guest, dist_upgrade=False):
@@ -2669,13 +2715,14 @@ def apply_updates(guest, dist_upgrade=False):
                     ssh.execute_sudo("apt-get update -qq", timeout=120)
                     stdout, stderr, code = ssh.execute_sudo(cmd, timeout=600)
                     if code == 0:
-                        # Mark all pending as applied
-                        now = datetime.now(timezone.utc)
-                        for pkg in guest.pending_updates():
-                            pkg.status = "applied"
-                            pkg.applied_at = now
-                        guest.status = "up-to-date"
-                        db.session.commit()
+                        # Re-read what is still upgradable: a zero exit does not
+                        # mean every pending package was actually installed.
+                        recheck_out, _, recheck_code = ssh.execute_sudo(
+                            APT_LIST_CMD, timeout=120
+                        )
+                        _reconcile_applied_updates(
+                            guest, recheck_out if recheck_code == 0 else None
+                        )
                         try:
                             check_reboot_required(guest)
                         except Exception:
@@ -2696,14 +2743,18 @@ def apply_updates(guest, dist_upgrade=False):
                     break
             if node:
                 client.exec_guest_agent(node, guest.vmid, "apt-get update -qq")
-                stdout, err = client.exec_guest_agent(node, guest.vmid, cmd)
+                # The agent runs argv directly, so an env-var prefix ('VAR=x cmd')
+                # is not a program name — wrap it in a shell like _execute_command.
+                stdout, err = client.exec_guest_agent(
+                    node, guest.vmid, f"sh -c {shlex.quote(cmd)}"
+                )
                 if err is None:
-                    now = datetime.now(timezone.utc)
-                    for pkg in guest.pending_updates():
-                        pkg.status = "applied"
-                        pkg.applied_at = now
-                    guest.status = "up-to-date"
-                    db.session.commit()
+                    recheck_out, recheck_err = client.exec_guest_agent(
+                        node, guest.vmid, "apt list --upgradable"
+                    )
+                    _reconcile_applied_updates(
+                        guest, recheck_out if recheck_err is None else None
+                    )
                     try:
                         check_reboot_required(guest)
                     except Exception:
