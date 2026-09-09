@@ -217,6 +217,7 @@ class TestInitScheduler:
             "revoked_token_prune",
             "moderation_check",
             "update_history_purge",
+            "ai_upgrade_analysis",
         }
         assert expected_ids == registered_ids
 
