@@ -39,6 +39,41 @@ def _delete_test_guest(app, guest_id):
             db.session.commit()
 
 
+
+
+class TestAdminTagBypass:
+    """A level-3 admin without tags may act on any guest via the AI, matching
+    the UI (may_access_guest), not just super_admin."""
+
+    def test_admin_without_tags_can_list_and_read_guests(self, app):
+        from core.ai_tools import execute_tool
+        guest_id = _create_test_guest(app, name="ai-admin3-guest")
+        try:
+            with app.app_context():
+                role = Role.query.filter_by(name="_ai-admin3").first()
+                if not role:
+                    role = Role(name="_ai-admin3", display_name="AI Admin3", level=3,
+                                is_builtin=False, can_use_ai=True,
+                                can_view_services=True, can_edit_services=True)
+                    db.session.add(role)
+                    db.session.commit()
+                u = User.query.filter_by(username="_ai-admin3").first()
+                if not u:
+                    u = User(username="_ai-admin3", display_name="AI Admin3", role_id=role.id)
+                    u.set_password("test-only-dummy")
+                    db.session.add(u)
+                    db.session.commit()
+                user = User.query.options(db.joinedload(User.role_obj)).get(u.id)
+                assert user.is_admin and not user.is_super_admin
+                assert list(user.allowed_tags) == []
+                listed = json.loads(execute_tool("list_guests", {}, user))
+                assert "ai-admin3-guest" in [g["name"] for g in listed]
+                details = json.loads(execute_tool("get_guest_details", {"guest_id": guest_id}, user))
+                assert details["name"] == "ai-admin3-guest"
+        finally:
+            _delete_test_guest(app, guest_id)
+
+
 # ---------------------------------------------------------------------------
 # Tool filtering tests
 # ---------------------------------------------------------------------------

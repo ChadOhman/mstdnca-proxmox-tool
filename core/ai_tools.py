@@ -40,7 +40,9 @@ def _serialize_service(svc):
 # ---- Tool handler functions ----
 
 def _handle_list_guests(tool_input, user):
-    guests = user.accessible_guests()
+    from models import Guest
+    # Match the UI: admin-tier roles see every guest, others their tagged guests.
+    guests = Guest.query.filter_by(enabled=True).all() if user.is_admin else user.accessible_guests()
     return json.dumps([_serialize_guest(g) for g in guests])
 
 
@@ -49,7 +51,7 @@ def _handle_get_guest_details(tool_input, user):
     guest = Guest.query.get(tool_input["guest_id"])
     if not guest:
         return json.dumps({"error": "Guest not found"})
-    if not user.can_access_guest(guest):
+    if not user.may_access_guest(guest):
         return json.dumps({"error": "Access denied"})
     data = _serialize_guest(guest)
     # Add update details
@@ -72,7 +74,7 @@ def _handle_get_guest_updates(tool_input, user):
     guest = Guest.query.get(tool_input["guest_id"])
     if not guest:
         return json.dumps({"error": "Guest not found"})
-    if not user.can_access_guest(guest):
+    if not user.may_access_guest(guest):
         return json.dumps({"error": "Access denied"})
     updates = [
         {
@@ -92,7 +94,7 @@ def _handle_list_services(tool_input, user):
     services = GuestService.query.all()
     result = []
     for svc in services:
-        if svc.guest and user.can_access_guest(svc.guest):
+        if svc.guest and user.may_access_guest(svc.guest):
             entry = _serialize_service(svc)
             entry["guest_name"] = svc.guest.name if svc.guest else None
             result.append(entry)
@@ -107,7 +109,7 @@ def _handle_restart_service(tool_input, user):
     if not svc:
         return json.dumps({"error": "Service not found"})
     guest = svc.guest
-    if not guest or not user.can_access_guest(guest):
+    if not guest or not user.may_access_guest(guest):
         return json.dumps({"error": "Access denied"})
 
     action = tool_input.get("action", "restart")
