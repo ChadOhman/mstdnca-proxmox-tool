@@ -32,14 +32,15 @@ def _get_trusted_networks():
     """Parse trusted subnets from settings into a list of IPv4/IPv6 networks."""
     raw = Setting.get("trusted_subnets", DEFAULT_TRUSTED_SUBNETS)
     networks = []
-    for entry in raw.split(","):
+    for position, entry in enumerate(raw.split(","), start=1):
         entry = entry.strip()
         if not entry:
             continue
         try:
             networks.append(ipaddress.ip_network(entry, strict=False))
         except ValueError:
-            logger.warning(f"Invalid trusted subnet: {entry}")
+            # The value itself is deliberately not logged; it is visible in Settings.
+            logger.warning("Ignoring invalid trusted subnet entry #%d (check Settings > Trusted subnets)", position)
     return networks
 
 

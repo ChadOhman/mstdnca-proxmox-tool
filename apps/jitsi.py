@@ -190,8 +190,8 @@ def _require_valid_hostname(config):
         return "Jitsi hostname not configured"
     try:
         _validate_hostname(hostname, "Jitsi hostname")
-    except ValueError as e:
-        return str(e)
+    except ValueError:
+        return "Jitsi hostname setting is not a valid hostname (fix it in Settings)"
     return None
 
 

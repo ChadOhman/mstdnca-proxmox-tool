@@ -498,8 +498,8 @@ def follow_account():
     try:
         _validate_shell_param(user, "Mastodon user")
         _validate_shell_param(app_dir, "Mastodon app_dir")
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+    except ValueError:
+        return jsonify({"error": "Mastodon user or app directory setting is not shell-safe; fix it in Settings."}), 400
 
     command = (
         f"su - {user} -c '{_RBENV_PATH}; cd {app_dir} && "

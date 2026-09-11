@@ -519,7 +519,10 @@ def _write_initial_admin_password(password):
     The file is created with ``O_CREAT | O_EXCL | O_WRONLY`` so the mode is
     applied atomically at creation rather than after a umask-widened open, and
     so an existing path (including a symlink planted by another user) is never
-    followed.  Returns None when the file could not be written.
+    followed.  Returns True on success, False when the file could not be
+    written.  (The path itself comes from initial_admin_password_path(); it is
+    deliberately not returned from here so nothing derived from the password
+    argument ends up in the startup banner that gets logged.)
     """
     path = initial_admin_password_path()
     try:
@@ -532,10 +535,10 @@ def _write_initial_admin_password(password):
             os.write(fd, (password + "\n").encode("utf-8"))
         finally:
             os.close(fd)
-        return path
+        return True
     except OSError:
         logger.warning("Could not write the initial admin password file at %s", path, exc_info=True)
-        return None
+        return False
 
 
 def _ensure_default_admin():
@@ -562,8 +565,8 @@ def _ensure_default_admin():
         admin.must_change_password = True
         db.session.add(admin)
         db.session.commit()
-        path = _write_initial_admin_password(default_password)
-        location = path or "(could not be written -- reset the password manually)"
+        written = _write_initial_admin_password(default_password)
+        location = initial_admin_password_path() if written else "(could not be written -- reset the password manually)"
         banner = (
             "=" * 60
             + "\n  DEFAULT ADMIN ACCOUNT CREATED"
