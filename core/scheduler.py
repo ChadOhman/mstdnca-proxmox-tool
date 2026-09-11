@@ -641,7 +641,7 @@ def _run_discovery(app):
                             reuse_reason = f"type changed {existing.guest_type} -> {g['type']}"
                             existing.guest_type = g["type"]
                         elif mac and existing.mac_address and mac.lower() != existing.mac_address.lower():
-                            reuse_reason = f"MAC changed {existing.mac_address} -> {mac}"
+                            reuse_reason = "MAC address changed"
 
                         if reuse_reason:
                             existing.clear_stale_data()

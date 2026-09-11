@@ -107,8 +107,8 @@ def _validate_recording_dir(recording_dir):
     """
     try:
         _validate_abs_path(recording_dir, "Jibri recording directory")
-    except ValueError as e:
-        return str(e)
+    except ValueError:
+        return "Jibri recording directory must be a plain absolute path (fix it in Settings)"
     return None
 
 

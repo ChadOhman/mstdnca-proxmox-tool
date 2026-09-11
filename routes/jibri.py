@@ -478,10 +478,11 @@ def recordings_list():
 
     recordings, error = list_recordings()
     # Sanitize error to avoid exposing internal details (stack traces, paths)
+    public_error = None
     if error:
         logger.warning("Recordings list error: %s", error)
-        error = "Could not retrieve recordings. Check the operation log for details."
-    return jsonify({"recordings": recordings, "error": error})
+        public_error = "Could not retrieve recordings. Check the operation log for details."
+    return jsonify({"recordings": recordings, "error": public_error})
 
 
 @bp.route("/recordings/delete", methods=["POST"])
