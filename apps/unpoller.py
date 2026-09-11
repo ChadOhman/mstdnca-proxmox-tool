@@ -251,7 +251,7 @@ def run_unpoller_install(log_callback=None):
     # Validate UniFi controller settings
     unifi_url = config.get("unifi_url", "")
     unifi_user = config.get("unifi_user", "")
-    unifi_pass = config.get("unifi_pass", "")
+    unifi_pass = _get_unifi_password()
     if not unifi_url or not unifi_user or not unifi_pass:
         _log("ERROR: UniFi controller URL, username, and password are required.")
         _log("Configure them in Settings > UniFi Controller.")
@@ -333,7 +333,7 @@ def run_unpoller_install(log_callback=None):
             # Generate config — written atomically with its final mode/ownership so
             # the UniFi credentials it contains are never briefly world-readable.
             _log("Generating unpoller config...")
-            conf = _generate_unpoller_config(config)
+            conf = _generate_unpoller_config(config, unifi_pass)
             ok, err = _write_remote_file(ssh, conf, "/etc/unpoller/up.conf", mode="640", owner="root", group="unpoller")
             if not ok:
                 _log(f"ERROR: Failed to write config: {err[:200]}")
@@ -577,7 +577,7 @@ def run_unpoller_preflight(log_callback=None):
 
     unifi_url = config.get("unifi_url", "")
     unifi_user = config.get("unifi_user", "")
-    unifi_pass = config.get("unifi_pass", "")
+    unifi_pass = _get_unifi_password()
     check("UniFi controller URL configured", bool(unifi_url), "set it in Settings > UniFi Controller")
     check("UniFi username configured", bool(unifi_user), "set it in Settings > UniFi Controller")
     check("UniFi password configured", bool(unifi_pass), "set it in Settings > UniFi Controller")
@@ -760,10 +760,11 @@ def run_unpoller_reconfig(log_callback=None):
         return False, log_lines
 
     _log("Regenerating unpoller config...")
+    unifi_pass = _get_unifi_password()
 
     try:
         with SSHClient.from_credential(guest.ip_address, credential) as ssh:
-            conf = _generate_unpoller_config(config)
+            conf = _generate_unpoller_config(config, unifi_pass)
             ok, err = _write_remote_file(ssh, conf, "/etc/unpoller/up.conf", mode="640", owner="root", group="unpoller")
             if not ok:
                 _log(f"ERROR: Failed to write config: {err[:200]}")
@@ -790,12 +791,16 @@ def run_unpoller_reconfig(log_callback=None):
 # ---------------------------------------------------------------------------
 
 def _get_config():
-    """Read all relevant settings into a dict."""
+    """Read all relevant settings into a dict.
+
+    The UniFi password is deliberately *not* included: values from this dict
+    are echoed into operation logs, so callers fetch the password separately
+    via _get_unifi_password() only where it is needed.
+    """
     return {
         "guest_id": Setting.get("prometheus_guest_id", ""),
         "unifi_url": Setting.get("unifi_base_url", ""),
         "unifi_user": Setting.get("unifi_username", ""),
-        "unifi_pass": _get_unifi_password(),
         "unifi_site": Setting.get("unpoller_site_name", "default"),
         "metric_prefix": Setting.get("unpoller_metric_prefix", "unpoller"),
         "listen_port": Setting.get("unpoller_listen_port", str(DEFAULT_PORT)),
@@ -841,11 +846,14 @@ def _toml_escape(value):
     return text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
 
 
-def _generate_unpoller_config(config):
-    """Generate the unpoller up.conf TOML config file."""
+def _generate_unpoller_config(config, unifi_pass):
+    """Generate the unpoller up.conf TOML config file.
+
+    *unifi_pass* is passed separately from *config* so the plaintext password
+    never sits in the dict whose values are written to operation logs.
+    """
     unifi_url = config.get("unifi_url", "")
     unifi_user = config.get("unifi_user", "")
-    unifi_pass = config.get("unifi_pass", "")
     site = config.get("unifi_site", "default")
     prefix = config.get("metric_prefix", "unpoller")
     port = config.get("listen_port", str(DEFAULT_PORT))

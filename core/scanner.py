@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from clients.proxmox_api import ProxmoxClient
 from clients.ssh_client import SSHClient
+from core.errors import describe_exception
 from models import Guest, GuestService, ScanResult, UpdatePackage, db
 
 logger = logging.getLogger(__name__)
@@ -630,7 +631,8 @@ def _execute_on_guest(guest):
                         return None, None, f"SSH apt list failed: {stderr}"
             except Exception as e:
                 if guest.connection_method == "ssh":
-                    return None, None, f"SSH failed: {e}"
+                    logger.warning(f"SSH failed for {guest.name}: {e}")
+                    return None, None, f"SSH failed: {describe_exception(e)}"
                 logger.debug(f"SSH failed for {guest.name}, trying agent: {e}")
 
     # Try QEMU guest agent
@@ -658,7 +660,8 @@ def _execute_on_guest(guest):
                 return None, None, f"Agent exec failed: {err}"
             return None, None, f"Could not find VM {guest.vmid} on any node"
         except Exception as e:
-            return None, None, f"Agent failed: {e}"
+            logger.warning(f"Guest agent failed for {guest.name}: {e}")
+            return None, None, f"Agent failed: {describe_exception(e)}"
 
     return None, None, "No viable connection method available"
 
@@ -687,7 +690,8 @@ def _execute_command(guest, command, timeout=60, sudo=False):
                         return stdout, stderr or f"Exit code {code}"
             except Exception as e:
                 if guest.connection_method == "ssh":
-                    return None, f"SSH failed: {e}"
+                    logger.warning(f"SSH failed for {guest.name}: {e}")
+                    return None, f"SSH failed: {describe_exception(e)}"
                 logger.debug(f"SSH failed for {guest.name}, trying agent: {e}")
 
     if guest.connection_method in ("agent", "auto") and guest.proxmox_host and guest.guest_type == "vm":
@@ -700,7 +704,8 @@ def _execute_command(guest, command, timeout=60, sudo=False):
                 return stdout, err
             return None, f"Could not find VM {guest.vmid} on any node"
         except Exception as e:
-            return None, f"Agent failed: {e}"
+            logger.warning(f"Guest agent failed for {guest.name}: {e}")
+            return None, f"Agent failed: {describe_exception(e)}"
 
     return None, "No viable connection method available"
 
@@ -868,8 +873,8 @@ def service_action(guest, service, action):
 
     try:
         unit = _safe_unit_name(service.unit_name)
-    except ValueError as e:
-        return False, str(e)
+    except ValueError:
+        return False, "Invalid systemd unit name"
 
     cmd = f"systemctl {action} {unit}"
     stdout, error = _execute_command(guest, cmd, timeout=30, sudo=True)
@@ -899,8 +904,8 @@ def get_service_logs(guest, service, lines=50):
     """Fetch recent journal logs for a service. Returns log text."""
     try:
         unit = _safe_unit_name(service.unit_name)
-    except ValueError as e:
-        return f"Error: {e}"
+    except ValueError:
+        return "Error: invalid systemd unit name"
     lines = int(lines)
     cmd = f"journalctl -u {unit} -n {lines} --no-pager 2>/dev/null"
     stdout, error = _execute_command(guest, cmd, timeout=30)
@@ -1023,7 +1028,7 @@ def get_service_stats(guest, service):
             stats.update(_stats_prometheus(guest, service))
     except Exception as e:
         logger.error(f"Error collecting {stype} stats for {guest.name}: {e}")
-        stats["error"] = str(e)
+        stats["error"] = describe_exception(e)
 
     return stats
 
@@ -2405,6 +2410,9 @@ _LANG_CODE_RE = re.compile(r'^[a-z]{2,8}$')
 def _lt_run(guest, script_bytes, timeout=60):
     """Base64-encode a script and run it via SSH using system python3.
 
+    Returns ``(data, error)``: *data* is the JSON object the script printed,
+    *error* a user-safe message (the raw output is logged, never returned).
+
     argostranslate discovery is handled inside the script itself via
     _LT_PATH_SETUP (broad glob + find fallback).
     """
@@ -2412,35 +2420,41 @@ def _lt_run(guest, script_bytes, timeout=60):
     cmd = f"python3 -c 'import base64;exec(base64.b64decode(\"{_py_b64}\").decode())' 2>/dev/null"
     out, err = _execute_command(guest, cmd, timeout=timeout)
     if err and not out:
-        raise RuntimeError(err)
+        return None, err
     # Parse the last JSON object line — guards against any progress text printed
     # to stdout by argostranslate during package installs.
     lines = [line for line in (out or "").strip().splitlines() if line.strip().startswith("{")]
     if not lines:
-        raise RuntimeError(f"No JSON output from script; stdout={out!r}")
-    return json.loads(lines[-1])
+        logger.warning(f"LibreTranslate script on {guest.name} produced no JSON output: {out!r}")
+        return None, "No JSON output from script"
+    try:
+        data = json.loads(lines[-1])
+    except ValueError as e:
+        logger.warning(f"LibreTranslate script on {guest.name} produced invalid JSON: {e}")
+        return None, "Script output was not valid JSON"
+    if not isinstance(data, dict):
+        return None, "Script output was not a JSON object"
+    return data, None
 
 
 def lt_list_installed(guest, service):
     """List installed LibreTranslate language packages. Returns (packages, error)."""
-    try:
-        data = _lt_run(guest, _LT_LIST_INSTALLED_SCRIPT, timeout=30)
-        if "error" in data:
-            return [], data["error"]
-        return data.get("packages", []), None
-    except Exception as e:
-        return [], str(e)
+    data, err = _lt_run(guest, _LT_LIST_INSTALLED_SCRIPT, timeout=30)
+    if err:
+        return [], err
+    if "error" in data:
+        return [], data["error"]
+    return data.get("packages", []), None
 
 
 def lt_list_available(guest, service):
     """Fetch available LibreTranslate packages from the Argos index. Returns (packages, error)."""
-    try:
-        data = _lt_run(guest, _LT_LIST_AVAILABLE_SCRIPT, timeout=60)
-        if "error" in data:
-            return [], data["error"]
-        return data.get("packages", []), None
-    except Exception as e:
-        return [], str(e)
+    data, err = _lt_run(guest, _LT_LIST_AVAILABLE_SCRIPT, timeout=60)
+    if err:
+        return [], err
+    if "error" in data:
+        return [], data["error"]
+    return data.get("packages", []), None
 
 
 def lt_install_package(guest, service, from_code, to_code):
@@ -2450,20 +2464,18 @@ def lt_install_package(guest, service, from_code, to_code):
     script = _LT_INSTALL_PACKAGE_SCRIPT_TPL
     script = script.replace(b"__FROM__", from_code.encode())
     script = script.replace(b"__TO__", to_code.encode())
-    try:
-        data = _lt_run(guest, script, timeout=300)
-        return data.get("ok", False), data.get("message", "Unknown error")
-    except Exception as e:
-        return False, str(e)
+    data, err = _lt_run(guest, script, timeout=300)
+    if err:
+        return False, err
+    return data.get("ok", False), data.get("message", "Unknown error")
 
 
 def lt_update_all_packages(guest, service):
     """Re-install the latest version of every installed language package. Returns (ok, message, count)."""
-    try:
-        data = _lt_run(guest, _LT_UPDATE_ALL_SCRIPT, timeout=600)
-        return data.get("ok", False), data.get("message", "Unknown error"), data.get("updated", 0)
-    except Exception as e:
-        return False, str(e), 0
+    data, err = _lt_run(guest, _LT_UPDATE_ALL_SCRIPT, timeout=600)
+    if err:
+        return False, err, 0
+    return data.get("ok", False), data.get("message", "Unknown error"), data.get("updated", 0)
 
 
 def lt_update_packages_stream(guest, service, line_callback):
@@ -2503,8 +2515,9 @@ def lt_update_packages_stream(guest, service, line_callback):
         if buf.strip().startswith("{"):
             line_callback(buf.strip())
     except Exception as e:
+        logger.warning(f"LibreTranslate update stream failed for {guest.name}: {e}")
         line_callback(json.dumps({"type": "result", "ok": False, "updated": 0,
-                                  "message": f"SSH error: {e}"}))
+                                  "message": f"SSH error: {describe_exception(e)}"}))
 
 
 def check_reboot_required(guest):

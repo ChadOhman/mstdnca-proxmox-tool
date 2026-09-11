@@ -15,6 +15,7 @@ from flask_login import current_user, login_required
 
 from apps.utils import _validate_http_url, _validate_no_control_chars
 from auth.audit import log_action
+from core.errors import describe_exception
 from models import ExporterInstance, Guest, HostExporterInstance, ProxmoxHost, Setting, Tag, db
 
 # Longest value accepted for an exporter environment variable (DSNs and URIs).
@@ -266,7 +267,8 @@ def test_connection():
             return jsonify({"ok": True, "message": "Connection successful"})
         return jsonify({"ok": False, "error": "Prometheus is not reachable"})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+        logger.warning("Prometheus connection test failed: %s", e)
+        return jsonify({"ok": False, "error": describe_exception(e)})
 
 
 @bp.route("/detect-versions", methods=["POST"])

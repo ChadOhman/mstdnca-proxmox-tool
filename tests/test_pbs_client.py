@@ -197,10 +197,11 @@ class TestPost:
     def test_post_request_exception(self):
         client = _password_client()
         client._logged_in = True
-        with patch.object(client.session, "post", side_effect=requests.RequestException("timed out")):
+        with patch.object(client.session, "post", side_effect=requests.Timeout("HTTPSConnectionPool(...) timed out")):
             ok, data = client._post("/admin/datastore/store1/gc")
         assert ok is False
-        assert data == "timed out"
+        # Described by exception type; the raw requests text (URL, pool) must not leak.
+        assert data == "request timed out"
 
 
 class TestTaskStatusUrlQuoting:

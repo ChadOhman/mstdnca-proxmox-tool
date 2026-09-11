@@ -1,4 +1,5 @@
 """Tests for Jitsi Meet install/upgrade routes and scheduler integration."""
+import re
 import sys
 from unittest.mock import MagicMock
 
@@ -1102,7 +1103,7 @@ class TestSecureDomainPatchProsody:
         written_cmd = write_call[0][0]
         assert "base64" in written_cmd
         assert any("internal_hashed" in msg for msg in logs)
-        assert any("guest.meet.example.com" in msg for msg in logs)
+        assert any(re.search(r"\bguest\.meet\.example\.com\b", msg) for msg in logs)
 
     def test_enable_idempotent(self):
         from apps.jitsi import _sd_patch_prosody

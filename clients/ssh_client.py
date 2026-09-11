@@ -6,6 +6,7 @@ import time
 import paramiko
 
 from auth.credential_store import decrypt
+from core.errors import describe_exception
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +243,7 @@ class SSHClient:
             return out_text, err_text, channel.recv_exit_status()
         except Exception as e:
             logger.error(f"SSH command failed on {self.hostname}: {e}")
-            return "", str(e), -1
+            return "", f"SSH command failed: {describe_exception(e)}", -1
 
     def execute_sudo(self, command, timeout=120):
         """Execute a command with sudo wrapping if needed."""
@@ -278,7 +279,7 @@ class SSHClient:
             return channel.recv_exit_status()
         except Exception as e:
             logger.error(f"SSH streaming command failed on {self.hostname}: {e}")
-            callback(f"\n[SSH Error: {e}]\n")
+            callback(f"\n[SSH Error: {describe_exception(e)}]\n")
             return -1
 
     def execute_sudo_streaming(self, command, callback, timeout=600, stop_fn=None):
@@ -309,4 +310,5 @@ class SSHClient:
                 return True, "SSH connection successful"
             return False, stderr or "Unexpected output"
         except Exception as e:
-            return False, str(e)
+            logger.warning(f"SSH connection test failed on {self.hostname}: {e}")
+            return False, describe_exception(e)
