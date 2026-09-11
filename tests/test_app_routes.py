@@ -118,7 +118,7 @@ class TestSecurityHeaders:
     def test_csp_script_src_includes_cdn(self, client):
         headers = self._get_headers(client)
         csp = headers.get("Content-Security-Policy", "")
-        assert "https://cdn.jsdelivr.net" in csp
+        assert any(token == "https://cdn.jsdelivr.net" for token in csp.replace(";", " ").split())
 
     def test_csp_object_src_none(self, client):
         headers = self._get_headers(client)

@@ -11,6 +11,8 @@ from flask_login import current_user, login_required
 from sqlalchemy import func
 
 from auth.audit import log_action
+from core.errors import describe_exception
+from core.local_redirect import resolve_local_url
 from core.scanner import (
     check_service_statuses,
     get_service_logs,
@@ -175,11 +177,10 @@ def refresh_all():
 
     referrer = request.referrer
     if referrer and "/guests/" in referrer:
-        from urllib.parse import urlparse
-        parsed = urlparse(referrer)
-        # Only redirect to same-host paths to prevent open redirect
-        if not parsed.netloc or parsed.netloc == request.host:
-            return redirect(parsed.path)
+        # Resolved against our own URL map, so the redirect can only land on a route of this app.
+        target = resolve_local_url(referrer)
+        if target:
+            return redirect(target)
     return redirect(url_for("services.index"))
 
 
@@ -1287,8 +1288,9 @@ def lt_update_stream(service_id):
                     msg_queue.put(json.dumps({"type": "result", "ok": False,
                                              "updated": 0, "message": "Service not found"}))
         except Exception as exc:
+            logger.warning("LibreTranslate package update stream failed for service %s: %s", svc_id, exc)
             msg_queue.put(json.dumps({"type": "result", "ok": False,
-                                     "updated": 0, "message": str(exc)}))
+                                     "updated": 0, "message": describe_exception(exc)}))
         finally:
             msg_queue.put(None)  # sentinel — always sent so generator never blocks forever
 

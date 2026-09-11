@@ -24,6 +24,7 @@ from apps.utils import (
 )
 from clients.proxmox_api import ProxmoxClient
 from clients.ssh_client import SSHClient
+from core.errors import describe_exception
 from models import Guest, Setting
 
 logger = logging.getLogger(__name__)
@@ -2070,7 +2071,8 @@ def _sd_get_ssh(config=None):
         ssh = SSHClient.from_credential(guest.ip_address, credential)
         return ssh, guest, None
     except Exception as e:
-        return None, None, str(e)
+        logger.warning(f"Could not open SSH session to Jitsi guest {guest.name}: {e}")
+        return None, None, f"SSH connection failed: {describe_exception(e)}"
 
 
 def sd_list_users():
@@ -2102,7 +2104,8 @@ def sd_list_users():
             users = [f.replace(".dat", "") for f in stdout.strip().split("\n") if f.strip().endswith(".dat")]
             return users, None
     except Exception as e:
-        return [], str(e)
+        logger.warning(f"Listing Prosody users on {guest.name} failed: {e}")
+        return [], describe_exception(e)
 
 
 def sd_add_user(username, password):
@@ -2146,7 +2149,8 @@ def sd_add_user(username, password):
                 return False, f"Failed to register user: {err_msg}"
             return True, f"User '{username}' registered successfully"
     except Exception as e:
-        return False, str(e)
+        logger.warning(f"Registering Prosody user on {guest.name} failed: {e}")
+        return False, describe_exception(e)
 
 
 def sd_remove_user(username):
@@ -2183,4 +2187,5 @@ def sd_remove_user(username):
                 return False, f"Failed to delete user: {err_msg}"
             return True, f"User '{username}' deleted successfully"
     except Exception as e:
-        return False, str(e)
+        logger.warning(f"Deleting Prosody user on {guest.name} failed: {e}")
+        return False, describe_exception(e)

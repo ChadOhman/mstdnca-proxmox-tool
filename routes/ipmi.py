@@ -7,6 +7,8 @@ from flask_login import current_user, login_required
 
 from auth.audit import log_action
 from auth.credential_store import decrypt, encrypt
+from core.errors import describe_exception
+from core.local_redirect import redirect_back
 from models import HostMetricSnapshot, ProxmoxHost, Setting, db
 
 logger = logging.getLogger(__name__)
@@ -148,7 +150,7 @@ def test_connection(host_id):
     with _redfish_session(host) as client:
         if not client:
             flash("IPMI is not configured for this host.", "error")
-            return redirect(request.referrer or url_for("ipmi.index"))
+            return redirect_back("ipmi.index")
 
         ok, msg = client.test_connection()
 
@@ -157,7 +159,7 @@ def test_connection(host_id):
     else:
         flash(f"IPMI connection to {host.name} failed: {msg}", "error")
 
-    return redirect(request.referrer or url_for("ipmi.index"))
+    return redirect_back("ipmi.index")
 
 
 @bp.route("/host/<int:host_id>/sel")
@@ -261,7 +263,8 @@ def prom_debug(host_id):
             metrics.setdefault(name, []).append({"labels": labels, "value": value})
         return jsonify({"target": target, "metrics": metrics})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        logger.warning("IPMI metrics query failed for host %s: %s", host_id, e)
+        return jsonify({"error": describe_exception(e)})
 
 
 @bp.route("/host/<int:host_id>/configure", methods=["POST"])
@@ -287,4 +290,4 @@ def configure(host_id):
     db.session.commit()
 
     flash(f"IPMI configuration updated for {host.name}.", "success")
-    return redirect(request.referrer or url_for("ipmi.detail", host_id=host_id))
+    return redirect_back("ipmi.detail", host_id=host_id)

@@ -24,6 +24,14 @@ All `confirm()` dialogs use Bootstrap modal (`#confirmModal` in `base.html`). Fo
 
 `== True` comparisons are intentional (E712 is ignored in ruff) — required by SQLAlchemy filter syntax.
 
+## User-Facing Error Messages
+
+Never return `str(e)` / `f"...{e}"` from a caught exception to a route (JSON, flash, streamed log). Log the exception server-side and return `describe_exception(e)` from `core.errors` — a message derived from the exception *type* only. CodeQL flags exception text reaching an HTTP response as stack-trace exposure.
+
+## Redirects Back to the Referrer
+
+Never `redirect(request.referrer)` or `redirect(request.args["next"])`. Use `redirect_back("endpoint", **values)` / `resolve_local_url(target)` from `core.local_redirect`: the target is matched against the app's URL map and rebuilt with `url_for`, so it can only land on a route of this app.
+
 ## Import Conventions
 
 Core modules (`models`, `config`) are at root. Everything else uses package imports:

@@ -30,12 +30,11 @@ class TestUnpollerConfig:
         config = {
             "unifi_url": "https://10.0.0.1",
             "unifi_user": "admin",
-            "unifi_pass": "test-only-secret",
             "unifi_site": "default",
             "metric_prefix": "unpoller",
             "listen_port": "9130",
         }
-        result = _generate_unpoller_config(config)
+        result = _generate_unpoller_config(config, "test-only-secret")
         assert 'url = "https://10.0.0.1"' in result
         assert 'user = "admin"' in result
         assert 'pass = "test-only-secret"' in result
@@ -49,12 +48,11 @@ class TestUnpollerConfig:
         config = {
             "unifi_url": "10.0.0.1",
             "unifi_user": "admin",
-            "unifi_pass": "pw",
             "unifi_site": "default",
             "metric_prefix": "unpoller",
             "listen_port": "9130",
         }
-        result = _generate_unpoller_config(config)
+        result = _generate_unpoller_config(config, "pw")
         assert 'url = "https://10.0.0.1"' in result
 
     def test_generate_systemd_unit(self, app):
@@ -87,11 +85,11 @@ class TestUnpollerConfig:
 
         with app.app_context():
             config = {
-                "unifi_url": "https://10.0.0.1", "unifi_user": "admin", "unifi_pass": "test-only-unifi-pass",
+                "unifi_url": "https://10.0.0.1", "unifi_user": "admin",
                 "unifi_site": "default", "metric_prefix": "unpoller", "listen_port": "9130",
                 "verify_ssl": False,
             }
-            result = _generate_unpoller_config(config)
+            result = _generate_unpoller_config(config, "test-only-unifi-pass")
             assert "verify_ssl = false" in result
 
     def test_verify_ssl_true_when_setting_enabled(self, app):
@@ -99,11 +97,11 @@ class TestUnpollerConfig:
 
         with app.app_context():
             config = {
-                "unifi_url": "https://10.0.0.1", "unifi_user": "admin", "unifi_pass": "test-only-unifi-pass",
+                "unifi_url": "https://10.0.0.1", "unifi_user": "admin",
                 "unifi_site": "default", "metric_prefix": "unpoller", "listen_port": "9130",
                 "verify_ssl": True,
             }
-            result = _generate_unpoller_config(config)
+            result = _generate_unpoller_config(config, "test-only-unifi-pass")
             assert "verify_ssl = true" in result
 
     def test_toml_escape_quote_and_newline(self, app):
@@ -123,13 +121,12 @@ class TestUnpollerConfig:
             config = {
                 "unifi_url": "https://10.0.0.1",
                 "unifi_user": "admin",
-                "unifi_pass": 'wei"rd\npass\r\nword',
                 "unifi_site": "default",
                 "metric_prefix": "unpoller",
                 "listen_port": "9130",
                 "verify_ssl": False,
             }
-            result = _generate_unpoller_config(config)
+            result = _generate_unpoller_config(config, 'wei"rd\npass\r\nword')
             parsed = tomllib.loads(result)
             controller = parsed["unifi"]["controller"][0]
             assert controller["pass"] == 'wei"rd\npass\r\nword'
@@ -158,7 +155,7 @@ class TestUnpollerGetConfig:
             # save flow) may leave it toggled on in this session-scoped DB.
 
     def test_get_config_reads_settings(self, app):
-        from apps.unpoller import _get_config
+        from apps.unpoller import _get_config, _get_unifi_password
 
         with app.app_context():
             Setting.set("prometheus_guest_id", "42")
@@ -173,30 +170,30 @@ class TestUnpollerGetConfig:
             assert config["guest_id"] == "42"
             assert config["unifi_url"] == "https://udm.local"
             assert config["unifi_user"] == "testuser"
-            # Decrypted plaintext must reach up.conf, not the ciphertext.
-            assert config["unifi_pass"] == "test-only-testpass"
+            # The password is fetched separately so it never sits in the (logged)
+            # config dict; the decrypted plaintext must reach up.conf, not the ciphertext.
+            assert "unifi_pass" not in config
+            assert _get_unifi_password() == "test-only-testpass"
             assert config["unifi_site"] == "mysite"
 
-    def test_get_config_password_unset(self, app):
-        from apps.unpoller import _get_config
+    def test_get_unifi_password_unset(self, app):
+        from apps.unpoller import _get_unifi_password
 
         with app.app_context():
             # A blank/unset password yields an empty string, not a crash.
             # (Session-scoped DB is shared, so set it explicitly.)
             Setting.set("unifi_password", "")
             db.session.commit()
-            config = _get_config()
-            assert config["unifi_pass"] == ""
+            assert _get_unifi_password() == ""
 
-    def test_get_config_corrupt_password_falls_back(self, app):
-        from apps.unpoller import _get_config
+    def test_get_unifi_password_corrupt_falls_back(self, app):
+        from apps.unpoller import _get_unifi_password
 
         with app.app_context():
             # A non-Fernet / corrupt value must not crash install/reconfigure.
             Setting.set("unifi_password", "not-a-valid-fernet-token")
             db.session.commit()
-            config = _get_config()
-            assert config["unifi_pass"] == ""
+            assert _get_unifi_password() == ""
 
     def test_get_config_follows_unifi_verify_ssl_setting(self, app):
         """verify_ssl must track the app's existing UniFi verify-SSL setting (the

@@ -465,7 +465,9 @@ class TestExecute:
         out, err, code = client.execute("date")
 
         assert out == ""
-        assert "broken pipe" in err
+        assert err.startswith("SSH command failed")
+        # Raw exception text must not leak into a message that reaches the UI.
+        assert "broken pipe" not in err
         assert code == -1
 
     @patch("clients.ssh_client.paramiko.SSHClient")
@@ -881,13 +883,15 @@ class TestTestConnection:
     def test_failure_when_connect_raises(self, MockSSH):
         mock_raw = MagicMock()
         MockSSH.return_value = mock_raw
-        mock_raw.connect.side_effect = Exception("Connection refused")
+        mock_raw.connect.side_effect = ConnectionRefusedError("[Errno 111] Connection refused")
 
         client = _make_client(password="pw")
         ok, msg = client.test_connection()
 
         assert ok is False
-        assert "Connection refused" in msg
+        # Described by exception type, never by its raw text.
+        assert msg == "connection refused"
+        assert "Errno" not in msg
 
     @patch("clients.ssh_client.paramiko.SSHClient")
     def test_failure_when_stdout_does_not_contain_ok(self, MockSSH):

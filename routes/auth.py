@@ -5,7 +5,6 @@ import threading
 import time
 import zoneinfo
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
 
 from flask import Blueprint, current_app, flash, g, redirect, render_template, request, session, url_for
 from flask_login import current_user, login_required, login_user, logout_user
@@ -16,6 +15,7 @@ from auth.audit import log_action
 from auth.jwt_auth import credential_epoch
 from auth.local_network import _get_client_ip as _client_ip
 from auth.session_manager import SESSION_KEY, revoke_current_session, start_session
+from core.local_redirect import resolve_local_url
 from models import User, UserSession, db
 
 logger = logging.getLogger(__name__)
@@ -205,14 +205,6 @@ def _get_client_ip() -> str:
     return _client_ip() or "unknown"
 
 
-def _is_safe_next_url(target):
-    """Allow redirects only to local paths."""
-    if not target:
-        return False
-    parsed = urlparse(target)
-    return parsed.scheme == "" and parsed.netloc == "" and target.startswith("/")
-
-
 @bp.route("/login", methods=["GET", "POST"])
 def login():
     if current_user.is_authenticated:
@@ -242,10 +234,10 @@ def login():
             next_page = request.args.get("next")
             if user.must_change_password:
                 target = url_for("auth.change_password")
-            elif _is_safe_next_url(next_page):
-                target = next_page
             else:
-                target = url_for("dashboard.index")
+                # Resolved against our own URL map, so ?next= can only land on
+                # a route of this app (never another host or a //host URL).
+                target = resolve_local_url(next_page) or url_for("dashboard.index")
             response = redirect(target)
             if remember:
                 _set_remember_marker(response, user)

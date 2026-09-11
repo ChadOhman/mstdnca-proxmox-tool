@@ -5,6 +5,7 @@ import time
 from proxmoxer import ProxmoxAPI
 
 from auth.credential_store import decrypt
+from core.errors import describe_exception
 
 logger = logging.getLogger(__name__)
 
@@ -313,7 +314,8 @@ class ProxmoxClient:
 
             return None, "Timeout waiting for command"
         except Exception as e:
-            return None, str(e)
+            logger.warning("Guest agent exec failed for VM %s on %s: %s", vmid, node, e)
+            return None, f"Guest agent exec failed: {describe_exception(e)}"
 
     def exec_ct_command(self, node, vmid, command):
         """Execute a command inside a CT via Proxmox API (pct exec equivalent)."""
@@ -328,7 +330,8 @@ class ProxmoxClient:
             # Fallback: we'll use SSH to the Proxmox host and run pct exec
             return None, "CT exec via API requires SSH to Proxmox host - use SSH connection method instead"
         except Exception as e:
-            return None, str(e)
+            logger.warning("CT status lookup failed for CT %s on %s: %s", vmid, node, e)
+            return None, f"CT status lookup failed: {describe_exception(e)}"
 
     def get_guest_status(self, node, vmid, guest_type):
         """Get current power status of a guest. Returns status string or 'unknown'."""

@@ -23,6 +23,7 @@ from auth.audit import log_action
 from auth.credential_store import decrypt, encrypt
 from config import BASE_DIR, DATA_DIR
 from core.app_update_auth import github_auth_headers, github_token_env
+from core.errors import describe_exception
 from models import Setting, db
 
 logger = logging.getLogger(__name__)
@@ -602,7 +603,8 @@ def upload_geoip_db():
                     return _err("File too large (max 150 MB).")
                 out.write(chunk)
     except OSError as e:
-        return _err(f"Could not save file: {e}")
+        logger.error("GeoIP database upload could not be saved: %s", e)
+        return _err(f"Could not save file: {describe_exception(e)}")
 
     # Validate: try opening with geoip2 if available
     try:
@@ -616,7 +618,8 @@ def upload_geoip_db():
             os.remove(tmp_path)
         except OSError:
             pass
-        return _err(f"File does not appear to be a valid MaxMind database: {e}")
+        logger.warning("Uploaded GeoIP database failed validation: %s", e)
+        return _err("File does not appear to be a valid MaxMind database.")
 
     os.replace(tmp_path, dest_path)
 
@@ -669,7 +672,9 @@ def verify_geoip_db():
     except ImportError:
         return jsonify({"ok": True, "message": f"File exists ({size_mb} MB) — geoip2 library not installed, cannot validate contents.", "size_mb": size_mb, "path": db_path})
     except Exception as e:
-        return jsonify({"ok": False, "message": f"Invalid database: {e}", "size_mb": size_mb, "path": db_path})
+        logger.warning("GeoIP database at %s failed validation: %s", db_path, e)
+        return jsonify({"ok": False, "message": f"Invalid database: {describe_exception(e)}",
+                        "size_mb": size_mb, "path": db_path})
 
     msg = f"Valid {db_type} — {size_mb} MB"
     if test_result:

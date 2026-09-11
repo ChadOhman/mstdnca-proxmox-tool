@@ -64,11 +64,17 @@ class UniFiClient:
             logger.error("UniFi login error: %s", e)
             return False
 
-    def _api_get(self, path):
+    def _api_get(self, path, *path_params):
+        """GET *path* and return its ``data`` list (``None`` on failure).
+
+        *path_params* are appended to *path* as extra URL segments.  Only
+        *path* is written to log lines, so per-client identifiers such as MAC
+        addresses belong in *path_params* where they never reach the log.
+        """
         if not self._logged_in:
             if not self.login():
                 return None
-        url = f"{self.base_url}{self._prefix}{path}"
+        url = f"{self.base_url}{self._prefix}{path}" + "".join(f"/{p}" for p in path_params)
         try:
             resp = self.session.get(url, timeout=15)
             if resp.status_code == 401:
@@ -227,7 +233,7 @@ class UniFiClient:
 
     def get_client_by_mac(self, mac):
         """Fetch live stats for a single client by MAC address."""
-        raw = self._api_get(f"/api/s/{self.site}/stat/sta/{mac.lower()}")
+        raw = self._api_get(f"/api/s/{self.site}/stat/sta", mac.lower())
         if not raw:
             return None
         return self._parse_client(raw[0])

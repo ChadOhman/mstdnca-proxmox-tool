@@ -338,7 +338,8 @@ def create_app(test_config=None):
             from flask import abort
             abort(403)
         session["safety_mode"] = not session.get("safety_mode", False)
-        return redirect(request.referrer or "/")
+        from core.local_redirect import resolve_local_url
+        return redirect(resolve_local_url(request.referrer) or "/")
 
     @app.route("/health")
     def health_check():

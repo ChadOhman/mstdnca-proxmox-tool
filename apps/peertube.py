@@ -183,7 +183,12 @@ def check_peertube_release():
 # ---------------------------------------------------------------------------
 
 def _get_peertube_config():
-    """Read all PeerTube-related settings."""
+    """Read all PeerTube-related settings.
+
+    The database password is deliberately *not* included: values from this
+    dict are echoed into operation logs, so the (encrypted) password is read
+    separately, only where it is needed (see run_peertube_install).
+    """
     return {
         "guest_id": Setting.get("peertube_guest_id", ""),
         "db_guest_id": Setting.get("peertube_db_guest_id", ""),
@@ -192,7 +197,6 @@ def _get_peertube_config():
         "peertube_dir": Setting.get("peertube_dir", "/var/www/peertube"),
         "peertube_url": Setting.get("peertube_url", ""),
         "db_host": Setting.get("peertube_db_host", ""),
-        "db_password": Setting.get("peertube_db_password", ""),
         "current_version": Setting.get("peertube_current_version", ""),
         "latest_version": Setting.get("peertube_latest_version", ""),
         "protection_type": Setting.get("peertube_protection_type", "snapshot"),
@@ -341,7 +345,7 @@ def run_peertube_install(log_callback=None):
     db_name = config["db_name"]
     peertube_url = config.get("peertube_url", "")
     db_host = config.get("db_host", "")
-    db_password_encrypted = config.get("db_password", "")
+    db_password_encrypted = Setting.get("peertube_db_password", "")
 
     if not peertube_url:
         return False, "PeerTube Instance URL is required for installation (used for webserver hostname)"

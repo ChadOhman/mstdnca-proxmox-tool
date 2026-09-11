@@ -3,6 +3,8 @@ import logging
 import requests
 import urllib3
 
+from core.errors import describe_exception
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
 
@@ -76,7 +78,8 @@ class PBSClient:
                 return True, resp.json().get("data")
             return False, f"HTTP {resp.status_code}"
         except requests.RequestException as e:
-            return False, str(e)
+            logger.error("PBS API error on %s: %s", path, e)
+            return False, describe_exception(e)
 
     # ── Connection & Status ───────────────────────────────────────────────────
 

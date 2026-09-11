@@ -3,6 +3,7 @@
 import json
 import time
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import auth.cloudflare_access as cloudflare_access
 from models import Setting, User, db
@@ -309,8 +310,10 @@ class TestFetchJwks:
                 cloudflare_access._fetch_jwks("example.cloudflareaccess.com")
 
         assert len(captured_urls) == 1
-        assert "example.cloudflareaccess.com" in captured_urls[0]
-        assert "/cdn-cgi/access/certs" in captured_urls[0]
+        parsed = urlparse(captured_urls[0])
+        assert parsed.scheme == "https"
+        assert parsed.hostname == "example.cloudflareaccess.com"
+        assert parsed.path == "/cdn-cgi/access/certs"
 
     def test_refuses_to_fetch_for_invalid_team_domain(self, app):
         """An .endswith()-style bypass string must never reach urlopen -- it's
