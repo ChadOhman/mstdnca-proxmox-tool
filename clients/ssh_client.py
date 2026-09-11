@@ -233,7 +233,10 @@ class SSHClient:
             err_text = err_buf.text()
 
             if not finished:
-                logger.warning(f"SSH command timed out after {timeout}s on {self.hostname}: {command}")
+                # Deliberately not logging the command text: remote file writes
+                # carry the file contents (base64) inline, which can include
+                # credentials such as the UniFi password in up.conf.
+                logger.warning(f"SSH command timed out after {timeout}s on {self.hostname} ({len(command)}-char command)")
                 try:
                     channel.close()
                 except Exception:  # noqa: S110 - best-effort teardown
