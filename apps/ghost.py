@@ -81,6 +81,28 @@ def _get_ghost_config():
 # Permission remediation
 # ---------------------------------------------------------------------------
 
+# Where ghost-cli's nginx extension keeps per-site configs (its nginxConfigPath
+# default is /etc/nginx).  The pre-update migrations rewrite files under here.
+_NGINX_SITES = "/etc/nginx/sites-available"
+
+# Seconds allowed for the chmod/chown sweep in _fix_ghost_permissions.
+_PERMS_FIX_TIMEOUT = 600
+
+
+def _resolve_guest_binary(ssh, name, default):
+    """Return the absolute path of *name* on the guest, or *default*.
+
+    sudoers command specs must be fully qualified, and the path sudo compares
+    against is whatever it resolves from PATH — so ask the guest rather than
+    hard-code /usr/bin vs /bin (usrmerge) or /usr/sbin.
+    """
+    out, _, _ = ssh.execute_sudo(
+        f"command -v {name} 2>/dev/null || echo {default}", timeout=5,
+    )
+    path = (out or "").strip().splitlines()
+    return (path[0].strip() if path else "") or default
+
+
 def _fix_ghost_permissions(ssh, ghost_dir, user, log):
     """Re-assert Ghost file ownership and modes over an SSH connection.
 
@@ -101,7 +123,10 @@ def _fix_ghost_permissions(ssh, ghost_dir, user, log):
         f"&& find {ghost_dir} ! -path '*/versions/*' -type d -exec chmod 775 {{}} + "
         f"&& chown -R {user}: {ghost_dir}"
     )
-    stdout, stderr, code = ssh.execute_sudo(perms_cmds, timeout=120)
+    # Walking the whole tree (every versions/*/node_modules plus a large
+    # content/images) routinely takes longer than two minutes on production
+    # hosts, and a timeout here silently skips the remediation.
+    stdout, stderr, code = ssh.execute_sudo(perms_cmds, timeout=_PERMS_FIX_TIMEOUT)
     if code == 0:
         log("File permissions fixed")
         return True
@@ -619,17 +644,18 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
                     service_name = f"ghost_{m_name.group(1)}"
             log(f"Ghost service name: {service_name}")
 
-            # Write/refresh the sudoers entry for ghost_user.  ghost-cli uses
-            # 'sudo systemctl ...' to manage the service; without NOPASSWD entries
-            # sudo prompts for a password, ghost-cli detects it and calls prompt(),
-            # which throws in non-TTY mode.  Always overwrite so the entry stays
-            # current if new systemctl sub-commands are required by updated ghost-cli.
+            # Write/refresh the sudoers entry for ghost_user.  ghost-cli runs
+            # 'sudo systemctl ...' to manage the service and, since ghost-cli
+            # 1.31.0, 'sudo mv/sed/nginx ...' in its pre-update nginx migrations
+            # (ActivityPub resolver, X-Forwarded-For rewrite).  Without NOPASSWD
+            # entries sudo prompts for a password, ghost-cli detects the prompt
+            # string on stderr and calls prompt(), which throws under --no-prompt.
+            # Always overwrite so the entry stays current with newer ghost-cli.
             sudoers_path = f"/etc/sudoers.d/ghost-{service_name}"
-            sc_out, _, _ = ssh.execute_sudo(
-                "command -v systemctl 2>/dev/null || echo /usr/bin/systemctl",
-                timeout=5,
-            )
-            systemctl = (sc_out or "").strip() or "/usr/bin/systemctl"
+            systemctl = _resolve_guest_binary(ssh, "systemctl", "/usr/bin/systemctl")
+            mv_bin = _resolve_guest_binary(ssh, "mv", "/usr/bin/mv")
+            sed_bin = _resolve_guest_binary(ssh, "sed", "/usr/bin/sed")
+            nginx_bin = _resolve_guest_binary(ssh, "nginx", "/usr/sbin/nginx")
             sudoers_lines = [
                 "# Managed by mstdnca-proxmox-tool",
             ] + [
@@ -638,6 +664,12 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
                                "is-active", "is-enabled", "enable", "disable")
             ] + [
                 f"{user} ALL=(root) NOPASSWD: {systemctl} daemon-reload",
+                # ghost-cli nginx migrations: stage the rewritten site config in
+                # /tmp, move it into place, validate, reload.
+                f"{user} ALL=(root) NOPASSWD: {mv_bin} /tmp/* {_NGINX_SITES}/*",
+                f"{user} ALL=(root) NOPASSWD: {sed_bin} -i * {_NGINX_SITES}/*",
+                f"{user} ALL=(root) NOPASSWD: {nginx_bin} -t",
+                f"{user} ALL=(root) NOPASSWD: {nginx_bin} -s reload",
             ]
             write_parts = [
                 f"echo '{line}' {'>' if i == 0 else '>>'} {sudoers_path}"
