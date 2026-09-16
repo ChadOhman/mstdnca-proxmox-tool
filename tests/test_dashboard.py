@@ -75,3 +75,21 @@ class TestDashboardStatsHostUpdates:
 
             assert result["stats"]["host_pending_updates"] == 0
             assert result["stats"]["host_security_updates"] == 0
+
+    def test_dashboard_current_tag_renders_as_valid_js_when_empty(self, auth_client):
+        """With no tag filter, CURRENT_TAG must be an empty JS string literal, not HTML-escaped quotes.
+
+        The inline-if fallback used to bypass |tojson so autoescape turned '""' into &#34;&#34;,
+        which is a SyntaxError that kills the whole dashboard script block.
+        """
+        resp = auth_client.get("/")
+        assert resp.status_code == 200
+        body = resp.data.decode()
+        assert 'const CURRENT_TAG = "";' in body
+        assert "&#34;" not in body
+
+    def test_dashboard_current_tag_renders_selected_tag(self, auth_client):
+        """A tag filter is rendered through tojson as a proper JS string literal."""
+        resp = auth_client.get("/?tag=web")
+        assert resp.status_code == 200
+        assert 'const CURRENT_TAG = "web";' in resp.data.decode()
