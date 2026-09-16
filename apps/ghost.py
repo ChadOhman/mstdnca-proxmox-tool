@@ -135,6 +135,77 @@ def _fix_ghost_permissions(ssh, ghost_dir, user, log):
     return False
 
 
+def _preflight_nginx_reload(ssh, nginx_bin, log):
+    """Prove that ``nginx -s reload`` works *before* ``ghost update`` runs it.
+
+    ghost-cli's pre-update nginx migrations end with ``sudo nginx -s reload``
+    and, when that fails, report only "Failed to restart Nginx." — the real
+    stderr goes to a debug log on the guest.  Running the same command up front
+    surfaces the error while nothing has been modified yet.
+
+    The one failure that is safe to remediate is the well-known Debian race
+    where nginx is running under systemd but ``/run/nginx.pid`` is empty or
+    stale, so ``-s reload`` cannot signal the master ("invalid PID number" /
+    "open() ... failed").  Only in that case — systemd says *active* and reload
+    still fails — is nginx restarted, then the reload is re-tested.
+
+    Returns True when the update can proceed.  If nginx is absent the check
+    is skipped (ghost-cli's nginx extension will not run either).
+    """
+    _, _, present = ssh.execute_sudo(f"test -x {nginx_bin}", timeout=5)
+    if present != 0:
+        log("nginx not found on guest — skipping reload pre-flight")
+        return True
+
+    reload_cmd = f"{nginx_bin} -t 2>&1 && {nginx_bin} -s reload 2>&1"
+    out, err, code = ssh.execute_sudo(reload_cmd, timeout=30)
+    if code == 0:
+        log("nginx config valid and reload works")
+        return True
+
+    log(f"WARNING: nginx reload pre-flight failed (exit {code}):")
+    log((out or err or "").strip()[:800] or "(no output)")
+
+    active_out, _, _ = ssh.execute_sudo("systemctl is-active nginx 2>/dev/null", timeout=10)
+    if (active_out or "").strip() != "active":
+        log("ERROR: nginx is not active under systemd. ghost-cli's nginx migration "
+            "will fail the same way — fix nginx on the guest before retrying.")
+        return False
+
+    log("nginx is active but cannot be signalled (stale or empty pid file) — "
+        "restarting nginx so ghost-cli's reload can succeed...")
+    r_out, r_err, r_code = ssh.execute_sudo("systemctl restart nginx 2>&1", timeout=60)
+    if r_code != 0:
+        log(f"ERROR: nginx restart failed (exit {r_code}): "
+            f"{(r_out or r_err or '').strip()[:400]}")
+        return False
+
+    out, err, code = ssh.execute_sudo(reload_cmd, timeout=30)
+    if code == 0:
+        log("nginx restarted; reload now works")
+        return True
+    log(f"ERROR: nginx reload still fails after restart (exit {code}): "
+        f"{(out or err or '').strip()[:400]}")
+    return False
+
+
+def _log_ghost_cli_debug(ssh, ghost_dir, log, lines=80):
+    """Log the tail of the newest ghost-cli debug log after a failed update.
+
+    ghost-cli prints only a one-line CliError message to the console; the
+    underlying stderr (e.g. what ``nginx -s reload`` actually said) lives in
+    ``<ghost_dir>/.ghost/logs/ghost-cli-debug-*.log``.
+    """
+    cmd = (
+        f"f=$(ls -t {ghost_dir}/.ghost/logs/ghost-cli-debug-*.log 2>/dev/null | head -1); "
+        f"[ -n \"$f\" ] && echo \"--- $f ---\" && tail -n {lines} \"$f\""
+    )
+    out, _, code = ssh.execute_sudo(cmd, timeout=15)
+    if code == 0 and (out or "").strip():
+        log("--- ghost-cli debug log (tail) ---")
+        log((out or "").strip()[-6000:])
+
+
 # ---------------------------------------------------------------------------
 # Database privilege remediation (FM4)
 # ---------------------------------------------------------------------------
@@ -708,6 +779,15 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
             _ensure_ghost_db_privileges(ssh, ghost_dir, log)
             log("")
 
+            # ghost-cli's pre-update nginx migrations reload nginx; prove that
+            # works now, while nothing has been changed, instead of learning it
+            # from a bare "Failed to restart Nginx." mid-update.
+            log("Checking nginx can be reloaded (ghost-cli nginx migrations need it)...")
+            if not _preflight_nginx_reload(ssh, nginx_bin, log):
+                log("ERROR: aborting before ghost update — nothing was modified")
+                return False, "\n".join(log_lines)
+            log("")
+
             # Run ghost update as the Ghost system user.  su - creates a full login
             # shell so ghost-cli can find Node.js on PATH and interact with systemd.
             # --no-prompt disables interactive confirmations for non-TTY environments.
@@ -718,6 +798,7 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
 
             if code != 0:
                 log(f"ERROR: ghost update failed (exit {code})")
+                _log_ghost_cli_debug(ssh, ghost_dir, log)
                 return False, "\n".join(log_lines)
 
             log("ghost update completed successfully")
