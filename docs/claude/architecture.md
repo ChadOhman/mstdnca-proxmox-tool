@@ -60,7 +60,7 @@ One file per feature area in `routes/`:
 - `security.py` — user/role/tag/session management, audit log, `_safe_int()` helper
 - `services.py` — service monitoring (mastodon, sidekiq, postgres, redis)
 - `mastodon.py`, `ghost.py`, `peertube.py`, `elk.py`, `jitsi.py`, `jibri.py`, `prometheus_app.py`, `unpoller.py` — application upgrade routes
-- `moderation.py` — PeerTube/Mastodon email cross-check
+- `moderation.py` — PeerTube/Mastodon email cross-check, plus Mastodon Admin API JSON endpoints (reports, pending approvals, account actions, domain blocks) backed by `core/mastodon_admin.py`
 - `trends.py` — update history and trends
 - `ipmi.py` — IPMI sensor/power monitoring
 - `api.py`, `api_v1.py` — REST API endpoints
