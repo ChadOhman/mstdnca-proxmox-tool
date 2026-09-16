@@ -12,6 +12,7 @@ from apps.ghost import (
     _PERMS_FIX_TIMEOUT,
     _ensure_ghost_db_privileges,
     _fix_ghost_permissions,
+    _preflight_nginx_reload,
     _resolve_guest_binary,
     run_ghost_upgrade,
 )
@@ -437,3 +438,133 @@ class TestGhostSudoersGrants:
         assert "/usr/bin/sed -i *" in cmd
         assert "/usr/sbin/nginx -t" in cmd
         assert "/usr/bin/systemctl daemon-reload" in cmd
+
+
+class TestPreflightNginxReload:
+    """ghost-cli's nginx migrations end in 'nginx -s reload' and hide its stderr
+    behind "Failed to restart Nginx."; the pre-flight reproduces it up front."""
+
+    NGINX = "/usr/sbin/nginx"
+
+    def test_passes_when_reload_works(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH()
+        assert _preflight_nginx_reload(ssh, self.NGINX, log) is True
+        assert ssh.ran(f"{self.NGINX} -t 2>&1 && {self.NGINX} -s reload 2>&1")
+        assert not ssh.ran("systemctl restart nginx")
+
+    def test_skips_when_nginx_absent(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("test -x", ("", "", 1))])
+        assert _preflight_nginx_reload(ssh, self.NGINX, log) is True
+        assert not ssh.ran("-s reload")
+        assert any("skipping" in line for line in logs)
+
+    def test_restarts_nginx_when_active_but_unsignallable(self):
+        # Debian race: nginx up under systemd, /run/nginx.pid empty ->
+        # 'nginx -s reload' fails with "invalid PID number".
+        logs, log = _collect_log()
+        ssh = FakeSSH()
+        reload_results = iter([
+            ("nginx: [error] invalid PID number \"\" in \"/run/nginx.pid\"", "", 1),
+            ("", "", 0),
+        ])
+
+        def _execute_sudo(cmd, timeout=None):
+            ssh.calls.append(cmd)
+            if "-s reload" in cmd:
+                return next(reload_results)
+            if "is-active nginx" in cmd:
+                return ("active", "", 0)
+            return ("", "", 0)
+
+        ssh.execute_sudo = _execute_sudo
+        assert _preflight_nginx_reload(ssh, self.NGINX, log) is True
+        assert ssh.ran("systemctl restart nginx")
+        assert ssh.index_of("systemctl restart nginx") < len(ssh.calls) - 1
+        assert any("invalid PID number" in line for line in logs)
+
+    def test_fails_without_restart_when_nginx_inactive(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("-s reload", ("nginx: [error] open() \"/run/nginx.pid\" failed", "", 1)),
+            ("is-active nginx", ("inactive", "", 3)),
+        ])
+        assert _preflight_nginx_reload(ssh, self.NGINX, log) is False
+        assert not ssh.ran("systemctl restart nginx")
+        assert any("not active" in line for line in logs)
+
+    def test_fails_when_reload_still_broken_after_restart(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("-s reload", ("nginx: [error] invalid PID number", "", 1)),
+            ("is-active nginx", ("active", "", 0)),
+        ])
+        assert _preflight_nginx_reload(ssh, self.NGINX, log) is False
+        assert ssh.ran("systemctl restart nginx")
+        assert any("still fails after restart" in line for line in logs)
+
+
+class TestGhostUpgradeNginxPreflightAndDebugLog:
+    def _run(self, ssh):
+        fake_setting = MagicMock()
+        settings = _make_settings()
+        fake_setting.get.side_effect = lambda k, d="": settings.get(k, d)
+
+        fake_guest = MagicMock()
+        fake_guest.credential = MagicMock()
+        fake_guest.ip_address = "10.0.0.5"
+        fake_guest.name = "ghost-vm"
+        fake_guest_cls = MagicMock()
+        fake_guest_cls.query.get.return_value = fake_guest
+
+        with (
+            patch("apps.ghost.Setting", fake_setting),
+            patch("apps.ghost.Guest", fake_guest_cls),
+            patch("apps.ghost.SSHClient") as fake_sshclient,
+        ):
+            fake_sshclient.from_credential.return_value = ssh
+            return run_ghost_upgrade(skip_protection=True)
+
+    def _base_responses(self):
+        ghost_cli_json = '{"name": "example-site", "active-version": "6.22.0"}'
+        return [
+            (".ghost-cli", (ghost_cli_json, "", 0)),
+            ("config.production.json", ('["ghost", "ghost"]', "", 0)),
+            ("SHOW GRANTS", ("GRANT ALL PRIVILEGES ON `ghost`.* TO `ghost`@`localhost`", "", 0)),
+            ("command -v systemctl", ("/usr/bin/systemctl", "", 0)),
+            ("command -v nginx", ("/usr/sbin/nginx", "", 0)),
+            ("npm install -g ghost-cli", ("ok", "", 0)),
+        ]
+
+    def test_preflight_runs_before_update_and_aborts_when_nginx_down(self):
+        ssh = FakeSSH(self._base_responses() + [
+            ("-s reload", ("nginx: [error] open() \"/run/nginx.pid\" failed", "", 1)),
+            ("is-active nginx", ("inactive", "", 3)),
+            ("ghost update", ("Finished", "", 0)),
+        ])
+        ok, msg = self._run(ssh)
+        assert ok is False
+        assert not ssh.ran("ghost update"), ssh.calls
+        assert "aborting before ghost update" in msg
+
+    def test_debug_log_tailed_when_update_fails(self):
+        ssh = FakeSSH(self._base_responses() + [
+            ("ghost update", ("[FAILED] Failed to restart Nginx.", "", 1)),
+            ("ghost-cli-debug-", ("--- /opt/ghost/.ghost/logs/ghost-cli-debug-x.log ---\n"
+                                  "nginx: [error] invalid PID number", "", 0)),
+        ])
+        ok, msg = self._run(ssh)
+        assert ok is False
+        assert ssh.index_of("ghost-cli-debug-") > ssh.index_of("ghost update")
+        assert "ghost-cli debug log (tail)" in msg
+        assert "invalid PID number" in msg
+
+    def test_debug_log_not_fetched_on_success(self):
+        ssh = FakeSSH(self._base_responses() + [
+            ("ghost update", ("Finished", "", 0)),
+            ("is-active", ("active", "", 0)),
+        ])
+        ok, _ = self._run(ssh)
+        assert ok is True
+        assert not ssh.ran("ghost-cli-debug-")
