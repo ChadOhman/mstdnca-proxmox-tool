@@ -9,6 +9,7 @@ import json
 import logging
 import os.path as _osp
 import re
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from apps.backup import backup_guest, snapshot_guest
@@ -204,6 +205,103 @@ def _log_ghost_cli_debug(ssh, ghost_dir, log, lines=80):
     if code == 0 and (out or "").strip():
         log("--- ghost-cli debug log (tail) ---")
         log((out or "").strip()[-6000:])
+
+
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.\-]+$")
+
+
+def _resolve_ghost_http_target(ssh, ghost_dir):
+    """Read (site hostname, bind host, bind port) from ``config.production.json``.
+
+    Returns ``(None, "127.0.0.1", 2368)`` when the config cannot be read, so
+    the direct check still runs against ghost-cli's defaults.
+    """
+    cfg = f"{ghost_dir}/config.production.json"
+    py_cmd = (
+        f"python3 -c \"import json; c = json.load(open('{cfg}')); s = c.get('server') or {{}}; "
+        f"print(json.dumps({{'url': c.get('url', ''), 'host': s.get('host', '127.0.0.1'), "
+        f"'port': s.get('port', 2368)}}))\" 2>/dev/null  # ghost-http-target"
+    )
+    stdout, _, code = ssh.execute_sudo(py_cmd, timeout=10)
+    hostname, host, port = None, "127.0.0.1", 2368
+    if code != 0 or not (stdout or "").strip():
+        return hostname, host, port
+    try:
+        data = json.loads(stdout.strip())
+    except ValueError:
+        return hostname, host, port
+    if not isinstance(data, dict):
+        return hostname, host, port
+    candidate = urlparse(str(data.get("url") or "")).hostname or ""
+    if _HOSTNAME_RE.match(candidate):
+        hostname = candidate
+    if _HOSTNAME_RE.match(str(data.get("host") or "")):
+        host = str(data["host"])
+    try:
+        p = int(data.get("port") or 0)
+        if 0 < p < 65536:
+            port = p
+    except (TypeError, ValueError):
+        pass
+    return hostname, host, port
+
+
+def _http_ok(out):
+    """True when a ``HTTP:<code>`` marker line reports a 2xx/3xx status."""
+    m = re.search(r"HTTP:(\d{3})", out or "")
+    return bool(m) and m.group(1)[0] in "23"
+
+
+def _check_ghost_http(ssh, ghost_dir, nginx_bin, log, attempts=6, delay=10):
+    """Verify the site actually answers over HTTP after the update.
+
+    ``systemctl is-active`` on the Ghost unit says nothing about whether the
+    site is reachable: Ghost can still be booting (or crash a few seconds in),
+    and nginx — which is what the public hits — can be dead while Ghost is
+    fine.  Two checks, both must pass:
+
+    1. Ghost directly on its bind address, retried for up to
+       ``attempts * delay`` seconds to allow for boot time.
+    2. Through nginx on 127.0.0.1:443 with the site's Host header (skipped when
+       nginx is not installed or the site URL is unknown).
+
+    Returns True when the site is up.
+    """
+    hostname, host, port = _resolve_ghost_http_target(ssh, ghost_dir)
+
+    direct_url = f"http://{host}:{port}/"
+    direct_cmd = (
+        f"c=000; for i in $(seq 1 {attempts}); do "
+        f"c=$(curl -s -o /dev/null -m 10 -w '%{{http_code}}' {direct_url}); "
+        f"case $c in 2*|3*) break;; esac; sleep {delay}; done; echo HTTP:$c"
+    )
+    out, _, _ = ssh.execute_sudo(direct_cmd, timeout=attempts * (delay + 12) + 15)
+    if not _http_ok(out):
+        log(f"ERROR: Ghost is not answering at {direct_url} "
+            f"(last status {(out or '').strip() or 'none'})")
+        return False
+    log(f"Ghost answers at {direct_url}")
+
+    if not hostname:
+        log("Site URL unknown — skipping nginx check")
+        return True
+    _, _, present = ssh.execute_sudo(f"test -x {nginx_bin}", timeout=5)
+    if present != 0:
+        log("nginx not installed — skipping nginx check")
+        return True
+
+    nginx_cmd = (
+        f"c=$(curl -sk -o /dev/null -m 10 -w '%{{http_code}}' -H 'Host: {hostname}' https://127.0.0.1/); "
+        f"echo HTTP:$c"
+    )
+    out, _, _ = ssh.execute_sudo(nginx_cmd, timeout=30)
+    if not _http_ok(out):
+        active, _, _ = ssh.execute_sudo("systemctl is-active nginx 2>/dev/null", timeout=10)
+        log(f"ERROR: site not reachable through nginx for {hostname} "
+            f"(status {(out or '').strip() or 'none'}, nginx is {(active or '').strip() or 'unknown'})")
+        return False
+    log(f"Site reachable through nginx for {hostname}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -858,6 +956,14 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
                     if (stdout or "").strip():
                         log("--- Recent service journal ---")
                         log((stdout or "").strip())
+
+            # An active unit is not a working site: Ghost may still be booting
+            # or about to crash, and nginx (what the public actually hits) can
+            # be dead while the Ghost unit is fine.  Prove it over HTTP.
+            if service_ok:
+                log("Verifying the site answers over HTTP...")
+                if not _check_ghost_http(ssh, ghost_dir, nginx_bin, log):
+                    service_ok = False
 
             if not service_ok:
                 # The new code is unpacked but the site is down: do not record
