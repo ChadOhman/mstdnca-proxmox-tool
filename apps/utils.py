@@ -124,8 +124,45 @@ def upgrade_lock(app_name: str):
             release_upgrade_lock(app_name)
 
 
+# Lines in the omitted middle of a failed command's output that are worth
+# surfacing: the real cause usually sits between a chatty build log (head) and
+# a Ruby/Node stack trace (tail), e.g. "Killed" / "rake aborted!" / "error
+# Command failed with signal SIGKILL".
+_FATAL_LINE_RE = re.compile(
+    r"rake aborted|killed|sigkill|out of memory|\boom\b|error|fatal|command failed|exit code|exited with",
+    re.IGNORECASE,
+)
+_MAX_EXCERPT_LINES = 15
+_MAX_EXCERPT_LINE_CHARS = 300
+
+
+def _error_excerpt(text, limit=_MAX_EXCERPT_LINES):
+    """Return up to ``limit`` lines of ``text`` that look like an error.
+
+    The line after "rake aborted!" is included too: that is where Rake prints
+    the exception message.
+    """
+    picked = []
+    take_next = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if take_next or _FATAL_LINE_RE.search(stripped):
+            picked.append(stripped[:_MAX_EXCERPT_LINE_CHARS])
+            take_next = "rake aborted" in stripped.lower()
+            if len(picked) >= limit:
+                break
+    return picked
+
+
 def _log_cmd_output(log, stdout, stderr, code, max_chars=2000):
-    """Log combined stdout+stderr, showing start+end on failure (error before stack trace)."""
+    """Log combined stdout+stderr, showing start+end on failure (error before stack trace).
+
+    On failure the middle of the output is dropped, but any line in it that
+    looks like an error is still logged, so a fatal line buried between a long
+    build log and a stack trace (e.g. an OOM kill) is not lost.
+    """
     combined = ((stdout or "") + ("\n" + stderr if stderr else "")).strip()
     if not combined:
         return
@@ -137,7 +174,14 @@ def _log_cmd_output(log, stdout, stderr, code, max_chars=2000):
         head = combined[:1500].strip()
         tail = combined[-500:].strip()
         log(head)
-        log("[... output truncated ...]")
+        excerpt = _error_excerpt(combined[1500:-500])
+        if excerpt:
+            log("[... output truncated — error-like lines from the omitted part: ...]")
+            for line in excerpt:
+                log(f"  | {line}")
+            log("[... end of excerpt ...]")
+        else:
+            log("[... output truncated ...]")
         log(tail)
     else:
         log(combined[-max_chars:].strip())

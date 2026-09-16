@@ -49,6 +49,47 @@ _MIGRATE_PGOPTIONS = 'PGOPTIONS="-c statement_timeout=0"'
 _MIGRATE_TIMEOUT = 1800
 
 
+# MemAvailable floor (MiB) before the upgrade may start.  The vite asset build
+# peaks at a few GB; on 2026-09-16 it was OOM-killed on a 32 GB guest with
+# ~1.5 GB available (50 puma workers), leaving the new code checked out with no
+# compiled assets.  Checking before the snapshot / git pull turns that into a
+# clean early abort instead of a half-finished deploy.
+_MIN_AVAILABLE_MEMORY_MB = 3072
+
+
+def _parse_meminfo_mb(text):
+    """Return {field: MiB} for the kB-valued fields of /proc/meminfo."""
+    info = {}
+    for line in (text or "").splitlines():
+        m = re.match(r"^(\w+):\s+(\d+)\s+kB", line)
+        if m:
+            info[m.group(1)] = int(m.group(2)) // 1024
+    return info
+
+
+def _check_memory_headroom(ssh):
+    """Compare the guest's MemAvailable with _MIN_AVAILABLE_MEMORY_MB.
+
+    Returns (ok, detail).  ``ok`` is None when /proc/meminfo could not be read,
+    so callers can warn instead of blocking on an unusual guest.
+    """
+    stdout, _stderr, code = ssh.execute_sudo("cat /proc/meminfo", timeout=10)
+    info = _parse_meminfo_mb(stdout) if code == 0 else {}
+    available = info.get("MemAvailable")
+    if available is None:
+        return None, "could not read MemAvailable from /proc/meminfo"
+    detail = f"{available} MB available of {info.get('MemTotal', '?')} MB"
+    if "SwapTotal" in info:
+        detail += f", swap {info.get('SwapFree', '?')}/{info['SwapTotal']} MB free"
+    if available < _MIN_AVAILABLE_MEMORY_MB:
+        return False, (
+            f"{detail} — need at least {_MIN_AVAILABLE_MEMORY_MB} MB or the asset build (vite) "
+            "gets OOM-killed. Free memory first (e.g. lower WEB_CONCURRENCY, stop spare Sidekiq "
+            "workers) and re-run."
+        )
+    return True, detail
+
+
 def _check_version_range(installed, requirement):
     """Simple semver range check. Supports >=, ^, and plain version.
 
@@ -929,6 +970,13 @@ def run_mastodon_preflight(log_callback=None):
                 else:
                     checks_failed += 1
 
+                # Memory headroom for the asset build (vite gets OOM-killed otherwise)
+                mem_ok, mem_detail = _check_memory_headroom(ssh)
+                if mem_ok is None:
+                    log(f"  [WARN] Memory headroom: {mem_detail}")
+                else:
+                    check(f"Memory headroom ≥ {_MIN_AVAILABLE_MEMORY_MB} MB for asset build", mem_ok, mem_detail)
+
                 # Direct DB reachability — use bash /dev/tcp (no external tools required)
                 # Falls back to pg_isready and nc if bash /dev/tcp is unavailable
                 stdout, stderr, code = ssh.execute_sudo(
@@ -1100,7 +1148,16 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
         try:
             with SSHClient.from_credential(mastodon_guest.ip_address, credential) as ssh:
                 _check_env_compliance(ssh, user, app_dir, branch, log)
+                mem_ok, mem_detail = _check_memory_headroom(ssh)
             log("Runtime versions (Ruby / Node.js / Bundler) will be upgraded automatically if needed.")
+            if mem_ok is None:
+                log(f"  [WARN] Memory headroom: {mem_detail}")
+            elif mem_ok:
+                log(f"  [PASS] Memory headroom: {mem_detail}")
+            else:
+                log(f"  [FAIL] Memory headroom: {mem_detail}")
+                log("ERROR: aborting before the snapshot / git pull — nothing has been changed on the guest.")
+                return False, "\n".join(log_lines)
         except Exception as e:
             log(f"WARNING: Could not run environment compliance check: {e}")
             log("Proceeding with upgrade — runtimes will still be checked in Step 3.")
