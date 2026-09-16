@@ -6,16 +6,16 @@
 
 <ul class="nav nav-pills mb-4" role="tablist">
     <li class="nav-item" role="presentation">
-        <button class="nav-link active" id="peertube-tab" data-bs-toggle="pill"
+        <button class="nav-link{% if active_tab != 'mastodon' %} active{% endif %}" id="peertube-tab" data-bs-toggle="pill"
                 data-bs-target="#peertube-pane" type="button" role="tab"
-                aria-controls="peertube-pane" aria-selected="true">
+                aria-controls="peertube-pane" aria-selected="{{ 'false' if active_tab == 'mastodon' else 'true' }}">
             <i class="bi bi-play-btn"></i> PeerTube
         </button>
     </li>
     <li class="nav-item" role="presentation">
-        <button class="nav-link" id="mastodon-tab" data-bs-toggle="pill"
+        <button class="nav-link{% if active_tab == 'mastodon' %} active{% endif %}" id="mastodon-tab" data-bs-toggle="pill"
                 data-bs-target="#mastodon-pane" type="button" role="tab"
-                aria-controls="mastodon-pane" aria-selected="false">
+                aria-controls="mastodon-pane" aria-selected="{{ 'true' if active_tab == 'mastodon' else 'false' }}">
             <i class="bi bi-mastodon"></i> Mastodon
         </button>
     </li>
@@ -23,7 +23,7 @@
 
 <div class="tab-content">
     <!-- PeerTube Moderation -->
-    <div class="tab-pane fade show active" id="peertube-pane" role="tabpanel" aria-labelledby="peertube-tab">
+    <div class="tab-pane fade{% if active_tab != 'mastodon' %} show active{% endif %}" id="peertube-pane" role="tabpanel" aria-labelledby="peertube-tab">
         <div class="row g-4">
             <!-- Configuration -->
             <div class="col-lg-6">
@@ -166,14 +166,205 @@
         {% endif %}
     </div>
 
-    <!-- Mastodon Moderation (placeholder) -->
-    <div class="tab-pane fade" id="mastodon-pane" role="tabpanel" aria-labelledby="mastodon-tab">
-        <div class="card bg-dark">
-            <div class="card-body text-center py-5">
-                <i class="bi bi-mastodon fs-1 text-muted"></i>
-                <h4 class="mt-3 text-muted">Mastodon Moderation</h4>
-                <p class="text-muted">Mastodon moderation features coming soon.</p>
+    <!-- Mastodon Moderation -->
+    <div class="tab-pane fade{% if active_tab == 'mastodon' %} show active{% endif %}" id="mastodon-pane" role="tabpanel" aria-labelledby="mastodon-tab"
+         data-configured="{{ 'true' if settings.mastodon_api_url and settings.mastodon_api_token else 'false' }}">
+        <div class="row g-4">
+            <!-- Configuration -->
+            <div class="col-lg-5">
+                <div class="card bg-dark h-100">
+                    <div class="card-header">
+                        <h5 class="mb-0"><i class="bi bi-gear"></i> Mastodon Admin API</h5>
+                    </div>
+                    <div class="card-body">
+                        <form method="post" action="/moderation/mastodon/save">
+                            <div class="mb-3">
+                                <label class="form-label" for="mastodon_api_url">Instance URL</label>
+                                <input type="url" class="form-control font-monospace" id="mastodon_api_url" name="mastodon_api_url"
+                                       value="{{ settings.mastodon_api_url }}" placeholder="https://mastodon.example">
+                                <div class="form-text">Base URL of the Mastodon instance (no trailing slash).</div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label" for="mastodon_api_token">Admin Access Token</label>
+                                <input type="password" class="form-control font-monospace" id="mastodon_api_token" name="mastodon_api_token"
+                                       autocomplete="off"
+                                       placeholder="{{ '********' if settings.mastodon_api_token else '' }}">
+                                <div class="form-text">
+                                    Token from an application created under <em>Preferences &rarr; Development</em> while
+                                    signed in as an admin, with scopes <code>read:accounts admin:read admin:write</code>.
+                                    Leave blank to keep the existing token.
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-primary">
+                                <i class="bi bi-check-lg"></i> Save Settings
+                            </button>
+                            <button type="button" class="btn btn-outline-info ms-2" id="masto-test-btn"
+                                    {{ 'disabled' if not (settings.mastodon_api_url and settings.mastodon_api_token) }}>
+                                <i class="bi bi-plug"></i> Test Connection
+                            </button>
+                        </form>
+                        <div id="masto-test-result" class="mt-3 small" aria-live="polite"></div>
+                    </div>
+                </div>
             </div>
+
+            <!-- Account lookup -->
+            <div class="col-lg-7">
+                <div class="card bg-dark h-100">
+                    <div class="card-header">
+                        <h5 class="mb-0"><i class="bi bi-person-badge"></i> Account Lookup</h5>
+                    </div>
+                    <div class="card-body">
+                        <form id="masto-lookup-form" class="d-flex gap-2 mb-3">
+                            <label class="visually-hidden" for="masto-lookup-acct">Account handle</label>
+                            <input type="text" class="form-control font-monospace" id="masto-lookup-acct"
+                                   placeholder="username or username@remote.domain" autocomplete="off">
+                            <button type="submit" class="btn btn-outline-light">
+                                <i class="bi bi-search"></i> Look up
+                            </button>
+                        </form>
+                        <div id="masto-account-panel" class="small text-muted">
+                            Search for a local or remote account to view its moderation state and apply an action.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Reports -->
+        <div class="card bg-dark mt-4" id="masto-reports-card">
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <h5 class="mb-0"><i class="bi bi-flag"></i> Reports <span class="badge bg-secondary" id="masto-reports-count"></span></h5>
+                <div class="d-flex align-items-center gap-2">
+                    <div class="form-check form-switch mb-0">
+                        <input class="form-check-input" type="checkbox" id="masto-reports-resolved">
+                        <label class="form-check-label small" for="masto-reports-resolved">Show resolved</label>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" data-masto-refresh="reports">
+                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                    </button>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div id="masto-reports-body" class="p-3 small text-muted">Not loaded.</div>
+            </div>
+        </div>
+
+        <!-- Pending approvals -->
+        <div class="card bg-dark mt-4" id="masto-pending-card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-person-plus"></i> Pending Approvals <span class="badge bg-secondary" id="masto-pending-count"></span></h5>
+                <button type="button" class="btn btn-sm btn-outline-secondary" data-masto-refresh="pending">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                </button>
+            </div>
+            <div class="card-body p-0">
+                <div id="masto-pending-body" class="p-3 small text-muted">Not loaded.</div>
+            </div>
+        </div>
+
+        <!-- Domain blocks -->
+        <div class="card bg-dark mt-4" id="masto-domains-card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-globe2"></i> Domain Blocks <span class="badge bg-secondary" id="masto-domains-count"></span></h5>
+                <button type="button" class="btn btn-sm btn-outline-secondary" data-masto-refresh="domains">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                </button>
+            </div>
+            <div class="card-body">
+                <form id="masto-domain-form" class="row g-2 align-items-end mb-3">
+                    <div class="col-md-4">
+                        <label class="form-label small" for="masto-domain-name">Domain</label>
+                        <input type="text" class="form-control form-control-sm font-monospace" id="masto-domain-name"
+                               placeholder="spam.example" autocomplete="off" required>
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label small" for="masto-domain-severity">Severity</label>
+                        <select class="form-select form-select-sm" id="masto-domain-severity">
+                            <option value="silence">Limit (silence)</option>
+                            <option value="suspend">Suspend</option>
+                            <option value="noop">None (flags only)</option>
+                        </select>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input" type="checkbox" id="masto-domain-reject-media">
+                            <label class="form-check-label small" for="masto-domain-reject-media">Reject media</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input" type="checkbox" id="masto-domain-reject-reports">
+                            <label class="form-check-label small" for="masto-domain-reject-reports">Reject reports</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input" type="checkbox" id="masto-domain-obfuscate">
+                            <label class="form-check-label small" for="masto-domain-obfuscate">Obfuscate</label>
+                        </div>
+                    </div>
+                    <div class="col-md-2 text-md-end">
+                        <button type="submit" class="btn btn-sm btn-danger">
+                            <i class="bi bi-slash-circle"></i> Add Block
+                        </button>
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label small" for="masto-domain-public">Public comment</label>
+                        <input type="text" class="form-control form-control-sm" id="masto-domain-public" maxlength="500">
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label small" for="masto-domain-private">Private comment</label>
+                        <input type="text" class="form-control form-control-sm" id="masto-domain-private" maxlength="500">
+                    </div>
+                </form>
+                <div id="masto-domains-body" class="small text-muted">Not loaded.</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Mastodon account action modal -->
+<div class="modal fade" id="mastoActionModal" tabindex="-1" aria-modal="true" role="dialog" aria-labelledby="mastoActionModalLabel">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border-secondary">
+            <form id="masto-action-form">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title" id="mastoActionModalLabel">Moderate Account</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Cancel"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-3">Account: <strong class="font-monospace" id="masto-action-acct"></strong></p>
+                    <input type="hidden" id="masto-action-account-id">
+                    <input type="hidden" id="masto-action-report-id">
+                    <div class="mb-3">
+                        <label class="form-label" for="masto-action-type">Action</label>
+                        <select class="form-select" id="masto-action-type">
+                            <option value="none">Warning only (no restriction)</option>
+                            <option value="sensitive">Force sensitive media</option>
+                            <option value="disable">Freeze login (disable)</option>
+                            <option value="silence" selected>Limit (silence)</option>
+                            <option value="suspend">Suspend</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="masto-action-text">Reason / note to the user</label>
+                        <textarea class="form-control" id="masto-action-text" rows="3" maxlength="2000"
+                                  placeholder="Shown to the user if email notification is enabled; kept in the moderation log."></textarea>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" id="masto-action-notify">
+                        <label class="form-check-label" for="masto-action-notify">Send email notification to the user</label>
+                    </div>
+                    <div class="form-check mb-2" id="masto-action-report-wrap" style="display:none">
+                        <input class="form-check-input" type="checkbox" id="masto-action-link-report" checked>
+                        <label class="form-check-label" for="masto-action-link-report">
+                            Link to report <span id="masto-action-report-label"></span> (resolves it)
+                        </label>
+                    </div>
+                    <div id="masto-action-error" class="text-danger small" aria-live="polite"></div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-danger" id="masto-action-submit">Apply</button>
+                </div>
+            </form>
         </div>
     </div>
 </div>
@@ -217,6 +408,410 @@
     }
 
     if (polling) pollStatus();
+})();
+</script>
+<script>
+// ── Mastodon moderation tab ──────────────────────────────────────────────────
+(function() {
+    const pane = document.getElementById('mastodon-pane');
+    if (!pane) return;
+    const configured = pane.dataset.configured === 'true';
+    const loaded = { reports: false, pending: false, domains: false };
+
+    // ── helpers ───────────────────────────────────────────────────────────
+    function api(url, form) {
+        const opts = form ? { method: 'POST', body: form } : {};
+        return fetch(url, opts).then(async r => {
+            let data = {};
+            try { data = await r.json(); } catch (e) { /* non-JSON body */ }
+            if (!r.ok || data.ok === false) {
+                throw new Error(data.error || ('HTTP ' + r.status));
+            }
+            return data;
+        });
+    }
+
+    // Promise wrapper around the shared accessible confirm modal in base.html.
+    function confirmDialog(msg) {
+        return new Promise(resolve => {
+            const el = document.getElementById('confirmModal');
+            const modal = bootstrap.Modal.getOrCreateInstance(el);
+            document.getElementById('confirmModalBody').textContent = msg;
+            let decided = false;
+            const ok = document.getElementById('confirmModalOk');
+            ok.onclick = function() { decided = true; modal.hide(); resolve(true); };
+            el.addEventListener('hidden.bs.modal', function onHide() {
+                el.removeEventListener('hidden.bs.modal', onHide);
+                if (!decided) resolve(false);
+            });
+            modal.show();
+        });
+    }
+
+    function formData(obj) {
+        const fd = new FormData();
+        Object.keys(obj).forEach(k => { if (obj[k] !== undefined && obj[k] !== null) fd.append(k, obj[k]); });
+        return fd;
+    }
+
+    function fmtDate(iso) {
+        if (!iso) return '';
+        const d = new Date(iso);
+        return isNaN(d) ? escHtml(iso) : escHtml(d.toLocaleString());
+    }
+
+    function errorBox(msg) {
+        return '<div class="alert alert-danger py-2 mb-0 small">' + escHtml(msg) + '</div>';
+    }
+
+    function stateBadges(a) {
+        const b = [];
+        if (a.suspended) b.push('<span class="badge bg-danger">Suspended</span>');
+        if (a.silenced) b.push('<span class="badge bg-warning text-dark">Limited</span>');
+        if (a.disabled) b.push('<span class="badge bg-secondary">Frozen</span>');
+        if (a.sensitized) b.push('<span class="badge bg-info text-dark">Sensitive</span>');
+        if (a.approved === false) b.push('<span class="badge bg-secondary">Pending</span>');
+        if (a.confirmed === false && !a.domain) b.push('<span class="badge bg-secondary">Unconfirmed</span>');
+        if (a.role && a.role !== 'User') b.push('<span class="badge bg-primary">' + escHtml(a.role) + '</span>');
+        return b.join(' ');
+    }
+
+    function acctLink(a) {
+        const label = escHtml(a.acct || a.username || a.id);
+        return a.url
+            ? '<a href="' + escHtml(a.url) + '" target="_blank" rel="noopener" class="font-monospace">' + label + '</a>'
+            : '<span class="font-monospace">' + label + '</span>';
+    }
+
+    function notConfigured(target) {
+        target.innerHTML = '<span class="text-muted">Save the instance URL and admin token first.</span>';
+    }
+
+    // ── connection test ───────────────────────────────────────────────────
+    const testBtn = document.getElementById('masto-test-btn');
+    const testOut = document.getElementById('masto-test-result');
+    if (testBtn) testBtn.addEventListener('click', () => {
+        testBtn.disabled = true;
+        testOut.innerHTML = '<span class="text-muted">Testing…</span>';
+        api('/moderation/mastodon/test', new FormData())
+            .then(d => {
+                const a = d.account || {};
+                testOut.innerHTML = '<span class="text-success"><i class="bi bi-check-circle"></i> Connected as '
+                    + '<strong class="font-monospace">' + escHtml(a.acct) + '</strong>'
+                    + (a.role ? ' (' + escHtml(a.role) + ')' : '') + '. Admin scope OK.</span>';
+            })
+            .catch(e => { testOut.innerHTML = errorBox(e.message); })
+            .finally(() => { testBtn.disabled = false; });
+    });
+
+    // ── account panel + action modal ──────────────────────────────────────
+    const acctPanel = document.getElementById('masto-account-panel');
+    const actionModalEl = document.getElementById('mastoActionModal');
+    const actionModal = bootstrap.Modal.getOrCreateInstance(actionModalEl);
+    let afterAction = null;  // callback invoked after a successful action
+
+    function openActionModal(account, opts) {
+        opts = opts || {};
+        document.getElementById('masto-action-acct').textContent = account.acct || account.id;
+        document.getElementById('masto-action-account-id').value = account.id;
+        document.getElementById('masto-action-report-id').value = opts.reportId || '';
+        document.getElementById('masto-action-text').value = '';
+        document.getElementById('masto-action-notify').checked = false;
+        document.getElementById('masto-action-error').textContent = '';
+        document.getElementById('masto-action-type').value = opts.type || 'silence';
+        const wrap = document.getElementById('masto-action-report-wrap');
+        wrap.style.display = opts.reportId ? '' : 'none';
+        document.getElementById('masto-action-report-label').textContent = opts.reportId ? '#' + opts.reportId : '';
+        document.getElementById('masto-action-link-report').checked = !!opts.reportId;
+        actionModalEl.dataset.acct = account.acct || '';
+        afterAction = opts.after || null;
+        actionModal.show();
+    }
+
+    document.getElementById('masto-action-form').addEventListener('submit', e => {
+        e.preventDefault();
+        const submit = document.getElementById('masto-action-submit');
+        const errEl = document.getElementById('masto-action-error');
+        const id = document.getElementById('masto-action-account-id').value;
+        const linkReport = document.getElementById('masto-action-link-report').checked;
+        const reportId = document.getElementById('masto-action-report-id').value;
+        submit.disabled = true;
+        errEl.textContent = '';
+        api('/moderation/mastodon/accounts/' + encodeURIComponent(id) + '/action', formData({
+            type: document.getElementById('masto-action-type').value,
+            text: document.getElementById('masto-action-text').value,
+            send_email_notification: document.getElementById('masto-action-notify').checked ? '1' : '0',
+            report_id: (linkReport && reportId) ? reportId : '',
+            acct: actionModalEl.dataset.acct,
+        }))
+            .then(d => {
+                actionModal.hide();
+                if (d.account) renderAccount(d.account);
+                if (afterAction) afterAction(d);
+            })
+            .catch(err => { errEl.textContent = err.message; })
+            .finally(() => { submit.disabled = false; });
+    });
+
+    function renderAccount(a) {
+        const rows = [
+            ['Handle', acctLink(a)],
+            ['Display name', escHtml(a.display_name || '')],
+            ['Email', '<span class="font-monospace">' + escHtml(a.email || (a.domain ? 'n/a (remote)' : '')) + '</span>'],
+            ['Last IP', '<span class="font-monospace">' + escHtml(a.ip || '') + '</span>'],
+            ['Created', fmtDate(a.created_at)],
+            ['State', stateBadges(a) || '<span class="text-muted">normal</span>'],
+        ];
+        let html = '<table class="table table-dark table-sm mb-3"><tbody>';
+        rows.forEach(r => { html += '<tr><th class="text-muted fw-normal" style="width:8rem">' + r[0] + '</th><td>' + r[1] + '</td></tr>'; });
+        html += '</tbody></table>';
+        html += '<div class="d-flex flex-wrap gap-2">';
+        html += '<button type="button" class="btn btn-sm btn-outline-danger" data-act="action">'
+              + '<i class="bi bi-hammer"></i> Take action…</button>';
+        if (a.suspended) html += '<button type="button" class="btn btn-sm btn-outline-success" data-act="unsuspend">Unsuspend</button>';
+        if (a.silenced) html += '<button type="button" class="btn btn-sm btn-outline-success" data-act="unsilence">Remove limit</button>';
+        if (a.disabled) html += '<button type="button" class="btn btn-sm btn-outline-success" data-act="enable">Unfreeze</button>';
+        if (a.sensitized) html += '<button type="button" class="btn btn-sm btn-outline-success" data-act="unsensitive">Clear sensitive</button>';
+        html += '</div><div class="mt-2" id="masto-account-error"></div>';
+        acctPanel.innerHTML = html;
+        acctPanel.classList.remove('text-muted');
+        acctPanel.querySelectorAll('[data-act]').forEach(btn => btn.addEventListener('click', () => {
+            const act = btn.dataset.act;
+            if (act === 'action') { openActionModal(a); return; }
+            confirmDialog('Apply "' + btn.textContent.trim() + '" to ' + (a.acct || a.id) + '?').then(ok => {
+                if (!ok) return;
+                api('/moderation/mastodon/accounts/' + encodeURIComponent(a.id) + '/' + act, formData({ acct: a.acct }))
+                    .then(d => { if (d.account) renderAccount(d.account); })
+                    .catch(err => { document.getElementById('masto-account-error').innerHTML = errorBox(err.message); });
+            });
+        }));
+    }
+
+    document.getElementById('masto-lookup-form').addEventListener('submit', e => {
+        e.preventDefault();
+        if (!configured) { notConfigured(acctPanel); return; }
+        const acct = document.getElementById('masto-lookup-acct').value.trim();
+        if (!acct) return;
+        acctPanel.innerHTML = '<span class="text-muted">Looking up…</span>';
+        api('/moderation/mastodon/accounts/lookup?acct=' + encodeURIComponent(acct))
+            .then(d => renderAccount(d.account))
+            .catch(err => { acctPanel.innerHTML = errorBox(err.message); });
+    });
+
+    // ── reports ───────────────────────────────────────────────────────────
+    const reportsBody = document.getElementById('masto-reports-body');
+    const reportsCount = document.getElementById('masto-reports-count');
+    const resolvedToggle = document.getElementById('masto-reports-resolved');
+
+    function loadReports() {
+        if (!configured) { notConfigured(reportsBody); return; }
+        loaded.reports = true;
+        const resolved = resolvedToggle.checked;
+        reportsBody.innerHTML = '<span class="text-muted">Loading…</span>';
+        api('/moderation/mastodon/reports?resolved=' + (resolved ? 'true' : 'false'))
+            .then(d => renderReports(d.reports || [], resolved))
+            .catch(err => { reportsBody.innerHTML = errorBox(err.message); });
+    }
+
+    function renderReports(reports, resolved) {
+        reportsCount.textContent = reports.length;
+        if (!reports.length) {
+            reportsBody.innerHTML = '<span class="text-muted">No ' + (resolved ? 'resolved' : 'open') + ' reports.</span>';
+            return;
+        }
+        let html = '<div class="table-responsive"><table class="table table-dark table-striped table-hover mb-0 align-middle">'
+            + '<thead><tr><th>#</th><th>Target</th><th>Reporter</th><th>Category</th><th>Details</th><th class="text-end">Actions</th></tr></thead><tbody>';
+        reports.forEach(r => {
+            const t = r.target_account || {};
+            let details = '';
+            if (r.comment) details += '<div class="mb-1">' + escHtml(r.comment) + '</div>';
+            if (r.rules && r.rules.length) details += '<div class="text-muted small mb-1">Rules: ' + r.rules.map(escHtml).join('; ') + '</div>';
+            (r.statuses || []).forEach(s => {
+                details += '<div class="small border-start border-secondary ps-2 mb-1">'
+                    + (s.url ? '<a href="' + escHtml(s.url) + '" target="_blank" rel="noopener" class="text-muted"><i class="bi bi-box-arrow-up-right"></i></a> ' : '')
+                    + escHtml(s.excerpt || '(no text)')
+                    + (s.media_count ? ' <span class="badge bg-secondary">' + s.media_count + ' media</span>' : '')
+                    + '</div>';
+            });
+            if (r.forwarded) details += '<span class="badge bg-secondary">forwarded</span> ';
+            html += '<tr data-report-id="' + escHtml(String(r.id)) + '">'
+                + '<td class="font-monospace">' + escHtml(String(r.id)) + '<div class="text-muted small">' + fmtDate(r.created_at) + '</div></td>'
+                + '<td>' + acctLink(t) + '<div class="mt-1">' + stateBadges(t) + '</div></td>'
+                + '<td>' + acctLink(r.account || {}) + '</td>'
+                + '<td>' + escHtml(r.category || '') + '</td>'
+                + '<td style="max-width:28rem">' + details + '</td>'
+                + '<td class="text-end text-nowrap">'
+                + (resolved
+                    ? '<button type="button" class="btn btn-sm btn-outline-secondary" data-report-act="reopen">Reopen</button>'
+                    : '<button type="button" class="btn btn-sm btn-outline-danger me-1" data-report-act="action">Act on account…</button>'
+                      + '<button type="button" class="btn btn-sm btn-outline-success" data-report-act="resolve">Resolve</button>')
+                + '</td></tr>';
+        });
+        html += '</tbody></table></div><div class="p-2" id="masto-reports-error"></div>';
+        reportsBody.innerHTML = html;
+
+        reportsBody.querySelectorAll('[data-report-act]').forEach(btn => btn.addEventListener('click', () => {
+            const tr = btn.closest('tr');
+            const rid = tr.dataset.reportId;
+            const r = reports.find(x => String(x.id) === rid);
+            const errEl = document.getElementById('masto-reports-error');
+            const act = btn.dataset.reportAct;
+            if (act === 'action') {
+                openActionModal(r.target_account, { reportId: rid, after: loadReports });
+                return;
+            }
+            confirmDialog((act === 'resolve' ? 'Resolve' : 'Reopen') + ' report #' + rid + '?').then(ok => {
+                if (!ok) return;
+                api('/moderation/mastodon/reports/' + encodeURIComponent(rid) + '/' + act, new FormData())
+                    .then(loadReports)
+                    .catch(err => { errEl.innerHTML = errorBox(err.message); });
+            });
+        }));
+    }
+    resolvedToggle.addEventListener('change', loadReports);
+
+    // ── pending approvals ─────────────────────────────────────────────────
+    const pendingBody = document.getElementById('masto-pending-body');
+    const pendingCount = document.getElementById('masto-pending-count');
+
+    function loadPending() {
+        if (!configured) { notConfigured(pendingBody); return; }
+        loaded.pending = true;
+        pendingBody.innerHTML = '<span class="text-muted">Loading…</span>';
+        api('/moderation/mastodon/pending')
+            .then(d => renderPending(d.accounts || []))
+            .catch(err => { pendingBody.innerHTML = errorBox(err.message); });
+    }
+
+    function renderPending(accounts) {
+        pendingCount.textContent = accounts.length;
+        if (!accounts.length) {
+            pendingBody.innerHTML = '<span class="text-muted">No accounts awaiting approval.</span>';
+            return;
+        }
+        let html = '<div class="table-responsive"><table class="table table-dark table-striped table-hover mb-0 align-middle">'
+            + '<thead><tr><th>Username</th><th>Email</th><th>Signed up</th><th>IP</th><th>Why do you want to join?</th><th class="text-end">Actions</th></tr></thead><tbody>';
+        accounts.forEach(a => {
+            html += '<tr data-account-id="' + escHtml(String(a.id)) + '">'
+                + '<td class="font-monospace">' + escHtml(a.username) + (a.confirmed ? '' : ' <span class="badge bg-secondary">unconfirmed</span>') + '</td>'
+                + '<td class="font-monospace">' + escHtml(a.email || '') + '</td>'
+                + '<td>' + fmtDate(a.created_at) + '</td>'
+                + '<td class="font-monospace">' + escHtml(a.ip || '') + '</td>'
+                + '<td style="max-width:24rem">' + escHtml(a.invite_request || '') + '</td>'
+                + '<td class="text-end text-nowrap">'
+                + '<button type="button" class="btn btn-sm btn-outline-success me-1" data-pending-act="approve">Approve</button>'
+                + '<button type="button" class="btn btn-sm btn-outline-danger" data-pending-act="reject">Reject</button>'
+                + '</td></tr>';
+        });
+        html += '</tbody></table></div><div class="p-2" id="masto-pending-error"></div>';
+        pendingBody.innerHTML = html;
+
+        pendingBody.querySelectorAll('[data-pending-act]').forEach(btn => btn.addEventListener('click', () => {
+            const tr = btn.closest('tr');
+            const id = tr.dataset.accountId;
+            const a = accounts.find(x => String(x.id) === id);
+            const act = btn.dataset.pendingAct;
+            const errEl = document.getElementById('masto-pending-error');
+            const go = () => api('/moderation/mastodon/accounts/' + encodeURIComponent(id) + '/' + act, formData({ acct: a.username }))
+                .then(loadPending)
+                .catch(err => { errEl.innerHTML = errorBox(err.message); });
+            if (act === 'reject') {
+                confirmDialog('Reject signup for ' + a.username + '? The account will be deleted.').then(ok => { if (ok) go(); });
+            } else {
+                go();
+            }
+        }));
+    }
+
+    // ── domain blocks ─────────────────────────────────────────────────────
+    const domainsBody = document.getElementById('masto-domains-body');
+    const domainsCount = document.getElementById('masto-domains-count');
+
+    function loadDomains() {
+        if (!configured) { notConfigured(domainsBody); return; }
+        loaded.domains = true;
+        domainsBody.innerHTML = '<span class="text-muted">Loading…</span>';
+        api('/moderation/mastodon/domain_blocks')
+            .then(d => renderDomains(d.blocks || []))
+            .catch(err => { domainsBody.innerHTML = errorBox(err.message); });
+    }
+
+    function renderDomains(blocks) {
+        domainsCount.textContent = blocks.length;
+        if (!blocks.length) {
+            domainsBody.innerHTML = '<span class="text-muted">No domain blocks.</span>';
+            return;
+        }
+        const sevBadge = s => s === 'suspend' ? '<span class="badge bg-danger">suspend</span>'
+            : s === 'silence' ? '<span class="badge bg-warning text-dark">limit</span>'
+            : '<span class="badge bg-secondary">' + escHtml(s || 'none') + '</span>';
+        let html = '<div class="table-responsive"><table class="table table-dark table-striped table-hover mb-0 align-middle">'
+            + '<thead><tr><th>Domain</th><th>Severity</th><th>Flags</th><th>Public comment</th><th>Private comment</th><th>Added</th><th class="text-end">Actions</th></tr></thead><tbody>';
+        blocks.forEach(b => {
+            const flags = [];
+            if (b.reject_media) flags.push('<span class="badge bg-secondary">no media</span>');
+            if (b.reject_reports) flags.push('<span class="badge bg-secondary">no reports</span>');
+            if (b.obfuscate) flags.push('<span class="badge bg-secondary">obfuscated</span>');
+            html += '<tr data-block-id="' + escHtml(String(b.id)) + '">'
+                + '<td class="font-monospace">' + escHtml(b.domain) + '</td>'
+                + '<td>' + sevBadge(b.severity) + '</td>'
+                + '<td>' + flags.join(' ') + '</td>'
+                + '<td class="small">' + escHtml(b.public_comment || '') + '</td>'
+                + '<td class="small text-muted">' + escHtml(b.private_comment || '') + '</td>'
+                + '<td class="small">' + fmtDate(b.created_at) + '</td>'
+                + '<td class="text-end"><button type="button" class="btn btn-sm btn-outline-danger" data-block-del>Remove</button></td>'
+                + '</tr>';
+        });
+        html += '</tbody></table></div><div class="pt-2" id="masto-domains-error"></div>';
+        domainsBody.innerHTML = html;
+
+        domainsBody.querySelectorAll('[data-block-del]').forEach(btn => btn.addEventListener('click', () => {
+            const tr = btn.closest('tr');
+            const id = tr.dataset.blockId;
+            const b = blocks.find(x => String(x.id) === id);
+            confirmDialog('Remove the domain block for ' + b.domain + '?').then(ok => {
+                if (!ok) return;
+                api('/moderation/mastodon/domain_blocks/' + encodeURIComponent(id) + '/delete', formData({ domain: b.domain }))
+                    .then(loadDomains)
+                    .catch(err => { document.getElementById('masto-domains-error').innerHTML = errorBox(err.message); });
+            });
+        }));
+    }
+
+    document.getElementById('masto-domain-form').addEventListener('submit', e => {
+        e.preventDefault();
+        if (!configured) { notConfigured(domainsBody); return; }
+        const domain = document.getElementById('masto-domain-name').value.trim();
+        const severity = document.getElementById('masto-domain-severity').value;
+        if (!domain) return;
+        confirmDialog('Add a "' + severity + '" block for ' + domain + '?').then(ok => {
+            if (!ok) return;
+            api('/moderation/mastodon/domain_blocks', formData({
+                domain: domain,
+                severity: severity,
+                reject_media: document.getElementById('masto-domain-reject-media').checked ? '1' : '0',
+                reject_reports: document.getElementById('masto-domain-reject-reports').checked ? '1' : '0',
+                obfuscate: document.getElementById('masto-domain-obfuscate').checked ? '1' : '0',
+                public_comment: document.getElementById('masto-domain-public').value,
+                private_comment: document.getElementById('masto-domain-private').value,
+            }))
+                .then(() => { document.getElementById('masto-domain-form').reset(); loadDomains(); })
+                .catch(err => { domainsBody.insertAdjacentHTML('afterbegin', errorBox(err.message)); });
+        });
+    });
+
+    // ── wiring ────────────────────────────────────────────────────────────
+    const loaders = { reports: loadReports, pending: loadPending, domains: loadDomains };
+    pane.querySelectorAll('[data-masto-refresh]').forEach(btn =>
+        btn.addEventListener('click', () => loaders[btn.dataset.mastoRefresh]()));
+
+    function loadAll() {
+        if (!loaded.reports) loadReports();
+        if (!loaded.pending) loadPending();
+        if (!loaded.domains) loadDomains();
+    }
+    document.getElementById('mastodon-tab').addEventListener('shown.bs.tab', loadAll);
+    if (pane.classList.contains('active')) loadAll();
 })();
 </script>
 {% endblock %}

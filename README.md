@@ -11,7 +11,7 @@ A datacenter-wide administration tool for Proxmox environments. Runs as an LXC c
 - **IPMI monitoring** — Sensor readings and power status for bare-metal hosts
 - **Service monitoring** — Track systemd service state across guests with failure/recovery alerts
 - **Application upgrade automation** — One-click upgrades for Mastodon (glitch-soc), Ghost, PeerTube, Elk, Jitsi Meet/Jibri, and Prometheus exporters, with Proxmox snapshots and auto-upgrade support
-- **Moderation tools** — PeerTube/Mastodon email cross-check for spam account detection
+- **Moderation tools** — PeerTube/Mastodon email cross-check for spam account detection, plus a Mastodon Admin API console: reports queue, pending signup approvals, account lookup with limit/suspend actions, and domain blocks
 - **Discord notifications** — Webhook alerts for available updates, upgrade results, and service failures, with severity breakdown and tag scoping
 - **Scheduled scans & auto-updates** — Configurable scan intervals and maintenance windows
 - **4-tier role-based access control** — Super Admin, Admin, Operator, and Viewer roles with tag-based guest filtering
@@ -307,7 +307,7 @@ Flask Web UI (:5000)
 ├── Schedules ────── maintenance windows for auto-updates
 ├── Services ─────── systemd service monitoring across guests
 ├── Applications ─── upgrades for Mastodon, Ghost, PeerTube, Elk, Jitsi, exporters
-├── Moderation ───── PeerTube/Mastodon spam account cross-check
+├── Moderation ───── PeerTube/Mastodon spam cross-check; Mastodon reports, approvals, account actions, domain blocks
 ├── Security ─────── users, roles, tags, sessions, audit log, credentials
 └── Settings ─────── Discord, scan, UniFi, CF Access, local bypass, backups
 
