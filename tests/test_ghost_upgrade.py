@@ -9,8 +9,10 @@ future refactor can't silently drop the post-update pass.
 from unittest.mock import MagicMock, patch
 
 from apps.ghost import (
+    _PERMS_FIX_TIMEOUT,
     _ensure_ghost_db_privileges,
     _fix_ghost_permissions,
+    _resolve_guest_binary,
     run_ghost_upgrade,
 )
 
@@ -77,6 +79,33 @@ class TestFixGhostPermissions:
         ssh = FakeSSH([("chown -R", ("", "Operation not permitted", 1))])
         assert _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log) is False
         assert any("WARNING" in line for line in logs)
+
+    def test_sweep_gets_a_long_timeout(self):
+        # The tree walk (versions/*/node_modules + content/images) took longer
+        # than the old 120 s budget on production, which silently skipped the
+        # remediation with "[timeout after 120 s]".
+        logs, log = _collect_log()
+        ssh = FakeSSH()
+        seen = {}
+
+        def _execute_sudo(cmd, timeout=None):
+            seen["timeout"] = timeout
+            return ("", "", 0)
+
+        ssh.execute_sudo = _execute_sudo
+        _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log)
+        assert seen["timeout"] == _PERMS_FIX_TIMEOUT
+        assert _PERMS_FIX_TIMEOUT >= 600
+
+
+class TestResolveGuestBinary:
+    def test_uses_path_reported_by_guest(self):
+        ssh = FakeSSH([("command -v nginx", ("/usr/sbin/nginx\n", "", 0))])
+        assert _resolve_guest_binary(ssh, "nginx", "/opt/nginx") == "/usr/sbin/nginx"
+
+    def test_falls_back_to_default_when_guest_prints_nothing(self):
+        ssh = FakeSSH([("command -v nginx", ("", "", 1))])
+        assert _resolve_guest_binary(ssh, "nginx", "/usr/sbin/nginx") == "/usr/sbin/nginx"
 
 
 class TestEnsureGhostDbPrivileges:
@@ -322,3 +351,89 @@ class TestGhostUpgradeReportsServiceFailure:
         ok, _ = self._run(ssh, settings_sink=written)
         assert ok is True
         assert written["ghost_current_version"] == "6.22.0"
+
+
+class TestGhostSudoersGrants:
+    """The NOPASSWD grants must cover every 'sudo' ghost-cli issues during update.
+
+    ghost-cli 1.31.0 added pre-update nginx migrations (ActivityPub resolver,
+    X-Forwarded-For rewrite) that run 'sudo mv', 'sudo sed -i', 'sudo nginx -t'
+    and 'sudo nginx -s reload'.  With only systemctl whitelisted, sudo asked for
+    a password and ghost-cli aborted with "Prompts have been disabled".
+    """
+
+    def _run(self, ssh):
+        fake_setting = MagicMock()
+        settings = _make_settings()
+        fake_setting.get.side_effect = lambda k, d="": settings.get(k, d)
+
+        fake_guest = MagicMock()
+        fake_guest.credential = MagicMock()
+        fake_guest.ip_address = "10.0.0.5"
+        fake_guest.name = "ghost-vm"
+        fake_guest_cls = MagicMock()
+        fake_guest_cls.query.get.return_value = fake_guest
+
+        with (
+            patch("apps.ghost.Setting", fake_setting),
+            patch("apps.ghost.Guest", fake_guest_cls),
+            patch("apps.ghost.SSHClient") as fake_sshclient,
+        ):
+            fake_sshclient.from_credential.return_value = ssh
+            return run_ghost_upgrade(skip_protection=True)
+
+    def _ssh(self):
+        ghost_cli_json = '{"name": "news-mstdn-ca", "active-version": "6.22.0"}'
+        return FakeSSH([
+            (".ghost-cli", (ghost_cli_json, "", 0)),
+            ("config.production.json", ('["ghost", "ghost"]', "", 0)),
+            ("SHOW GRANTS", ("GRANT ALL PRIVILEGES ON `ghost`.* TO `ghost`@`localhost`", "", 0)),
+            ("command -v systemctl", ("/usr/bin/systemctl", "", 0)),
+            ("command -v mv", ("/usr/bin/mv", "", 0)),
+            ("command -v sed", ("/usr/bin/sed", "", 0)),
+            ("command -v nginx", ("/usr/sbin/nginx", "", 0)),
+            ("npm install -g ghost-cli", ("ok", "", 0)),
+            ("ghost update", ("Finished", "", 0)),
+            ("is-active", ("active", "", 0)),
+        ])
+
+    def _sudoers_cmd(self, ssh):
+        cmds = [c for c in ssh.calls if "/etc/sudoers.d/ghost-ghost_news-mstdn-ca" in c]
+        assert len(cmds) == 1, ssh.calls
+        return cmds[0]
+
+    def test_grants_nginx_migration_commands(self):
+        ssh = self._ssh()
+        ok, _ = self._run(ssh)
+        assert ok is True
+
+        cmd = self._sudoers_cmd(ssh)
+        assert "ghost_user ALL=(root) NOPASSWD: /usr/bin/mv /tmp/* /etc/nginx/sites-available/*" in cmd
+        assert "ghost_user ALL=(root) NOPASSWD: /usr/bin/sed -i * /etc/nginx/sites-available/*" in cmd
+        assert "ghost_user ALL=(root) NOPASSWD: /usr/sbin/nginx -t" in cmd
+        assert "ghost_user ALL=(root) NOPASSWD: /usr/sbin/nginx -s reload" in cmd
+
+    def test_keeps_systemctl_grants(self):
+        ssh = self._ssh()
+        self._run(ssh)
+        cmd = self._sudoers_cmd(ssh)
+        for action in ("start", "stop", "restart", "reset-failed",
+                       "is-active", "is-enabled", "enable", "disable"):
+            assert f"NOPASSWD: /usr/bin/systemctl {action} ghost_news-mstdn-ca" in cmd
+        assert "NOPASSWD: /usr/bin/systemctl daemon-reload" in cmd
+
+    def test_sudoers_written_before_update_and_locked_down(self):
+        ssh = self._ssh()
+        self._run(ssh)
+        assert ssh.index_of("/etc/sudoers.d/") < ssh.index_of("ghost update")
+        assert "chmod 440 /etc/sudoers.d/ghost-ghost_news-mstdn-ca" in self._sudoers_cmd(ssh)
+
+    def test_binary_paths_fall_back_when_guest_lookup_fails(self):
+        ssh = self._ssh()
+        ssh.responses = [r for r in ssh.responses if not r[0].startswith("command -v")]
+        self._run(ssh)
+        cmd = self._sudoers_cmd(ssh)
+        assert "/usr/bin/mv /tmp/*" in cmd
+        assert "/usr/bin/sed -i *" in cmd
+        assert "/usr/sbin/nginx -t" in cmd
+        assert "/usr/bin/systemctl daemon-reload" in cmd
