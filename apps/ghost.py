@@ -190,21 +190,150 @@ def _preflight_nginx_reload(ssh, nginx_bin, log):
     return False
 
 
-def _log_ghost_cli_debug(ssh, ghost_dir, log, lines=80):
+def _log_ghost_cli_debug(ssh, ghost_dir, log, lines=80, since=None):
     """Log the tail of the newest ghost-cli debug log after a failed update.
 
     ghost-cli prints only a one-line CliError message to the console; the
     underlying stderr (e.g. what ``nginx -s reload`` actually said) lives in
     ``<ghost_dir>/.ghost/logs/ghost-cli-debug-*.log``.
+
+    *since* is a guest-side epoch timestamp taken before the update started;
+    when given, only a log written after it is shown, so a failure ghost-cli
+    did not log (e.g. its Node version check) doesn't surface a stale log
+    from an earlier run.
     """
-    cmd = (
-        f"f=$(ls -t {ghost_dir}/.ghost/logs/ghost-cli-debug-*.log 2>/dev/null | head -1); "
-        f"[ -n \"$f\" ] && echo \"--- $f ---\" && tail -n {lines} \"$f\""
-    )
+    logs_dir = f"{ghost_dir}/.ghost/logs"
+    if since:
+        pick = (f"find {logs_dir} -maxdepth 1 -name 'ghost-cli-debug-*.log' "
+                f"-newermt @{since} 2>/dev/null | sort | tail -1")
+    else:
+        pick = f"ls -t {logs_dir}/ghost-cli-debug-*.log 2>/dev/null | head -1"
+    cmd = f"f=$({pick}); [ -n \"$f\" ] && echo \"--- $f ---\" && tail -n {lines} \"$f\""
     out, _, code = ssh.execute_sudo(cmd, timeout=15)
     if code == 0 and (out or "").strip():
         log("--- ghost-cli debug log (tail) ---")
         log((out or "").strip()[-6000:])
+
+
+# ---------------------------------------------------------------------------
+# Node.js compatibility
+# ---------------------------------------------------------------------------
+
+_GHOST_NPM_VERSION_URL = "https://registry.npmjs.org/ghost/{version}"
+_SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
+_CARET_RE = re.compile(r"^(\^?)(\d+)\.(\d+)\.(\d+)$")
+_GTE_RE = re.compile(r"^>=\s*(\d+)\.(\d+)\.(\d+)$")
+
+
+def _fetch_ghost_node_range(version):
+    """Return the ``engines.node`` range for a Ghost *version* from npm, or None."""
+    try:
+        url = _GHOST_NPM_VERSION_URL.format(version=version or "latest")
+        req = Request(url, headers={"User-Agent": "mstdnca-proxmox-tool"})
+        with urlopen(req, timeout=15) as resp:  # noqa: S310 - fixed https host
+            data = json.loads(resp.read().decode())
+        node_range = (data.get("engines") or {}).get("node")
+        return node_range.strip() if isinstance(node_range, str) and node_range.strip() else None
+    except Exception as e:
+        logger.warning("Could not fetch Ghost %s engines from npm: %s", version, e)
+        return None
+
+
+def _parse_semver(text):
+    m = _SEMVER_RE.match((text or "").strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _node_satisfies(version, node_range):
+    """Minimal semver check for the ranges Ghost publishes.
+
+    Understands alternatives joined by ``||`` of the forms ``^X.Y.Z``,
+    ``>=X.Y.Z`` and exact ``X.Y.Z``.  Anything else is treated as not
+    satisfied so the caller falls back to a clear error rather than a guess.
+    """
+    v = _parse_semver(version)
+    if v is None:
+        return False
+    for alt in (node_range or "").split("||"):
+        alt = alt.strip()
+        m = _CARET_RE.match(alt)
+        if m:
+            base = tuple(int(x) for x in m.groups()[1:])
+            if m.group(1) == "^":
+                if v[0] == base[0] and v >= base:
+                    return True
+            elif v == base:
+                return True
+            continue
+        m = _GTE_RE.match(alt)
+        if m and v >= tuple(int(x) for x in m.groups()):
+            return True
+    return False
+
+
+def _node_target_major(node_range, current_major):
+    """Pick the Node major to install: the current one if the range allows a
+    newer release of it, else the lowest major the range accepts."""
+    majors = []
+    for alt in (node_range or "").split("||"):
+        m = _CARET_RE.match(alt.strip()) or _GTE_RE.match(alt.strip())
+        if m:
+            majors.append(int(m.groups()[-3]))
+    if not majors:
+        return None
+    return current_major if current_major in majors else min(majors)
+
+
+def _ensure_node_compatible(ssh, user, node_range, log):
+    """Make sure the guest's Node satisfies the target Ghost's ``engines.node``.
+
+    ghost-cli refuses the update ("Ghost vX is not compatible with the current
+    Node version") only after it has already run its nginx migrations.  Check
+    first, and when the guest manages Node with ``n`` (tj/n) install the
+    required major with it — a same-major bump when possible, else the lowest
+    major Ghost accepts.  ``n`` keeps the previous version under
+    ``/usr/local/n/versions`` so rollback is ``n <old-version>``.
+
+    Returns True when the update can proceed.
+    """
+    if not node_range:
+        log("Required Node.js range unknown — leaving the check to ghost-cli")
+        return True
+
+    def _guest_node():
+        out, _, _ = ssh.execute_sudo(f"su - {user} -c 'node --version' 2>/dev/null", timeout=20)
+        return (out or "").strip().splitlines()[0].strip() if (out or "").strip() else ""
+
+    current = _guest_node()
+    if not current:
+        log("WARNING: could not determine the guest's Node.js version — leaving the check to ghost-cli")
+        return True
+    if _node_satisfies(current, node_range):
+        log(f"Node.js {current} satisfies Ghost's requirement ({node_range})")
+        return True
+
+    log(f"Node.js {current} does not satisfy Ghost's requirement ({node_range})")
+    _, _, has_n = ssh.execute_sudo("command -v n >/dev/null 2>&1", timeout=5)
+    parsed = _parse_semver(current)
+    target = _node_target_major(node_range, parsed[0] if parsed else -1)
+    if has_n != 0 or target is None:
+        log("ERROR: Node.js must be upgraded on the guest before Ghost can be updated "
+            f"(need {node_range}; 'n' is not available to do it automatically).")
+        return False
+
+    log(f"Upgrading Node.js with 'n {target}' (previous version stays under /usr/local/n/versions)...")
+    out, err, code = ssh.execute_sudo(f"n {target} 2>&1", timeout=600)
+    _log_cmd_output(log, out, err, code, max_chars=1500)
+    if code != 0:
+        log(f"ERROR: 'n {target}' failed (exit {code})")
+        return False
+
+    current = _guest_node()
+    if current and _node_satisfies(current, node_range):
+        log(f"Node.js is now {current}")
+        return True
+    log(f"ERROR: Node.js is {current or 'unknown'} after upgrade, still outside {node_range}")
+    return False
 
 
 _HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.\-]+$")
@@ -877,6 +1006,16 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
             _ensure_ghost_db_privileges(ssh, ghost_dir, log)
             log("")
 
+            # Newer Ghost releases raise the minimum Node.js; ghost-cli only
+            # notices after its nginx migrations have run.  Check (and, with
+            # 'n' on the guest, fix) before anything is touched.
+            log("Checking Node.js compatibility with the target Ghost release...")
+            node_range = _fetch_ghost_node_range(config.get("latest_version") or "latest")
+            if not _ensure_node_compatible(ssh, user, node_range, log):
+                log("ERROR: aborting before ghost update — nothing was modified")
+                return False, "\n".join(log_lines)
+            log("")
+
             # ghost-cli's pre-update nginx migrations reload nginx; prove that
             # works now, while nothing has been changed, instead of learning it
             # from a bare "Failed to restart Nginx." mid-update.
@@ -891,12 +1030,15 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
             # --no-prompt disables interactive confirmations for non-TTY environments.
             update_cmd = f"su - {user} -c 'cd {ghost_dir} && ghost update --no-prompt'"
             log(f"Running: {update_cmd}")
+            started_out, _, _ = ssh.execute_sudo("date +%s", timeout=5)
+            started_at = (started_out or "").strip()
+            started_at = started_at if started_at.isdigit() else None
             stdout, stderr, code = ssh.execute_sudo(update_cmd, timeout=600)
             _log_cmd_output(log, stdout, stderr, code, max_chars=4000)
 
             if code != 0:
                 log(f"ERROR: ghost update failed (exit {code})")
-                _log_ghost_cli_debug(ssh, ghost_dir, log)
+                _log_ghost_cli_debug(ssh, ghost_dir, log, since=started_at)
                 return False, "\n".join(log_lines)
 
             log("ghost update completed successfully")

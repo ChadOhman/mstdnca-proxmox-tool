@@ -8,16 +8,29 @@ future refactor can't silently drop the post-update pass.
 """
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from apps.ghost import (
     _PERMS_FIX_TIMEOUT,
     _check_ghost_http,
     _ensure_ghost_db_privileges,
+    _ensure_node_compatible,
     _fix_ghost_permissions,
+    _log_ghost_cli_debug,
+    _node_satisfies,
+    _node_target_major,
     _preflight_nginx_reload,
     _resolve_ghost_http_target,
     _resolve_guest_binary,
     run_ghost_upgrade,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_npm_lookup(monkeypatch):
+    """run_ghost_upgrade asks npm for the target release's Node range; keep
+    the suite offline and deterministic.  Tests that need a range override."""
+    monkeypatch.setattr("apps.ghost._fetch_ghost_node_range", lambda version: None)
 
 
 class FakeSSH:
@@ -704,3 +717,185 @@ class TestGhostUpgradeHttpVerification:
         assert ok is True
         assert written["ghost_current_version"] == "6.46.0"
         assert ssh.index_of("https://127.0.0.1/") > ssh.index_of("ghost update")
+
+
+class TestNodeSemver:
+    RANGE = "^22.23.1 || ^24.20.0"
+
+    @pytest.mark.parametrize("version,expected", [
+        ("v22.23.1", True),
+        ("v22.23.2", True),
+        ("v22.99.0", True),
+        ("v22.18.0", False),   # news.mstdn.ca on 2026-09-16
+        ("v24.20.0", True),
+        ("v24.19.9", False),
+        ("v23.0.0", False),    # no alternative for major 23
+        ("v26.0.0", False),    # caret never crosses majors
+        ("", False),
+        ("garbage", False),
+    ])
+    def test_caret_alternatives(self, version, expected):
+        assert _node_satisfies(version, self.RANGE) is expected
+
+    def test_gte_and_exact(self):
+        assert _node_satisfies("v30.1.0", ">=26.0.0") is True
+        assert _node_satisfies("v25.9.9", ">=26.0.0") is False
+        assert _node_satisfies("v22.18.0", "22.18.0") is True
+        assert _node_satisfies("v22.18.1", "22.18.0") is False
+
+    def test_unknown_syntax_is_not_satisfied(self):
+        assert _node_satisfies("v22.23.2", "~22.23.0") is False
+        assert _node_satisfies("v22.23.2", "") is False
+
+    def test_target_major_prefers_current_major(self):
+        assert _node_target_major(self.RANGE, 22) == 22
+        assert _node_target_major(self.RANGE, 24) == 24
+        assert _node_target_major(self.RANGE, 20) == 22
+        assert _node_target_major("", 22) is None
+
+
+class TestEnsureNodeCompatible:
+    RANGE = "^22.23.1 || ^24.20.0"
+
+    def test_passes_when_already_compatible(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("node --version", ("v22.23.2\n", "", 0))])
+        assert _ensure_node_compatible(ssh, "ghost_user", self.RANGE, log) is True
+        assert not ssh.ran("command -v n")
+
+    def test_skips_when_range_unknown(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH()
+        assert _ensure_node_compatible(ssh, "ghost_user", None, log) is True
+        assert not ssh.ran("node --version")
+
+    def test_leaves_it_to_ghost_cli_when_node_version_unreadable(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("node --version", ("", "", 127))])
+        assert _ensure_node_compatible(ssh, "ghost_user", self.RANGE, log) is True
+        assert any("WARNING" in line for line in logs)
+
+    def test_upgrades_with_n_same_major(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH()
+        versions = iter(["v22.18.0\n", "v22.23.2\n"])
+
+        def _execute_sudo(cmd, timeout=None):
+            ssh.calls.append(cmd)
+            if "node --version" in cmd:
+                return (next(versions), "", 0)
+            if cmd.startswith("n 22"):
+                return ("   installed : v22.23.2", "", 0)
+            return ("", "", 0)
+
+        ssh.execute_sudo = _execute_sudo
+        assert _ensure_node_compatible(ssh, "ghost_user", self.RANGE, log) is True
+        assert ssh.ran("n 22 2>&1")
+        assert not ssh.ran("n 24")
+        assert any("Node.js is now v22.23.2" in line for line in logs)
+
+    def test_fails_clearly_without_n(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("node --version", ("v22.18.0\n", "", 0)),
+            ("command -v n", ("", "", 1)),
+        ])
+        assert _ensure_node_compatible(ssh, "ghost_user", self.RANGE, log) is False
+        assert not ssh.ran("n 22")
+        assert any("must be upgraded on the guest" in line for line in logs)
+
+    def test_fails_when_n_fails(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("node --version", ("v22.18.0\n", "", 0)),
+            ("n 22", ("Error: failed to download", "", 1)),
+        ])
+        assert _ensure_node_compatible(ssh, "ghost_user", self.RANGE, log) is False
+        assert any("'n 22' failed" in line for line in logs)
+
+    def test_fails_when_still_incompatible_after_n(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("node --version", ("v22.18.0\n", "", 0)),
+            ("n 22", ("", "", 0)),
+        ])
+        assert _ensure_node_compatible(ssh, "ghost_user", self.RANGE, log) is False
+        assert any("still outside" in line for line in logs)
+
+
+class TestGhostUpgradeNodeCheck:
+    def _run(self, ssh):
+        fake_setting = MagicMock()
+        settings = _make_settings({"ghost_latest_version": "6.64.0"})
+        fake_setting.get.side_effect = lambda k, d="": settings.get(k, d)
+
+        fake_guest = MagicMock()
+        fake_guest.credential = MagicMock()
+        fake_guest.ip_address = "10.0.0.5"
+        fake_guest.name = "ghost-vm"
+        fake_guest_cls = MagicMock()
+        fake_guest_cls.query.get.return_value = fake_guest
+
+        with (
+            patch("apps.ghost.Setting", fake_setting),
+            patch("apps.ghost.Guest", fake_guest_cls),
+            patch("apps.ghost.SSHClient") as fake_sshclient,
+        ):
+            fake_sshclient.from_credential.return_value = ssh
+            return run_ghost_upgrade(skip_protection=True)
+
+    def _responses(self):
+        ghost_cli_json = '{"name": "news-mstdn-ca", "active-version": "6.64.0"}'
+        return [
+            (".ghost-cli", (ghost_cli_json, "", 0)),
+            ("config.production.json", ('["ghost", "ghost"]', "", 0)),
+            ("SHOW GRANTS", ("GRANT ALL PRIVILEGES ON `ghost`.* TO `ghost`@`localhost`", "", 0)),
+            ("command -v systemctl", ("/usr/bin/systemctl", "", 0)),
+            ("npm install -g ghost-cli", ("ok", "", 0)),
+            ("ghost update", ("Finished", "", 0)),
+            ("is-active", ("active", "", 0)),
+            ("curl", ("HTTP:200", "", 0)),
+        ]
+
+    def test_asks_npm_for_the_target_release_and_aborts_when_incompatible(self, monkeypatch):
+        asked = {}
+
+        def _fake_fetch(version):
+            asked["version"] = version
+            return "^22.23.1 || ^24.20.0"
+
+        monkeypatch.setattr("apps.ghost._fetch_ghost_node_range", _fake_fetch)
+        ssh = FakeSSH(self._responses() + [
+            ("node --version", ("v22.18.0\n", "", 0)),
+            ("command -v n", ("", "", 1)),
+        ])
+        ok, msg = self._run(ssh)
+        assert ok is False
+        assert asked["version"] == "6.64.0"
+        assert not ssh.ran("ghost update"), ssh.calls
+        assert "does not satisfy" in msg and "aborting before ghost update" in msg
+
+    def test_node_check_runs_before_nginx_preflight(self, monkeypatch):
+        monkeypatch.setattr("apps.ghost._fetch_ghost_node_range", lambda v: "^22.23.1")
+        ssh = FakeSSH(self._responses() + [("node --version", ("v22.23.2\n", "", 0))])
+        ok, _ = self._run(ssh)
+        assert ok is True
+        # "-s reload 2>&1" is the pre-flight; the bare "-s reload" also appears
+        # in the sudoers grant written earlier.
+        assert ssh.index_of("node --version") < ssh.index_of("-s reload 2>&1") < ssh.index_of("ghost update")
+
+
+class TestDebugLogFreshness:
+    def test_only_logs_written_during_this_run_are_shown(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("ghost-cli-debug-", ("", "", 0))])
+        _log_ghost_cli_debug(ssh, "/opt/ghost", log, since="1789000000")
+        assert ssh.ran("-newermt @1789000000")
+        assert not any("debug log" in line for line in logs)
+
+    def test_falls_back_to_newest_without_timestamp(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("ghost-cli-debug-", ("--- x.log ---\nboom", "", 0))])
+        _log_ghost_cli_debug(ssh, "/opt/ghost", log)
+        assert ssh.ran("ls -t /opt/ghost/.ghost/logs/ghost-cli-debug-*.log")
+        assert any("boom" in line for line in logs)
