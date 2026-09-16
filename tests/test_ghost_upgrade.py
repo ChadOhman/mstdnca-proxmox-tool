@@ -21,6 +21,7 @@ from apps.ghost import (
     _node_target_major,
     _preflight_nginx_reload,
     _resolve_ghost_http_target,
+    _resolve_ghost_service_user,
     _resolve_guest_binary,
     run_ghost_upgrade,
 )
@@ -96,6 +97,25 @@ class TestFixGhostPermissions:
         assert _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log) is False
         assert any("WARNING" in line for line in logs)
 
+    def test_hands_content_to_the_service_account(self):
+        # ghost-cli's linux-user layout: install owned by the CLI user,
+        # content/ by the account the unit runs as.  Chowning content/ to
+        # the CLI user made ghost-cli refuse to stop/start the service
+        # ("Systemd process manager has not been set up or is corrupted")
+        # and made Ghost crash-loop on EACCES writing content/logs.
+        logs, log = _collect_log()
+        ssh = FakeSSH()
+        _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log, service_user="ghost")
+        cmd = ssh.calls[0]
+        assert "chown -R ghost_user: /opt/ghost" in cmd
+        assert cmd.index("chown -R ghost_user: /opt/ghost") < cmd.index("chown -R ghost: /opt/ghost/content")
+
+    def test_no_content_chown_when_service_account_is_the_cli_user(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH()
+        _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log, service_user="ghost_user")
+        assert "/opt/ghost/content" not in ssh.calls[0]
+
     def test_sweep_gets_a_long_timeout(self):
         # The tree walk (versions/*/node_modules + content/images) took longer
         # than the old 120 s budget on production, which silently skipped the
@@ -112,6 +132,44 @@ class TestFixGhostPermissions:
         _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log)
         assert seen["timeout"] == _PERMS_FIX_TIMEOUT
         assert _PERMS_FIX_TIMEOUT >= 600
+
+
+class TestResolveGhostServiceUser:
+    UNIT = "ghost_news-mstdn-ca"
+
+    def test_numeric_uid_is_resolved_to_a_name(self):
+        # news.mstdn.ca's unit carries User=1000
+        ssh = FakeSSH([
+            ("systemctl show -p User", ("1000\n", "", 0)),
+            ("getent passwd 1000", ("ghost\n", "", 0)),
+        ])
+        assert _resolve_ghost_service_user(ssh, self.UNIT) == "ghost"
+
+    def test_named_user_is_used_directly(self):
+        ssh = FakeSSH([("systemctl show -p User", ("ghost\n", "", 0))])
+        assert _resolve_ghost_service_user(ssh, self.UNIT) == "ghost"
+        assert not ssh.ran("getent")
+
+    def test_falls_back_to_ghost_account_when_unit_has_no_user(self):
+        ssh = FakeSSH([
+            ("systemctl show -p User", ("", "", 0)),
+            ("id -un ghost", ("ghost\n", "", 0)),
+        ])
+        assert _resolve_ghost_service_user(ssh, self.UNIT) == "ghost"
+
+    def test_none_when_nothing_is_known(self):
+        ssh = FakeSSH([
+            ("systemctl show -p User", ("", "", 0)),
+            ("id -un ghost", ("", "id: 'ghost': no such user", 1)),
+        ])
+        assert _resolve_ghost_service_user(ssh, self.UNIT) is None
+
+    def test_rejects_unsafe_values(self):
+        ssh = FakeSSH([
+            ("systemctl show -p User", ("ghost; rm -rf /\n", "", 0)),
+            ("id -un ghost", ("", "", 1)),
+        ])
+        assert _resolve_ghost_service_user(ssh, self.UNIT) is None
 
 
 class TestResolveGuestBinary:
@@ -262,6 +320,16 @@ class TestGhostUpgradePostUpdatePermissions:
         assert len(perms_idxs) == 2, ssh.calls
         update_idx = ssh.index_of("ghost update")
         assert perms_idxs[0] < update_idx < perms_idxs[1]
+
+    def test_content_is_handed_to_the_service_account_before_and_after(self):
+        ssh = self._healthy_ssh()
+        ssh.responses.insert(0, ("systemctl show -p User", ("ghost\n", "", 0)))
+        ok, _ = self._run(ssh)
+
+        assert ok is True
+        perms = [c for c in ssh.calls if "chown -R ghost_user:" in c]
+        assert len(perms) == 2
+        assert all("chown -R ghost: /opt/ghost/content" in c for c in perms), perms
 
     def test_db_privileges_checked_before_update(self):
         ssh = self._healthy_ssh()

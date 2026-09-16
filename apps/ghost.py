@@ -104,12 +104,44 @@ def _resolve_guest_binary(ssh, name, default):
     return (path[0].strip() if path else "") or default
 
 
-def _fix_ghost_permissions(ssh, ghost_dir, user, log):
+_UNIX_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*$")
+
+
+def _resolve_ghost_service_user(ssh, service_name):
+    """Return the account the Ghost systemd unit runs as, or None.
+
+    ghost-cli's ``linux-user`` setup runs the service as a dedicated ``ghost``
+    account (the unit may carry ``User=ghost`` or a bare uid such as
+    ``User=1000``) that is distinct from the account that owns the install and
+    runs ghost-cli.  Read it from the unit; fall back to ``ghost`` if such an
+    account exists.
+    """
+    out, _, _ = ssh.execute_sudo(
+        f"systemctl show -p User --value {service_name} 2>/dev/null", timeout=10
+    )
+    val = (out or "").strip().splitlines()[0].strip() if (out or "").strip() else ""
+    if val.isdigit():
+        out, _, _ = ssh.execute_sudo(f"getent passwd {val} | cut -d: -f1", timeout=10)
+        val = (out or "").strip()
+    if _UNIX_USER_RE.match(val):
+        return val
+    out, _, code = ssh.execute_sudo("id -un ghost 2>/dev/null", timeout=5)
+    val = (out or "").strip()
+    return val if code == 0 and _UNIX_USER_RE.match(val) else None
+
+
+def _fix_ghost_permissions(ssh, ghost_dir, user, log, service_user=None):
     """Re-assert Ghost file ownership and modes over an SSH connection.
 
     Files outside ``versions/`` are normalised to 664, directories to 775, and
-    the whole tree is chowned to *user*.  The ``versions/`` trees are excluded
-    from chmod so executable bits under ``node_modules/.bin`` survive.
+    the tree is chowned to *user* (the account that owns the install and runs
+    ghost-cli).  ``content/`` is then handed to *service_user* — the account
+    the systemd unit runs as — because that is what ghost-cli's ``linux-user``
+    layout expects: its systemd precheck refuses to stop/start the service
+    unless ``content/`` is owned by the ``ghost`` account, and Ghost itself
+    writes logs, images and settings there at runtime.  The ``versions/``
+    trees are excluded from chmod so executable bits under
+    ``node_modules/.bin`` survive.
 
     Run this both *before* ``ghost update`` (ghost-cli's check-permissions step
     rejects files with wrong modes) and *after* it: the update unpacks a new
@@ -124,6 +156,8 @@ def _fix_ghost_permissions(ssh, ghost_dir, user, log):
         f"&& find {ghost_dir} ! -path '*/versions/*' -type d -exec chmod 775 {{}} + "
         f"&& chown -R {user}: {ghost_dir}"
     )
+    if service_user and service_user != user:
+        perms_cmds += f" && chown -R {service_user}: {ghost_dir}/content"
     # Walking the whole tree (every versions/*/node_modules plus a large
     # content/images) routinely takes longer than two minutes on production
     # hosts, and a timeout here silently skips the remediation.
@@ -942,6 +976,17 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
                     service_name = f"ghost_{m_name.group(1)}"
             log(f"Ghost service name: {service_name}")
 
+            # ghost-cli's linux-user layout: the install is owned by the CLI
+            # user, content/ by the account the service runs as.  Getting this
+            # wrong makes ghost-cli refuse to stop/start the service and makes
+            # Ghost crash-loop on EACCES writing its logs.
+            service_user = _resolve_ghost_service_user(ssh, service_name)
+            if service_user:
+                log(f"Ghost service account: {service_user} (owns content/)")
+            else:
+                log("WARNING: could not determine the Ghost service account — "
+                    "content/ ownership will follow the CLI user")
+
             # Write/refresh the sudoers entry for ghost_user.  ghost-cli runs
             # 'sudo systemctl ...' to manage the service and, since ghost-cli
             # 1.31.0, 'sudo mv/sed/nginx ...' in its pre-update nginx migrations
@@ -995,7 +1040,7 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
             # cache files with executable bits), so do it proactively to keep
             # the update from aborting.
             log("Fixing file permissions...")
-            _fix_ghost_permissions(ssh, ghost_dir, user, log)
+            _fix_ghost_permissions(ssh, ghost_dir, user, log, service_user=service_user)
             log("")
 
             # Ensure the Ghost DB user can run migration DDL *before* the update
@@ -1052,7 +1097,7 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
             # corrected tree ('ghost update' already started it, possibly
             # against root-owned content).
             log("=== Step 2b: Re-asserting file permissions ===")
-            _fix_ghost_permissions(ssh, ghost_dir, user, log)
+            _fix_ghost_permissions(ssh, ghost_dir, user, log, service_user=service_user)
             log(f"Restarting {service_name} to apply permission fix...")
             r_out, r_err, r_code = ssh.execute_sudo(
                 f"systemctl restart {service_name} 2>&1", timeout=30
