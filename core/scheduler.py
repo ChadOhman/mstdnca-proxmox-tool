@@ -1306,22 +1306,30 @@ def _prune_revoked_tokens(app):
 
 
 def _run_moderation_check(app):
-    """Cross-check PeerTube user emails against Mastodon registered emails."""
+    """Cross-check PeerTube user emails against Mastodon registered emails.
+
+    Runs whenever the PeerTube API is configured. Whether unmatched users are
+    banned or only reported is decided inside ``run_moderation_check`` from the
+    ``moderation_auto_ban_enabled`` setting, so a report-only configuration
+    still gets a fresh result on every interval (the check-interval setting is
+    presented in the UI as "how often the scheduled check runs" regardless of
+    the auto-ban switch).
+    """
     with app.app_context():
         from models import Setting
 
-        if Setting.get("moderation_auto_ban_enabled", "false") == "false":
-            return
-        if not Setting.get("moderation_peertube_api_url"):
+        if not (Setting.get("moderation_peertube_api_url") and Setting.get("moderation_peertube_api_token")):
             return
 
+        auto_ban = Setting.get("moderation_auto_ban_enabled", "false") == "true"
         from core.moderation import run_moderation_check
         ok, result = run_moderation_check()
         if ok:
-            logger.info("Scheduled moderation check complete: %d unmatched users",
+            logger.info("Scheduled moderation check complete (%s): %d unmatched users",
+                        "auto-ban" if auto_ban else "report-only",
                         len(result.get("unmatched", [])))
         else:
-            logger.error("Scheduled moderation check failed")
+            logger.error("Scheduled moderation check failed: %s", "; ".join(result.get("errors", [])))
 
 
 def _purge_old_update_history(app):

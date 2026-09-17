@@ -583,47 +583,6 @@ class TestRunModerationCheck:
 # ---------------------------------------------------------------------------
 
 
-class TestModerationScheduler:
-    """Test the scheduler function for moderation checks."""
-
-    @patch("core.moderation.run_moderation_check")
-    def test_skipped_when_disabled(self, mock_run, app):
-        from core.scheduler import _run_moderation_check
-        from models import Setting
-
-        with app.app_context():
-            Setting.set("moderation_auto_ban_enabled", "false")
-
-        _run_moderation_check(app)
-        mock_run.assert_not_called()
-
-    @patch("core.moderation.run_moderation_check")
-    def test_skipped_when_no_url(self, mock_run, app):
-        from core.scheduler import _run_moderation_check
-        from models import Setting
-
-        with app.app_context():
-            Setting.set("moderation_auto_ban_enabled", "true")
-            Setting.set("moderation_peertube_api_url", "")
-
-        _run_moderation_check(app)
-        mock_run.assert_not_called()
-
-    @patch("core.moderation.run_moderation_check")
-    def test_runs_when_enabled(self, mock_run, app):
-        from core.scheduler import _run_moderation_check
-        from models import Setting
-
-        mock_run.return_value = (True, {"unmatched": []})
-
-        with app.app_context():
-            Setting.set("moderation_auto_ban_enabled", "true")
-            Setting.set("moderation_peertube_api_url", "https://pt.example.com")
-
-        _run_moderation_check(app)
-        mock_run.assert_called_once()
-
-
 # ---------------------------------------------------------------------------
 # Security: SQL/command injection via mastodon_db_name (B1)
 # ---------------------------------------------------------------------------
@@ -952,3 +911,63 @@ class TestModerationAutoBanSafety:
             assert result["skipped_admins"] == 2
             assert result["unmatched"] == []
             mock_ban.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Scheduled job gating
+# ---------------------------------------------------------------------------
+
+
+class TestModerationScheduler:
+    """_run_moderation_check runs whenever the PeerTube API is configured,
+    in report-only mode as well as auto-ban mode."""
+
+    @staticmethod
+    def _configure(app, url="https://pt.example.com", with_token=True, auto_ban="false"):
+        from models import Setting
+
+        with app.app_context():
+            Setting.set("moderation_peertube_api_url", url)
+            Setting.set("moderation_peertube_api_token", "test-only-encrypted" if with_token else "")
+            Setting.set("moderation_auto_ban_enabled", auto_ban)
+
+    @patch("core.moderation.run_moderation_check", return_value=(True, {"unmatched": [{"id": 1}]}))
+    def test_runs_in_report_only_mode(self, mock_run, app):
+        from core.scheduler import _run_moderation_check
+
+        self._configure(app, auto_ban="false")
+        _run_moderation_check(app)
+        mock_run.assert_called_once_with()
+
+    @patch("core.moderation.run_moderation_check", return_value=(True, {"unmatched": []}))
+    def test_runs_in_auto_ban_mode(self, mock_run, app):
+        from core.scheduler import _run_moderation_check
+
+        self._configure(app, auto_ban="true")
+        _run_moderation_check(app)
+        mock_run.assert_called_once_with()
+
+    @patch("core.moderation.run_moderation_check")
+    def test_skips_when_url_missing(self, mock_run, app):
+        from core.scheduler import _run_moderation_check
+
+        self._configure(app, url="")
+        _run_moderation_check(app)
+        mock_run.assert_not_called()
+
+    @patch("core.moderation.run_moderation_check")
+    def test_skips_when_token_missing(self, mock_run, app):
+        from core.scheduler import _run_moderation_check
+
+        self._configure(app, with_token=False)
+        _run_moderation_check(app)
+        mock_run.assert_not_called()
+
+    @patch("core.moderation.run_moderation_check", return_value=(False, {"unmatched": [], "errors": ["boom"]}))
+    def test_failure_is_logged_not_raised(self, mock_run, app, caplog):
+        from core.scheduler import _run_moderation_check
+
+        self._configure(app)
+        with caplog.at_level("ERROR", logger="core.scheduler"):
+            _run_moderation_check(app)
+        assert "boom" in caplog.text
