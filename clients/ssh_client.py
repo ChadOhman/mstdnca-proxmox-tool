@@ -51,6 +51,47 @@ class _CappedBuffer:
         return text
 
 
+_SUDO_AUTH_MARKERS = (
+    "sudo: a password is required",
+    "sudo: a terminal is required to read the password",
+    "is not in the sudoers file",
+    "is not allowed to run sudo",
+    "sudo: not found",
+    "sudo: command not found",
+)
+
+
+def sudo_auth_failure_hint(output, username=None):
+    """Return a human-readable hint if ``output`` shows sudo refusing to run.
+
+    Commands issued as a non-root user are wrapped in ``sudo``; when the host
+    still wants a password (or the user is not in sudoers at all) every
+    command fails the same way and the apt output alone does not tell the
+    operator what to fix.  Returns ``None`` when no sudo failure is present.
+    """
+    if not output:
+        return None
+    text = output.lower()
+    if not any(marker in text for marker in _SUDO_AUTH_MARKERS):
+        return None
+    who = f"'{username}'" if username else "the SSH user"
+    if "not in the sudoers file" in text or "not allowed to run sudo" in text:
+        return (
+            f"sudo refused: {who} is not permitted to use sudo on this host. "
+            "Grant it sudo access or assign a different credential."
+        )
+    if "sudo: not found" in text or "sudo: command not found" in text:
+        return (
+            f"sudo is not installed on this host, so {who} cannot run privileged commands. "
+            "Install sudo or assign a root credential."
+        )
+    return (
+        f"sudo needs a password for {who} on this host, but the credential has no sudo password stored. "
+        "Either add the sudo password to the credential, or grant the user passwordless sudo "
+        "(NOPASSWD in /etc/sudoers.d/)."
+    )
+
+
 class SSHClient:
     """SSH connection manager using paramiko."""
 
@@ -100,13 +141,17 @@ class SSHClient:
         fed safely via stdin (see ``_feed_sudo_password``).  This avoids
         interpolating the password into a shell string where special
         characters (like single-quotes) could cause injection.
+
+        Without a stored password, ``sudo -n`` is used so a host that still
+        requires one fails immediately with ``sudo: a password is required``
+        instead of stalling on a prompt that nothing will answer.
         """
         if not self.needs_sudo:
             return command
         escaped_cmd = command.replace("'", "'\\''")
         if self.sudo_password:
             return f"sudo -S sh -c '{escaped_cmd}'"
-        return f"sudo sh -c '{escaped_cmd}'"
+        return f"sudo -n sh -c '{escaped_cmd}'"
 
     def _feed_sudo_password(self, channel_stdin):
         """Feed the sudo password into an exec_command stdin channel.

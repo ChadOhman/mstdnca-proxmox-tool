@@ -120,7 +120,7 @@ class UpdateJob:
 def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None):
     """Run apt upgrade in a background thread with streaming output."""
     from clients.proxmox_api import ProxmoxClient
-    from clients.ssh_client import SSHClient
+    from clients.ssh_client import SSHClient, sudo_auth_failure_hint
 
     with app.app_context():
         job = _update_jobs.get(guest_id)
@@ -153,9 +153,18 @@ def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None)
                     job.append(f"Connecting to {guest.name} ({guest.ip_address}) via SSH...\n")
                     try:
                         with SSHClient.from_credential(guest.ip_address, credential) as ssh:
+                            # Keep each command's own output so a sudo refusal can be
+                            # recognised and explained instead of leaving the operator
+                            # with a bare "exited with code 1".
+                            captured = []
+
+                            def _stream(chunk):
+                                captured.append(chunk)
+                                job.append(chunk)
+
                             job.append("$ apt-get update\n")
                             update_code = ssh.execute_sudo_streaming(
-                                "apt-get update", job.append, timeout=120,
+                                "apt-get update", _stream, timeout=120,
                                 stop_fn=lambda: job.cancel_requested,
                             )
                             if job.cancel_requested:
@@ -164,10 +173,18 @@ def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None)
                                 return
                             if update_code != 0:
                                 job.append(f"\napt-get update exited with code {update_code}.\n")
+                                hint = sudo_auth_failure_hint("".join(captured), credential.username)
+                                if hint:
+                                    # The upgrade is wrapped identically, so it would fail
+                                    # the same way; stop here with the explanation.
+                                    job.append(f"\n[Hint] {hint}\n")
+                                    job.finish(False)
+                                    return
 
+                            captured.clear()
                             job.append(f"\n$ {cmd}\n")
                             exit_code = ssh.execute_sudo_streaming(
-                                cmd, job.append, timeout=600,
+                                cmd, _stream, timeout=600,
                                 stop_fn=lambda: job.cancel_requested,
                             )
                             if job.cancel_requested:
@@ -218,6 +235,9 @@ def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None)
                                 return
                             else:
                                 job.append(f"\n\napt exited with code {exit_code}.\n")
+                                hint = sudo_auth_failure_hint("".join(captured), credential.username)
+                                if hint:
+                                    job.append(f"\n[Hint] {hint}\n")
                                 job.finish(False)
                                 return
                     except Exception as e:

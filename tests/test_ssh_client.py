@@ -21,6 +21,8 @@ import socket
 import time
 from unittest.mock import MagicMock, patch
 
+from clients.ssh_client import sudo_auth_failure_hint
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -225,6 +227,48 @@ class TestNeedsSudo:
 
 
 # ---------------------------------------------------------------------------
+# sudo_auth_failure_hint()
+# ---------------------------------------------------------------------------
+
+
+class TestSudoAuthFailureHint:
+    def test_clean_output_gives_no_hint(self):
+        assert sudo_auth_failure_hint("Reading package lists... Done\n") is None
+
+    def test_empty_output_gives_no_hint(self):
+        assert sudo_auth_failure_hint("") is None
+        assert sudo_auth_failure_hint(None) is None
+
+    def test_password_required_points_at_credential(self):
+        out = (
+            "sudo: a terminal is required to read the password; either use the -S option "
+            "to read from standard input or configure an askpass helper\n"
+            "sudo: a password is required\n"
+        )
+        hint = sudo_auth_failure_hint(out, "ubuntu")
+        assert "'ubuntu'" in hint
+        assert "sudo password" in hint
+        assert "NOPASSWD" in hint
+
+    def test_non_interactive_password_required_points_at_credential(self):
+        hint = sudo_auth_failure_hint("sudo: a password is required\n")
+        assert hint is not None
+        assert "the SSH user" in hint
+
+    def test_not_in_sudoers_is_distinct(self):
+        hint = sudo_auth_failure_hint("bob is not in the sudoers file.  This incident will be reported.\n", "bob")
+        assert "not permitted to use sudo" in hint
+
+    def test_missing_sudo_binary_is_distinct(self):
+        hint = sudo_auth_failure_hint("sh: 1: sudo: not found\n", "bob")
+        assert "not installed" in hint
+
+    def test_apt_failure_without_sudo_text_gives_no_hint(self):
+        out = "E: Could not get lock /var/lib/apt/lists/lock. It is held by process 1234\n"
+        assert sudo_auth_failure_hint(out, "ubuntu") is None
+
+
+# ---------------------------------------------------------------------------
 # sudo_wrap()
 # ---------------------------------------------------------------------------
 
@@ -234,10 +278,10 @@ class TestSudoWrap:
         client = _make_client(username="root")
         assert client.sudo_wrap("apt-get upgrade") == "apt-get upgrade"
 
-    def test_non_root_without_sudo_password_uses_plain_sudo(self):
+    def test_non_root_without_sudo_password_uses_non_interactive_sudo(self):
         client = _make_client(username="ubuntu", sudo_password=None)
         result = client.sudo_wrap("apt-get upgrade")
-        assert result == "sudo sh -c 'apt-get upgrade'"
+        assert result == "sudo -n sh -c 'apt-get upgrade'"
 
     def test_non_root_with_sudo_password_uses_sudo_S(self):
         client = _make_client(username="ubuntu", sudo_password="pass")
