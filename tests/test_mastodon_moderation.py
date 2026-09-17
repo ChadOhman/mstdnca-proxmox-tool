@@ -562,3 +562,69 @@ class TestMastodonViewerDenied:
             with app.app_context():
                 User.query.filter_by(username="_masto_viewer").delete()
                 db.session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Outbound User-Agent and proxy/CDN error pages
+# ---------------------------------------------------------------------------
+
+
+class TestUserAgentAndProxyErrors:
+    """Cloudflare blocks the default Python-urllib agent with a bare 403 (error
+    code 1010). The client must identify itself, and a non-JSON 403 must not be
+    reported as a token-scope problem."""
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_requests_carry_app_user_agent(self, mock_urlopen):
+        mock_urlopen.return_value = _resp({})
+        MastodonAdminClient(API, "t")._request("GET", "/api/v1/x")
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_header("User-agent") == "mstdnca-proxmox-tool"
+        assert "urllib" not in req.get_header("User-agent")
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_cloudflare_text_403_is_described_as_upstream_block(self, mock_urlopen):
+        fp = io.BytesIO(b"error code: 1010")
+        mock_urlopen.side_effect = urllib.error.HTTPError("https://masto.example/x", 403, "Forbidden", {}, fp)
+        with pytest.raises(MastodonAPIError) as ei:
+            MastodonAdminClient(API, "t")._request("GET", "/api/v1/admin/reports")
+        msg = ei.value.message
+        assert "HTTP 403" in msg
+        assert "error code: 1010" in msg
+        assert "proxy or firewall" in msg
+        assert "upstream firewall" in msg
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_html_error_page_is_reduced_to_text_snippet(self, mock_urlopen):
+        fp = io.BytesIO(b"<html><head><title>403 Forbidden</title></head><body><h1>Access denied</h1></body></html>")
+        mock_urlopen.side_effect = urllib.error.HTTPError("https://masto.example/x", 403, "Forbidden", {}, fp)
+        with pytest.raises(MastodonAPIError) as ei:
+            MastodonAdminClient(API, "t")._request("GET", "/api/v1/admin/reports")
+        assert "<" not in ei.value.message
+        assert "Access denied" in ei.value.message
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_json_scope_error_still_reports_api_text(self, mock_urlopen):
+        mock_urlopen.side_effect = _http_error(403, {"error": "This action is outside the authorized scopes"})
+        with pytest.raises(MastodonAPIError) as ei:
+            MastodonAdminClient(API, "t")._request("GET", "/api/v1/admin/reports")
+        assert "outside the authorized scopes" in ei.value.message
+        assert "proxy or firewall" not in ei.value.message
+
+
+class TestPeerTubeUserAgent:
+    @patch("core.moderation.urllib.request.urlopen")
+    def test_fetch_users_sends_app_user_agent(self, mock_urlopen):
+        from core.moderation import fetch_peertube_users
+
+        mock_urlopen.return_value = _resp({"total": 0, "data": []})
+        fetch_peertube_users("https://pt.example", "t")
+        assert mock_urlopen.call_args[0][0].get_header("User-agent") == "mstdnca-proxmox-tool"
+
+    @patch("core.moderation.urllib.request.urlopen")
+    def test_ban_sends_app_user_agent(self, mock_urlopen):
+        from core.moderation import ban_peertube_user
+
+        mock_urlopen.return_value = _resp({})
+        ban_peertube_user("https://pt.example", "t", 5)
+        assert mock_urlopen.call_args[0][0].get_header("User-agent") == "mstdnca-proxmox-tool"
