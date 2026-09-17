@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 # Hard cap on PeerTube pagination pages to avoid an unbounded loop if the API
 # ever returns a bad ``total`` or a non-shrinking page (100 users/page → 100k).
 _MAX_PEERTUBE_PAGES = 1000
+# CDNs such as Cloudflare reject Python's default User-Agent outright (403); send
+# the identifier the rest of the app uses for outbound HTTP.
+_USER_AGENT = "mstdnca-proxmox-tool"
 
 
 def _build_mastodon_email_query_cmd(db_name, query):
@@ -100,6 +103,7 @@ def fetch_peertube_users(api_url, api_token):
         url = f"{api_url}/api/v1/users?start={start}&count={count}&sort=createdAt"
         req = urllib.request.Request(url)
         req.add_header("Authorization", f"Bearer {api_token}")
+        req.add_header("User-Agent", _USER_AGENT)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
                 data = json.loads(resp.read().decode())
@@ -148,6 +152,7 @@ def ban_peertube_user(api_url, api_token, user_id, reason=""):
     body = json.dumps({"reason": reason}).encode()
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Authorization", f"Bearer {api_token}")
+    req.add_header("User-Agent", _USER_AGENT)
     req.add_header("Content-Type", "application/json")
 
     try:

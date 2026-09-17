@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 _MAX_PAGES = 5
 _PAGE_SIZE = 100
 _TIMEOUT = 30
+# Cloudflare (and similar) block Python's default "Python-urllib/x.y" agent with a
+# bare 403 (error code 1010) before the request ever reaches Mastodon. Send the
+# same identifier the rest of the app uses for outbound HTTP.
+_USER_AGENT = "mstdnca-proxmox-tool"
 
 # Valid ``type`` values for POST /api/v1/admin/accounts/:id/action.
 ACCOUNT_ACTION_TYPES = ("none", "disable", "silence", "suspend", "sensitive")
@@ -102,6 +106,7 @@ class MastodonAdminClient:
         req = urllib.request.Request(url, method=method)
         req.add_header("Authorization", f"Bearer {self._token}")
         req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", _USER_AGENT)
         if body is not None:
             data = json.dumps(body).encode()
             req.add_header("Content-Type", "application/json")
@@ -334,17 +339,28 @@ def summarize_domain_block(blk):
 
 
 def _describe_http_error(exc):
-    """Build a user-safe message from an HTTPError: status plus the API's own ``error`` field."""
+    """Build a user-safe message from an HTTPError: status plus the API's own ``error`` field.
+
+    When the body is not JSON the answer almost certainly came from something in
+    front of Mastodon (a CDN or firewall page such as Cloudflare's "error code:
+    1010"), so say that instead of blaming the token, and keep a short printable
+    snippet of the body to make the cause recognisable.
+    """
     detail = ""
+    raw = b""
     try:
-        payload = json.loads(exc.read().decode())
+        raw = exc.read() or b""
+        payload = json.loads(raw.decode())
         if isinstance(payload, dict):
-            detail = str(payload.get("error") or payload.get("error_description") or "")
-    except Exception:  # noqa: S110 -- body is optional, status alone is still useful
+            detail = str(payload.get("error") or payload.get("error_description") or "")[:200]
+    except Exception:  # noqa: S110 -- non-JSON body handled below
         pass
+    if not detail and raw and not _looks_like_json(raw):
+        snippet = " ".join(_TAG_RE.sub(" ", raw[:400].decode("utf-8", "replace")).split())[:80]
+        detail = f"non-JSON reply, probably from a proxy or firewall in front of Mastodon: {snippet!r}"
     hint = {
         401: "token rejected",
-        403: "token lacks the required admin scope",
+        403: "forbidden (token scope, account role, or an upstream firewall)",
         404: "not found",
         422: "request rejected",
     }.get(exc.code, "")
@@ -352,5 +368,13 @@ def _describe_http_error(exc):
     if hint:
         parts.append(hint)
     if detail:
-        parts.append(detail[:200])
+        parts.append(detail)
     return ": ".join([parts[0], " - ".join(parts[1:])]) if len(parts) > 1 else parts[0]
+
+
+def _looks_like_json(raw):
+    try:
+        json.loads(raw.decode())
+        return True
+    except Exception:
+        return False
