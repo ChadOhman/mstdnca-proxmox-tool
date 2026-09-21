@@ -567,3 +567,23 @@ class TestCollaborationFanOut:
             db.session.rollback()
 
         mock_hub.broadcast.assert_not_called()
+
+    def test_log_action_with_moderators_audience_sets_flag(self, app):
+        from auth.audit import log_action
+
+        with app.app_context(), patch("core.collaboration.collab_hub") as mock_hub:
+            log_action("moderation_watch_hit", "settings", audience="moderators")
+            db.session.rollback()
+
+        payload = mock_hub.broadcast.call_args[0][0]
+        assert payload["moderators_only"] is True
+
+    def test_log_action_without_audience_has_no_moderators_flag(self, app):
+        from auth.audit import log_action
+
+        with app.app_context(), patch("core.collaboration.collab_hub") as mock_hub:
+            log_action("settings_scan_save", "settings")
+            db.session.rollback()
+
+        payload = mock_hub.broadcast.call_args[0][0]
+        assert "moderators_only" not in payload

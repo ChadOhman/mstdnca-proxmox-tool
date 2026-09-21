@@ -13,7 +13,8 @@ BACKGROUND_ACTOR = "system"
 NO_BROADCAST_ACTIONS = frozenset({"guest_ssh_disconnect"})
 
 
-def log_action(action, resource_type, resource_id=None, resource_name=None, details=None, actor=None):
+def log_action(action, resource_type, resource_id=None, resource_name=None, details=None, actor=None,
+               audience=None):
     """Add an AuditLog entry to the current db.session.
 
     Call before db.session.commit() so the log entry is committed atomically
@@ -23,6 +24,12 @@ def log_action(action, resource_type, resource_id=None, resource_name=None, deta
     Safe to call outside a request context (e.g. from scheduler jobs, which run
     under an app context only): ``user_id`` and ``ip_address`` are then left
     NULL and the broadcast is attributed to ``actor`` (default ``"system"``).
+
+    ``audience="moderators"`` marks the broadcast payload as moderators-only
+    (see ``CollaborationHub.broadcast``) so it is only delivered to connected
+    users whose session was registered with ``can_moderate=True``. This only
+    affects the real-time broadcast -- the AuditLog row itself is unchanged
+    and still visible to anyone who can view the audit log.
     """
     in_request = has_request_context()
     user = current_user if in_request and current_user.is_authenticated else None
@@ -60,6 +67,8 @@ def log_action(action, resource_type, resource_id=None, resource_name=None, deta
             "username": username,
             "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         }
+        if audience == "moderators":
+            payload["moderators_only"] = True
         # Guest activity is tag-scoped: attach the guest's id and tag ids so the
         # hub can drop the event for subscribers who cannot access that guest.
         if resource_type == "guest" and resource_id is not None:

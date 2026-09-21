@@ -275,6 +275,131 @@
             </div>
         </div>
 
+        <!-- Watched accounts -->
+        <div class="card bg-dark mt-4" id="masto-watch-card">
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <h5 class="mb-0"><i class="bi bi-eye"></i> Watched Accounts <span class="badge bg-secondary" id="masto-watch-count"></span></h5>
+                <div class="d-flex align-items-center gap-2">
+                    <button type="button" class="btn btn-sm btn-outline-info" data-masto-poll>
+                        <i class="bi bi-lightning-charge"></i> Run poll now
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" data-masto-refresh="watches">
+                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                    </button>
+                </div>
+            </div>
+            <div class="card-body">
+                <div id="masto-watch-status" class="small mb-2"></div>
+                <div class="small text-muted mb-3">
+                    Only posts visible to the admin token's account are detected (public/unlisted, plus followers-only if it follows them).
+                </div>
+                <div id="masto-watch-body" class="text-muted small">Not loaded.</div>
+            </div>
+        </div>
+
+        <!-- Alerts -->
+        <div class="card bg-dark mt-4" id="masto-alerts-card">
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <h5 class="mb-0"><i class="bi bi-bell"></i> Alerts <span class="badge bg-secondary" id="masto-alerts-count"></span></h5>
+                <div class="d-flex align-items-center gap-2 flex-wrap">
+                    <div class="btn-group btn-group-sm" role="group" aria-label="Alert filter">
+                        <button type="button" class="btn btn-outline-secondary active" data-alert-filter="">All</button>
+                        <button type="button" class="btn btn-outline-secondary" data-alert-filter="watched_post">Watched posts</button>
+                        <button type="button" class="btn btn-outline-secondary" data-alert-filter="new_account">New accounts</button>
+                        <button type="button" class="btn btn-outline-secondary" data-alert-filter="silent_login">Silent logins</button>
+                    </div>
+                    <div class="form-check form-switch mb-0">
+                        <input class="form-check-input" type="checkbox" id="masto-alerts-acked">
+                        <label class="form-check-label small" for="masto-alerts-acked">Show acknowledged</label>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-success" id="masto-alerts-ack-all">
+                        <i class="bi bi-check2-all"></i> Acknowledge all
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" data-masto-refresh="alerts">
+                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                    </button>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div id="masto-alerts-body" class="p-3 small text-muted">Not loaded.</div>
+            </div>
+        </div>
+
+        <!-- New local accounts -->
+        <div class="card bg-dark mt-4" id="masto-new-accounts-card">
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <h5 class="mb-0"><i class="bi bi-person-lines-fill"></i> New Local Accounts <span class="badge bg-secondary" id="masto-new-accounts-count"></span></h5>
+                <div class="d-flex align-items-center gap-2">
+                    <label class="visually-hidden" for="masto-new-accounts-days">Window</label>
+                    <select class="form-select form-select-sm" id="masto-new-accounts-days" style="width:auto">
+                        <option value="7" selected>Last 7 days</option>
+                        <option value="14">Last 14 days</option>
+                        <option value="30">Last 30 days</option>
+                    </select>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" data-masto-refresh="new_accounts">
+                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                    </button>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div id="masto-new-accounts-body" class="p-3 small text-muted">Not loaded.</div>
+            </div>
+        </div>
+
+        <!-- Watch settings -->
+        {% if can_configure %}
+        <div class="card bg-dark mt-4" id="masto-watch-settings-card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-sliders"></i> Watch Settings</h5>
+            </div>
+            <div class="card-body">
+                <form method="post" action="/moderation/mastodon/watch/save">
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="watch_alerts_enabled" name="alerts_enabled"
+                               {{ 'checked' if watch_settings.alerts_enabled }}>
+                        <label class="form-check-label" for="watch_alerts_enabled">Enable moderation watch alerts</label>
+                        <div class="form-text">Master switch for the scheduled poll. Turn this on once accounts are watched.</div>
+                    </div>
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label" for="watch_poll_minutes">Poll interval (minutes)</label>
+                            <input type="number" class="form-control" id="watch_poll_minutes" name="poll_minutes"
+                                   value="{{ watch_settings.poll_minutes }}" min="1" max="1440">
+                            <div class="form-text">How often the scheduled poll checks watched accounts and new signups.</div>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label" for="watch_auto_watch_days">Auto-watch new accounts (days)</label>
+                            <input type="number" class="form-control" id="watch_auto_watch_days" name="auto_watch_days"
+                                   value="{{ watch_settings.auto_watch_days }}" min="0" max="90">
+                            <div class="form-text">Automatically watch newly discovered accounts for this many days. 0 disables auto-watch.</div>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label" for="watch_silent_login_days">Silent-login window (days)</label>
+                            <input type="number" class="form-control" id="watch_silent_login_days" name="silent_login_days"
+                                   value="{{ watch_settings.silent_login_days }}" min="1" max="90">
+                            <div class="form-text">Flag a login within this many days as a possible silent login.</div>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label" for="watch_silent_min_age_days">Minimum account age (days)</label>
+                            <input type="number" class="form-control" id="watch_silent_min_age_days" name="silent_min_age_days"
+                                   value="{{ watch_settings.silent_min_age_days }}" min="0" max="365">
+                            <div class="form-text">Only flag accounts created at least this long ago.</div>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label" for="watch_silent_scan_window_days">Scan window (days)</label>
+                            <input type="number" class="form-control" id="watch_silent_scan_window_days" name="silent_scan_window_days"
+                                   value="{{ watch_settings.silent_scan_window_days }}" min="7" max="365">
+                            <div class="form-text">How far back the silent-login scan looks for candidate accounts.</div>
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary mt-3">
+                        <i class="bi bi-check-lg"></i> Save Watch Settings
+                    </button>
+                </form>
+            </div>
+        </div>
+        {% endif %}
+
         <!-- Domain blocks -->
         <div class="card bg-dark mt-4" id="masto-domains-card">
             <div class="card-header d-flex justify-content-between align-items-center">
@@ -381,6 +506,39 @@
     </div>
 </div>
 
+<!-- Mastodon watch modal -->
+<div class="modal fade" id="mastoWatchModal" tabindex="-1" aria-modal="true" role="dialog" aria-labelledby="mastoWatchModalLabel">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border-secondary">
+            <form id="masto-watch-form">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title" id="mastoWatchModalLabel">Watch Account</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Cancel"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-3">Account: <strong class="font-monospace" id="masto-watch-acct"></strong></p>
+                    <input type="hidden" id="masto-watch-account-id">
+                    <div class="mb-3">
+                        <label class="form-label" for="masto-watch-reason">Reason</label>
+                        <textarea class="form-control" id="masto-watch-reason" rows="2" maxlength="2000"
+                                  placeholder="Optional note for other moderators."></textarea>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="masto-watch-days">Watch for (days)</label>
+                        <input type="number" class="form-control" id="masto-watch-days" min="0" max="365" value="30">
+                        <div class="form-text">0 = watch indefinitely.</div>
+                    </div>
+                    <div id="masto-watch-modal-error" class="text-danger small" aria-live="polite"></div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="masto-watch-submit">Watch</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 {% endblock %}
 
 {% block scripts %}
@@ -428,7 +586,7 @@
     const pane = document.getElementById('mastodon-pane');
     if (!pane) return;
     const configured = pane.dataset.configured === 'true';
-    const loaded = { reports: false, pending: false, domains: false };
+    const loaded = { reports: false, pending: false, domains: false, watches: false, alerts: false, new_accounts: false };
 
     // ── helpers ───────────────────────────────────────────────────────────
     function api(url, form) {
@@ -584,12 +742,15 @@
         if (a.silenced) html += '<button type="button" class="btn btn-sm btn-outline-success" data-act="unsilence">Remove limit</button>';
         if (a.disabled) html += '<button type="button" class="btn btn-sm btn-outline-success" data-act="enable">Unfreeze</button>';
         if (a.sensitized) html += '<button type="button" class="btn btn-sm btn-outline-success" data-act="unsensitive">Clear sensitive</button>';
+        if (!a.domain) html += '<button type="button" class="btn btn-sm btn-outline-info" data-act="watch">'
+              + '<i class="bi bi-eye"></i> Watch</button>';
         html += '</div><div class="mt-2" id="masto-account-error"></div>';
         acctPanel.innerHTML = html;
         acctPanel.classList.remove('text-muted');
         acctPanel.querySelectorAll('[data-act]').forEach(btn => btn.addEventListener('click', () => {
             const act = btn.dataset.act;
             if (act === 'action') { openActionModal(a); return; }
+            if (act === 'watch') { openWatchModal(a); return; }
             confirmDialog('Apply "' + btn.textContent.trim() + '" to ' + (a.acct || a.id) + '?').then(ok => {
                 if (!ok) return;
                 api('/moderation/mastodon/accounts/' + encodeURIComponent(a.id) + '/' + act, formData({ acct: a.acct }))
@@ -812,8 +973,268 @@
         });
     });
 
+    // ── watch modal ───────────────────────────────────────────────────────
+    const watchModalEl = document.getElementById('mastoWatchModal');
+    const watchModal = bootstrap.Modal.getOrCreateInstance(watchModalEl);
+
+    function openWatchModal(account) {
+        document.getElementById('masto-watch-acct').textContent = account.acct || account.id;
+        document.getElementById('masto-watch-account-id').value = account.id;
+        document.getElementById('masto-watch-reason').value = '';
+        document.getElementById('masto-watch-days').value = 30;
+        document.getElementById('masto-watch-modal-error').textContent = '';
+        watchModalEl.dataset.acct = account.acct || '';
+        watchModal.show();
+    }
+
+    document.getElementById('masto-watch-form').addEventListener('submit', e => {
+        e.preventDefault();
+        const submit = document.getElementById('masto-watch-submit');
+        const errEl = document.getElementById('masto-watch-modal-error');
+        submit.disabled = true;
+        errEl.textContent = '';
+        api('/moderation/mastodon/watch', formData({
+            account_id: document.getElementById('masto-watch-account-id').value,
+            acct: watchModalEl.dataset.acct,
+            reason: document.getElementById('masto-watch-reason').value,
+            days: document.getElementById('masto-watch-days').value,
+        }))
+            .then(() => {
+                watchModal.hide();
+                loadWatches();
+                if (loaded.new_accounts) loadNewAccounts();
+                if (loaded.alerts) loadAlerts();
+            })
+            .catch(err => { errEl.textContent = err.message; })
+            .finally(() => { submit.disabled = false; });
+    });
+
+    // ── watched accounts ──────────────────────────────────────────────────
+    const watchBody = document.getElementById('masto-watch-body');
+    const watchCount = document.getElementById('masto-watch-count');
+    const watchStatus = document.getElementById('masto-watch-status');
+
+    function renderWatchStatus(lastRun, backoffUntil) {
+        if (!lastRun) {
+            watchStatus.innerHTML = '<span class="text-muted">No poll has run yet.</span>';
+            return;
+        }
+        const alerts = lastRun.alerts || {};
+        const rl = lastRun.rate_limit || {};
+        let html = '<span class="text-muted">Last run ' + fmtDate(lastRun.at) + ': checked '
+            + (lastRun.checked || 0) + ' of ' + (lastRun.watch_total || 0)
+            + ' &middot; alerts ' + (alerts.watched_post || 0) + '/' + (alerts.new_account || 0) + '/' + (alerts.silent_login || 0);
+        if (rl.limit) html += ' &middot; rate budget ' + (rl.remaining != null ? rl.remaining : '?') + '/' + rl.limit;
+        html += '</span>';
+        if (lastRun.deferred || backoffUntil) {
+            html += '<div class="alert alert-warning py-1 px-2 mt-2 mb-0 small">'
+                + 'Poll paused to stay under Mastodon\'s rate limit — reduce watched accounts or raise the poll interval</div>';
+        }
+        if (lastRun.errors && lastRun.errors.length) {
+            html += '<div class="alert alert-danger py-1 px-2 mt-2 mb-0 small">' + lastRun.errors.map(escHtml).join('<br>') + '</div>';
+        }
+        watchStatus.innerHTML = html;
+    }
+
+    function renderWatches(watches) {
+        watchCount.textContent = watches.length;
+        if (!watches.length) {
+            watchBody.innerHTML = '<span class="text-muted">No watched accounts.</span>';
+            return;
+        }
+        let html = '<div class="table-responsive"><table class="table table-dark table-striped table-hover mb-0 align-middle">'
+            + '<thead><tr><th>Handle</th><th>Reason</th><th>Added by</th><th>Expires</th><th>Last checked</th><th class="text-end">Actions</th></tr></thead><tbody>';
+        watches.forEach(w => {
+            html += '<tr data-watch-id="' + escHtml(String(w.id)) + '">'
+                + '<td>' + acctLink({ acct: w.acct, id: w.account_id }) + (w.auto_added ? ' <span class="badge bg-secondary">auto</span>' : '') + '</td>'
+                + '<td class="small">' + escHtml(w.reason || '') + '</td>'
+                + '<td class="small">' + escHtml(w.added_by || 'system') + '</td>'
+                + '<td class="small">' + (w.expires_at ? fmtDate(w.expires_at) : '<span class="text-muted">never</span>') + '</td>'
+                + '<td class="small">' + (w.last_checked_at ? fmtDate(w.last_checked_at) : '<span class="text-muted">never</span>') + '</td>'
+                + '<td class="text-end"><button type="button" class="btn btn-sm btn-outline-danger" data-watch-del>Remove</button></td>'
+                + '</tr>';
+        });
+        html += '</tbody></table></div><div class="pt-2" id="masto-watch-error"></div>';
+        watchBody.innerHTML = html;
+
+        watchBody.querySelectorAll('[data-watch-del]').forEach(btn => btn.addEventListener('click', () => {
+            const tr = btn.closest('tr');
+            const id = tr.dataset.watchId;
+            const w = watches.find(x => String(x.id) === id);
+            confirmDialog('Stop watching ' + (w.acct || id) + '?').then(ok => {
+                if (!ok) return;
+                api('/moderation/mastodon/watch/' + encodeURIComponent(id) + '/delete', new FormData())
+                    .then(loadWatches)
+                    .catch(err => { document.getElementById('masto-watch-error').innerHTML = errorBox(err.message); });
+            });
+        }));
+    }
+
+    function loadWatches() {
+        if (!configured) { notConfigured(watchBody); return; }
+        loaded.watches = true;
+        watchBody.innerHTML = '<span class="text-muted">Loading…</span>';
+        api('/moderation/mastodon/watch')
+            .then(d => {
+                renderWatches(d.watches || []);
+                renderWatchStatus(d.last_run, d.backoff_until);
+            })
+            .catch(err => { watchBody.innerHTML = errorBox(err.message); });
+    }
+
+    const pollBtn = pane.querySelector('[data-masto-poll]');
+    function repollWatches(times) {
+        if (times <= 0) { if (loaded.alerts) loadAlerts(); return; }
+        setTimeout(() => {
+            loadWatches();
+            repollWatches(times - 1);
+        }, 3000);
+    }
+    if (pollBtn) pollBtn.addEventListener('click', () => {
+        pollBtn.disabled = true;
+        api('/moderation/mastodon/watch/poll', new FormData())
+            .then(() => { repollWatches(10); })
+            .catch(err => { watchStatus.innerHTML = errorBox(err.message); })
+            .finally(() => { pollBtn.disabled = false; });
+    });
+
+    // ── alerts ────────────────────────────────────────────────────────────
+    const alertsBody = document.getElementById('masto-alerts-body');
+    const alertsCount = document.getElementById('masto-alerts-count');
+    const alertsAckedToggle = document.getElementById('masto-alerts-acked');
+    let alertFilter = '';
+
+    function alertKindLabel(kind) {
+        return { watched_post: 'Watched post', new_account: 'New account', silent_login: 'Silent login' }[kind] || kind;
+    }
+
+    function alertKindBadge(kind) {
+        const cls = kind === 'silent_login' ? 'bg-warning text-dark' : kind === 'new_account' ? 'bg-info text-dark' : 'bg-secondary';
+        return '<span class="badge ' + cls + '">' + escHtml(alertKindLabel(kind)) + '</span>';
+    }
+
+    function renderAlerts(alerts) {
+        alertsCount.textContent = alerts.length;
+        if (!alerts.length) {
+            alertsBody.innerHTML = '<span class="text-muted">No alerts.</span>';
+            return;
+        }
+        let html = '<div class="table-responsive"><table class="table table-dark table-striped table-hover mb-0 align-middle">'
+            + '<thead><tr><th>Kind</th><th>Handle</th><th>Excerpt</th><th>When</th><th class="text-end">Actions</th></tr></thead><tbody>';
+        alerts.forEach(a => {
+            html += '<tr data-alert-id="' + escHtml(String(a.id)) + '">'
+                + '<td>' + alertKindBadge(a.kind) + '</td>'
+                + '<td>' + acctLink({ acct: a.acct, id: a.account_id }) + '</td>'
+                + '<td class="small" style="max-width:24rem">' + escHtml(a.excerpt || '')
+                + (a.status_url ? ' <a href="' + escHtml(a.status_url) + '" target="_blank" rel="noopener">View</a>' : '') + '</td>'
+                + '<td class="small">' + fmtDate(a.created_at) + '</td>'
+                + '<td class="text-end text-nowrap">'
+                + (a.acknowledged_at
+                    ? '<span class="text-muted small">acked</span>'
+                    : '<button type="button" class="btn btn-sm btn-outline-success me-1" data-alert-act="ack">Ack</button>')
+                + (a.watched ? '' : '<button type="button" class="btn btn-sm btn-outline-info" data-alert-act="watch">Watch</button>')
+                + '</td></tr>';
+        });
+        html += '</tbody></table></div><div class="p-2" id="masto-alerts-error"></div>';
+        alertsBody.innerHTML = html;
+
+        alertsBody.querySelectorAll('[data-alert-act]').forEach(btn => btn.addEventListener('click', () => {
+            const tr = btn.closest('tr');
+            const id = tr.dataset.alertId;
+            const a = alerts.find(x => String(x.id) === id);
+            const act = btn.dataset.alertAct;
+            const errEl = document.getElementById('masto-alerts-error');
+            if (act === 'ack') {
+                api('/moderation/mastodon/alerts/' + encodeURIComponent(id) + '/ack', new FormData())
+                    .then(loadAlerts)
+                    .catch(err => { errEl.innerHTML = errorBox(err.message); });
+            } else if (act === 'watch') {
+                openWatchModal({ id: a.account_id, acct: a.acct });
+            }
+        }));
+    }
+
+    function loadAlerts() {
+        if (!configured) { notConfigured(alertsBody); return; }
+        loaded.alerts = true;
+        alertsBody.innerHTML = '<span class="text-muted">Loading…</span>';
+        const params = new URLSearchParams();
+        if (alertFilter) params.set('kind', alertFilter);
+        if (alertsAckedToggle.checked) params.set('include_acked', '1');
+        api('/moderation/mastodon/alerts?' + params.toString())
+            .then(d => renderAlerts(d.alerts || []))
+            .catch(err => { alertsBody.innerHTML = errorBox(err.message); });
+    }
+
+    pane.querySelectorAll('[data-alert-filter]').forEach(btn => btn.addEventListener('click', () => {
+        pane.querySelectorAll('[data-alert-filter]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        alertFilter = btn.dataset.alertFilter;
+        loadAlerts();
+    }));
+    alertsAckedToggle.addEventListener('change', loadAlerts);
+    document.getElementById('masto-alerts-ack-all').addEventListener('click', () => {
+        confirmDialog('Acknowledge all' + (alertFilter ? ' ' + alertKindLabel(alertFilter).toLowerCase() : '') + ' alerts?').then(ok => {
+            if (!ok) return;
+            api('/moderation/mastodon/alerts/ack_all', formData({ kind: alertFilter }))
+                .then(loadAlerts)
+                .catch(err => {
+                    const errEl = document.getElementById('masto-alerts-error');
+                    if (errEl) errEl.innerHTML = errorBox(err.message);
+                });
+        });
+    });
+
+    // ── new local accounts ────────────────────────────────────────────────
+    const newAccountsBody = document.getElementById('masto-new-accounts-body');
+    const newAccountsCount = document.getElementById('masto-new-accounts-count');
+    const newAccountsDays = document.getElementById('masto-new-accounts-days');
+
+    function renderNewAccounts(accounts) {
+        newAccountsCount.textContent = accounts.length;
+        if (!accounts.length) {
+            newAccountsBody.innerHTML = '<span class="text-muted">No new local accounts in this window.</span>';
+            return;
+        }
+        let html = '<div class="table-responsive"><table class="table table-dark table-striped table-hover mb-0 align-middle">'
+            + '<thead><tr><th>Handle</th><th>Created</th><th>Posts</th><th>Last login</th><th class="text-end">Actions</th></tr></thead><tbody>';
+        accounts.forEach(a => {
+            html += '<tr data-account-id="' + escHtml(String(a.id)) + '">'
+                + '<td>' + acctLink(a) + '</td>'
+                + '<td class="small">' + fmtDate(a.created_at) + '</td>'
+                + '<td class="small">' + (a.statuses_count || 0) + '</td>'
+                + '<td class="small">' + (a.last_login_at ? fmtDate(a.last_login_at) : '<span class="text-muted">never</span>') + '</td>'
+                + '<td class="text-end">' + (a.watched
+                    ? '<span class="badge bg-secondary">Watched</span>'
+                    : '<button type="button" class="btn btn-sm btn-outline-info" data-new-account-watch>Watch</button>') + '</td>'
+                + '</tr>';
+        });
+        html += '</tbody></table></div>';
+        newAccountsBody.innerHTML = html;
+
+        newAccountsBody.querySelectorAll('[data-new-account-watch]').forEach(btn => btn.addEventListener('click', () => {
+            const tr = btn.closest('tr');
+            const id = tr.dataset.accountId;
+            const a = accounts.find(x => String(x.id) === id);
+            openWatchModal(a);
+        }));
+    }
+
+    function loadNewAccounts() {
+        if (!configured) { notConfigured(newAccountsBody); return; }
+        loaded.new_accounts = true;
+        newAccountsBody.innerHTML = '<span class="text-muted">Loading…</span>';
+        api('/moderation/mastodon/new_accounts?days=' + encodeURIComponent(newAccountsDays.value))
+            .then(d => renderNewAccounts(d.accounts || []))
+            .catch(err => { newAccountsBody.innerHTML = errorBox(err.message); });
+    }
+    newAccountsDays.addEventListener('change', loadNewAccounts);
+
     // ── wiring ────────────────────────────────────────────────────────────
-    const loaders = { reports: loadReports, pending: loadPending, domains: loadDomains };
+    const loaders = {
+        reports: loadReports, pending: loadPending, domains: loadDomains,
+        watches: loadWatches, alerts: loadAlerts, new_accounts: loadNewAccounts,
+    };
     pane.querySelectorAll('[data-masto-refresh]').forEach(btn =>
         btn.addEventListener('click', () => loaders[btn.dataset.mastoRefresh]()));
 
@@ -821,6 +1242,9 @@
         if (!loaded.reports) loadReports();
         if (!loaded.pending) loadPending();
         if (!loaded.domains) loadDomains();
+        if (!loaded.watches) loadWatches();
+        if (!loaded.alerts) loadAlerts();
+        if (!loaded.new_accounts) loadNewAccounts();
     }
     document.getElementById('mastodon-tab').addEventListener('shown.bs.tab', loadAll);
     if (pane.classList.contains('active')) loadAll();

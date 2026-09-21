@@ -4,7 +4,7 @@ import json
 import logging
 import threading as _threading
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
@@ -18,7 +18,7 @@ from core.mastodon_admin import (
     MastodonAPIError,
     validate_domain,
 )
-from models import Setting, db
+from models import ModerationAlert, ModerationWatch, Setting, db
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,13 @@ _ADMIN_ONLY_ENDPOINTS = frozenset({
     "moderation.save",
     "moderation.mastodon_save",
     "moderation.mastodon_test",
+    "moderation.mastodon_watch_save",
 })
+
+# Guards the check-then-set on the manual "run poll now" job (TOCTOU): without
+# it, two concurrent /watch/poll requests could both observe running=False.
+_watch_poll_lock = _threading.Lock()
+_watch_poll_state = {"running": False}
 
 
 @bp.before_request
@@ -123,6 +129,8 @@ def index():
         except (json.JSONDecodeError, TypeError):
             pass
 
+    from core.moderation_watch import get_watch_settings
+
     active_tab = "mastodon" if request.args.get("tab") == "mastodon" else "peertube"
     return render_template(
         "moderation.html",
@@ -131,6 +139,7 @@ def index():
         job=_moderation_job,
         active_tab=active_tab,
         can_configure=current_user.is_admin,
+        watch_settings=get_watch_settings(),
     )
 
 
@@ -271,6 +280,66 @@ def _form_text(name):
 
 def _form_flag(name):
     return request.form.get(name, "").lower() in ("1", "true", "on", "yes")
+
+
+def _arg_flag(name):
+    return request.args.get(name, "").lower() in ("1", "true", "on", "yes")
+
+
+
+def _utc_iso(value):
+    """Serialise a DB datetime as ISO 8601 with an explicit UTC offset.
+
+    SQLite hands naive datetimes back even though every row is written in UTC;
+    without the offset the browser would parse them as local time.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
+
+
+def _serialize_watch(watch):
+    return {
+        "id": watch.id,
+        "account_id": watch.mastodon_account_id,
+        "acct": watch.acct,
+        "reason": watch.reason or "",
+        "added_by": watch.added_by.display_name if watch.added_by else "system",
+        "added_at": _utc_iso(watch.added_at),
+        "expires_at": _utc_iso(watch.expires_at),
+        "auto_added": bool(watch.auto_added),
+        "last_checked_at": _utc_iso(watch.last_checked_at),
+    }
+
+
+def _serialize_alert(alert, watched_ids):
+    return {
+        "id": alert.id,
+        "kind": alert.kind,
+        "account_id": alert.mastodon_account_id,
+        "acct": alert.acct,
+        "status_id": alert.status_id,
+        "status_url": alert.status_url,
+        "excerpt": alert.excerpt or "",
+        "created_at": _utc_iso(alert.created_at),
+        "acknowledged_at": _utc_iso(alert.acknowledged_at),
+        "watched": alert.mastodon_account_id in watched_ids,
+    }
+
+
+def _watched_account_ids(account_ids):
+    """Return the subset of ``account_ids`` that has an active ModerationWatch row."""
+    account_ids = [a for a in account_ids if a]
+    if not account_ids:
+        return set()
+    rows = (
+        db.session.query(ModerationWatch.mastodon_account_id)
+        .filter(ModerationWatch.mastodon_account_id.in_(account_ids))
+        .all()
+    )
+    return {row[0] for row in rows}
 
 
 @bp.route("/mastodon/save", methods=["POST"])
@@ -457,3 +526,274 @@ def mastodon_domain_block_delete(block_id):
         audit=("mastodon_domain_block_delete", "mastodon_domain_block", domain or str(block_id),
                {"block_id": str(block_id)}),
     )
+
+
+# ---------------------------------------------------------------------------
+# Moderation watch: watched accounts, deduplicated alerts, new-signup and
+# silent-login discovery. See core/moderation_watch.py for the poll itself.
+# ---------------------------------------------------------------------------
+
+
+@bp.route("/mastodon/watch")
+def mastodon_watch_list():
+    watches = ModerationWatch.query.order_by(ModerationWatch.added_at.desc()).all()
+
+    last_run = None
+    raw_result = Setting.get("moderation_watch_last_run_result", "")
+    if raw_result:
+        try:
+            last_run = json.loads(raw_result)
+        except (json.JSONDecodeError, TypeError):
+            last_run = None
+    if last_run is not None:
+        last_run["at"] = Setting.get("moderation_watch_last_run_at", "") or None
+
+    return jsonify({
+        "ok": True,
+        "watches": [_serialize_watch(w) for w in watches],
+        "last_run": last_run,
+        "backoff_until": Setting.get("moderation_watch_backoff_until", "") or None,
+    })
+
+
+@bp.route("/mastodon/watch", methods=["POST"])
+def mastodon_watch_add():
+    account_id = _form_text("account_id")
+    if not account_id.isdigit():
+        return jsonify({"ok": False, "error": "A numeric account_id is required"}), 400
+    acct = _form_text("acct")
+    if not acct:
+        return jsonify({"ok": False, "error": "acct is required"}), 400
+    reason = _form_text("reason")
+    days = request.form.get("days", 0, type=int) or 0
+    days = max(0, min(365, days))
+
+    if ModerationWatch.query.filter_by(mastodon_account_id=account_id).first():
+        return jsonify({"ok": False, "error": "Already watched"}), 409
+
+    def _do(c):
+        statuses = c.account_statuses(account_id, limit=1)
+        last_status_id = statuses[0]["id"] if statuses else None
+        watch = ModerationWatch(
+            mastodon_account_id=account_id,
+            acct=acct,
+            reason=reason or None,
+            added_by_user_id=current_user.id,
+            expires_at=(datetime.now(timezone.utc) + timedelta(days=days)) if days else None,
+            last_status_id=last_status_id,
+        )
+        db.session.add(watch)
+        db.session.flush()
+        return {"watch": _serialize_watch(watch)}
+
+    return _mastodon_json(
+        _do,
+        audit=("mastodon_watch_add", "mastodon_account", acct, {"account_id": account_id, "days": days}),
+    )
+
+
+@bp.route("/mastodon/watch/<int:watch_id>/delete", methods=["POST"])
+def mastodon_watch_remove(watch_id):
+    watch = db.session.get(ModerationWatch, watch_id)
+    if not watch:
+        return jsonify({"ok": False, "error": "Watch not found"}), 404
+    acct = watch.acct
+    db.session.delete(watch)
+    log_action("mastodon_watch_remove", "mastodon_account", resource_name=acct,
+               details={"watch_id": watch_id, "account_id": watch.mastodon_account_id})
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@bp.route("/mastodon/alerts")
+def mastodon_alerts():
+    kind = request.args.get("kind", "")
+    if kind and kind not in ModerationAlert.KINDS:
+        return jsonify({"ok": False, "error": "Unknown alert kind"}), 400
+    include_acked = _arg_flag("include_acked")
+    limit = request.args.get("limit", 50, type=int) or 50
+    limit = max(1, min(200, limit))
+
+    query = ModerationAlert.query
+    if kind:
+        query = query.filter_by(kind=kind)
+    if not include_acked:
+        query = query.filter(ModerationAlert.acknowledged_at.is_(None))
+    alerts = query.order_by(ModerationAlert.created_at.desc()).limit(limit).all()
+
+    watched_ids = _watched_account_ids([a.mastodon_account_id for a in alerts])
+    return jsonify({"ok": True, "alerts": [_serialize_alert(a, watched_ids) for a in alerts]})
+
+
+@bp.route("/mastodon/alerts/<int:alert_id>/ack", methods=["POST"])
+def mastodon_alert_ack(alert_id):
+    alert = db.session.get(ModerationAlert, alert_id)
+    if not alert:
+        return jsonify({"ok": False, "error": "Alert not found"}), 404
+    if alert.acknowledged_at is None:
+        alert.acknowledged_at = datetime.now(timezone.utc)
+        alert.acknowledged_by_user_id = current_user.id
+        db.session.commit()
+    return jsonify({"ok": True})
+
+
+@bp.route("/mastodon/alerts/ack_all", methods=["POST"])
+def mastodon_alerts_ack_all():
+    kind = _form_text("kind")
+    if kind and kind not in ModerationAlert.KINDS:
+        return jsonify({"ok": False, "error": "Unknown alert kind"}), 400
+
+    query = ModerationAlert.query.filter(ModerationAlert.acknowledged_at.is_(None))
+    if kind:
+        query = query.filter_by(kind=kind)
+    count = query.update(
+        {
+            "acknowledged_at": datetime.now(timezone.utc),
+            "acknowledged_by_user_id": current_user.id,
+        },
+        synchronize_session=False,
+    )
+    log_action("mastodon_alerts_ack_all", "moderation", details={"kind": kind or None, "count": count})
+    db.session.commit()
+    return jsonify({"ok": True, "count": count})
+
+
+@bp.route("/mastodon/new_accounts")
+def mastodon_new_accounts():
+    days = request.args.get("days", 7, type=int) or 7
+    days = max(1, min(30, days))
+
+    def _do(c):
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        accounts = c.list_local_accounts(newer_than=since, max_pages=3)
+        watched_ids = _watched_account_ids([a.get("id") for a in accounts])
+        for a in accounts:
+            a["watched"] = a.get("id") in watched_ids
+        return {"accounts": accounts}
+
+    return _mastodon_json(_do)
+
+
+@bp.route("/mastodon/watch/poll", methods=["POST"])
+def mastodon_watch_poll_now():
+    from flask import current_app
+
+    from core.moderation_watch import build_admin_client, run_watch_poll
+
+    client, err = build_admin_client()
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+
+    with _watch_poll_lock:
+        if _watch_poll_state["running"]:
+            return jsonify({"ok": False, "error": "A poll is already running"}), 409
+        _watch_poll_state["running"] = True
+
+    app = current_app._get_current_object()
+
+    def _worker():
+        with app.app_context():
+            try:
+                run_watch_poll(client)
+            except Exception:
+                logger.exception("Manual moderation watch poll failed")
+            finally:
+                _watch_poll_state["running"] = False
+
+    t = _threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+    log_action("mastodon_watch_poll_now", "moderation")
+    db.session.commit()
+    return jsonify({"ok": True, "started": True})
+
+
+@bp.route("/mastodon/summary")
+def mastodon_summary():
+    configured = bool(
+        Setting.get("moderation_mastodon_api_url", "") and Setting.get("moderation_mastodon_api_token", "")
+    )
+
+    unacked = {}
+    for kind in ModerationAlert.KINDS:
+        unacked[kind] = (
+            ModerationAlert.query.filter_by(kind=kind).filter(ModerationAlert.acknowledged_at.is_(None)).count()
+        )
+    unacked_total = sum(unacked.values())
+    watch_total = ModerationWatch.query.count()
+
+    recent = (
+        ModerationAlert.query.filter(ModerationAlert.acknowledged_at.is_(None))
+        .order_by(ModerationAlert.created_at.desc())
+        .limit(5)
+        .all()
+    )
+    watched_ids = _watched_account_ids([a.mastodon_account_id for a in recent])
+
+    open_reports = None
+    pending_accounts = None
+    live_error = None
+    if configured:
+        client, err = _get_mastodon_client()
+        if err:
+            live_error = err
+        else:
+            try:
+                count, more = client.open_report_count()
+                open_reports = {"count": count, "more": more}
+                count2, more2 = client.pending_account_count()
+                pending_accounts = {"count": count2, "more": more2}
+            except MastodonAPIError as exc:
+                live_error = exc.message
+
+    return jsonify({
+        "ok": True,
+        "configured": configured,
+        "unacked": unacked,
+        "unacked_total": unacked_total,
+        "watch_total": watch_total,
+        "recent_alerts": [_serialize_alert(a, watched_ids) for a in recent],
+        "last_run_at": Setting.get("moderation_watch_last_run_at", "") or None,
+        "open_reports": open_reports,
+        "pending_accounts": pending_accounts,
+        "live_error": live_error,
+    })
+
+
+@bp.route("/mastodon/watch/save", methods=["POST"])
+def mastodon_watch_save():
+    from core.scheduler import parse_interval, reschedule_moderation_watch
+
+    poll_minutes, error = parse_interval("moderation_watch_poll_minutes", request.form.get("poll_minutes", "5"))
+    if error:
+        flash(f"Poll interval {error}", "error")
+        return redirect(url_for("moderation.index", tab="mastodon"))
+
+    def _clamp(name, default, low, high):
+        raw = request.form.get(name, str(default))
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            value = default
+        return max(low, min(high, value))
+
+    alerts_enabled = _form_flag("alerts_enabled")
+    auto_watch_days = _clamp("auto_watch_days", 0, 0, 90)
+    silent_login_days = _clamp("silent_login_days", 7, 1, 90)
+    silent_min_age_days = _clamp("silent_min_age_days", 14, 0, 365)
+    silent_scan_window_days = _clamp("silent_scan_window_days", 90, 7, 365)
+
+    Setting.set("moderation_watch_alerts_enabled", "true" if alerts_enabled else "false")
+    Setting.set("moderation_watch_poll_minutes", str(poll_minutes))
+    Setting.set("moderation_watch_auto_watch_days", str(auto_watch_days))
+    Setting.set("moderation_watch_silent_login_days", str(silent_login_days))
+    Setting.set("moderation_watch_silent_min_age_days", str(silent_min_age_days))
+    Setting.set("moderation_watch_silent_scan_window_days", str(silent_scan_window_days))
+
+    log_action("moderation_watch_config_save", "moderation")
+    db.session.commit()
+
+    reschedule_moderation_watch(poll_minutes)
+
+    flash("Moderation watch settings saved.", "success")
+    return redirect(url_for("moderation.index", tab="mastodon"))

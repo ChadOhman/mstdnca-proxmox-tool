@@ -3,6 +3,7 @@
 import io
 import json
 import urllib.error
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,9 +11,13 @@ import pytest
 from core.mastodon_admin import (
     MastodonAdminClient,
     MastodonAPIError,
+    RateLimitState,
+    parse_iso,
     strip_html,
+    summarize_account_activity,
     summarize_admin_account,
     summarize_report,
+    summarize_status,
     validate_domain,
 )
 
@@ -92,6 +97,61 @@ class TestHelpers:
         assert out["id"] == "5"
         out_local = summarize_admin_account({"id": "6", "username": "l", "domain": None})
         assert out_local["acct"] == "l"
+
+    def test_parse_iso_handles_z_suffix(self):
+        dt = parse_iso("2026-09-01T12:30:00Z")
+        assert dt is not None
+        assert dt.tzinfo is not None
+        assert (dt.year, dt.month, dt.day, dt.hour, dt.minute) == (2026, 9, 1, 12, 30)
+
+    @pytest.mark.parametrize("raw", [None, "", "not-a-timestamp", 12345])
+    def test_parse_iso_rejects_bad_input(self, raw):
+        assert parse_iso(raw) is None
+
+    def test_summarize_status_lifts_account_acct_and_visibility(self):
+        st = {
+            "id": 9, "url": "s9", "created_at": "2026-09-01T00:00:00Z",
+            "content": "<p>buy <b>now</b></p>", "sensitive": True, "media_attachments": [1, 2],
+            "visibility": "public", "account": {"acct": "poster"},
+        }
+        out = summarize_status(st)
+        assert out == {
+            "id": "9", "url": "s9", "created_at": "2026-09-01T00:00:00Z", "excerpt": "buy now",
+            "sensitive": True, "media_count": 2, "visibility": "public", "account_acct": "poster",
+        }
+
+    def test_summarize_status_tolerates_missing_account(self):
+        out = summarize_status({"id": "1"})
+        assert out["account_acct"] is None
+        assert summarize_status(None)["id"] is None
+
+    def test_summarize_account_activity_excludes_pii(self):
+        adm = {
+            "id": "5", "username": "u", "domain": None, "email": "u@example.com", "ip": "10.0.0.9",
+            "created_at": "2026-01-01T00:00:00Z", "confirmed": True, "approved": True,
+            "disabled": False, "suspended": False, "silenced": False, "role": {"name": "User"},
+            "account": {
+                "id": "5", "acct": "u", "display_name": "U", "url": "uurl",
+                "statuses_count": 3, "last_status_at": "2026-05-01T00:00:00Z",
+            },
+            "ips": [
+                {"ip": "1.1.1.1", "used_at": "2026-01-02T00:00:00Z"},
+                {"ip": "2.2.2.2", "used_at": "2026-03-05T00:00:00Z"},
+            ],
+        }
+        out = summarize_account_activity(adm)
+        assert out["id"] == "5"
+        assert out["acct"] == "u"
+        assert out["statuses_count"] == 3
+        assert out["last_login_at"] == "2026-03-05T00:00:00Z"
+        assert out["role"] == "User"
+        assert "ips" not in out
+        assert "ip" not in out
+        assert "email" not in out
+
+    def test_summarize_account_activity_no_logins_is_none(self):
+        out = summarize_account_activity({"id": "1", "username": "a", "account": {}})
+        assert out["last_login_at"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +245,96 @@ class TestClientTransport:
         with pytest.raises(MastodonAPIError):
             MastodonAdminClient(API, "t")._get_all("/api/v1/admin/reports")
 
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_extra_headers_are_sent(self, mock_urlopen):
+        mock_urlopen.return_value = _resp({})
+        MastodonAdminClient(API, "t")._request(
+            "POST", "/api/v1/y", body={"a": 1}, headers={"Idempotency-Key": "abc123"},
+        )
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_header("Idempotency-key") == "abc123"
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_rate_limit_headers_parsed_on_success(self, mock_urlopen):
+        mock_urlopen.return_value = _resp({}, headers={
+            "X-RateLimit-Limit": "300",
+            "X-RateLimit-Remaining": "50",
+            "X-RateLimit-Reset": "2026-09-21T00:00:00.000Z",
+        })
+        c = MastodonAdminClient(API, "t")
+        c._request("GET", "/api/v1/x")
+        assert c.rate_limit.limit == 300
+        assert c.rate_limit.remaining == 50
+        assert c.rate_limit.reset_at is not None
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_rate_limit_headers_missing_gives_none_fields(self, mock_urlopen):
+        mock_urlopen.return_value = _resp({})
+        c = MastodonAdminClient(API, "t")
+        c._request("GET", "/api/v1/x")
+        assert c.rate_limit.limit is None
+        assert c.rate_limit.remaining is None
+        assert c.rate_limit.reset_at is None
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_rate_limit_headers_malformed_never_raises(self, mock_urlopen):
+        mock_urlopen.return_value = _resp({}, headers={
+            "X-RateLimit-Limit": "not-a-number", "X-RateLimit-Reset": "not-a-date",
+        })
+        c = MastodonAdminClient(API, "t")
+        c._request("GET", "/api/v1/x")
+        assert c.rate_limit.limit is None
+        assert c.rate_limit.reset_at is None
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_429_carries_retry_after_from_header_and_rate_limit_state(self, mock_urlopen):
+        fp = io.BytesIO(json.dumps({"error": "throttled"}).encode())
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://masto.example/x", 429, "Too Many Requests",
+            {"Retry-After": "30", "X-RateLimit-Remaining": "0"}, fp,
+        )
+        c = MastodonAdminClient(API, "t")
+        with pytest.raises(MastodonAPIError) as ei:
+            c._request("GET", "/api/v1/admin/reports")
+        assert ei.value.http_status == 429
+        assert ei.value.retry_after == 30
+        assert c.rate_limit.remaining == 0
+        assert "rate limited by Mastodon" in ei.value.message
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_429_without_retry_after_header_falls_back_to_reset_at(self, mock_urlopen):
+        reset_at = (datetime.now(timezone.utc) + timedelta(seconds=45)).isoformat()
+        fp = io.BytesIO(b"")
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://masto.example/x", 429, "Too Many Requests", {"X-RateLimit-Reset": reset_at}, fp,
+        )
+        c = MastodonAdminClient(API, "t")
+        with pytest.raises(MastodonAPIError) as ei:
+            c._request("GET", "/api/v1/admin/reports")
+        assert ei.value.retry_after is not None
+        assert 0 <= ei.value.retry_after <= 45
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_non_429_http_error_leaves_retry_after_none(self, mock_urlopen):
+        mock_urlopen.side_effect = _http_error(403, {"error": "nope"})
+        with pytest.raises(MastodonAPIError) as ei:
+            MastodonAdminClient(API, "t")._request("GET", "/api/v1/x")
+        assert ei.value.retry_after is None
+
+    def test_budget_ok_true_when_no_rate_limit_observed(self):
+        c = MastodonAdminClient(API, "t")
+        assert c.budget_ok(60) is True
+
+    def test_budget_ok_false_when_remaining_below_reserve(self):
+        c = MastodonAdminClient(API, "t")
+        c.rate_limit = RateLimitState(limit=300, remaining=50, reset_at=None, observed_at=datetime.now(timezone.utc))
+        assert c.budget_ok(60) is False
+
+    def test_budget_ok_true_when_remaining_comfortably_above_reserve(self):
+        c = MastodonAdminClient(API, "t")
+        c.rate_limit = RateLimitState(limit=300, remaining=200, reset_at=None, observed_at=datetime.now(timezone.utc))
+        assert c.budget_ok(60) is True
+
 
 # ---------------------------------------------------------------------------
 # Client operations
@@ -277,6 +427,101 @@ class TestClientOperations:
         assert req.get_method() == "DELETE"
         assert req.full_url == f"{API}/api/v1/admin/domain_blocks/3"
 
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_list_local_accounts_sends_origin_and_status(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").list_local_accounts()
+        url = mock_urlopen.call_args[0][0].full_url
+        assert "origin=local" in url
+        assert "status=active" in url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_list_local_accounts_drops_remote_rows(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([
+            {"id": "1", "username": "loc", "domain": None, "created_at": "2026-09-01T00:00:00Z",
+             "account": {"acct": "loc"}},
+            {"id": "2", "username": "rem", "domain": "remote.example", "created_at": "2026-09-01T00:00:00Z",
+             "account": {"acct": "rem@remote.example"}},
+        ])
+        out = MastodonAdminClient(API, "t").list_local_accounts()
+        assert [a["username"] for a in out] == ["loc"]
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_list_local_accounts_output_excludes_pii(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([
+            {"id": "1", "username": "loc", "domain": None, "email": "loc@example.com", "ip": "9.9.9.9",
+             "created_at": "2026-09-01T00:00:00Z", "account": {"acct": "loc"},
+             "ips": [{"ip": "9.9.9.9", "used_at": "2026-09-01T00:00:00Z"}]},
+        ])
+        out = MastodonAdminClient(API, "t").list_local_accounts()
+        assert "ips" not in out[0]
+        assert "ip" not in out[0]
+        assert "email" not in out[0]
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_list_local_accounts_stops_paging_at_cutoff(self, mock_urlopen):
+        # A same-origin Link header is present, but every row on this page is at/under
+        # the cutoff -- list_local_accounts must not follow it to a second page.
+        link = {"Link": f'<{API}/api/v2/admin/accounts?max_id=1>; rel="next"'}
+        cutoff = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        mock_urlopen.return_value = _resp([
+            {"id": "3", "username": "new", "domain": None, "created_at": "2026-09-05T00:00:00Z",
+             "account": {"acct": "new"}},
+            {"id": "2", "username": "old", "domain": None, "created_at": "2026-08-01T00:00:00Z",
+             "account": {"acct": "old"}},
+        ], headers=link)
+        out = MastodonAdminClient(API, "t").list_local_accounts(newer_than=cutoff, max_pages=5)
+        assert [a["username"] for a in out] == ["new"]
+        assert mock_urlopen.call_count == 1
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_account_statuses_passes_since_id_and_limit(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([{"id": "9", "content": "hi", "account": {"acct": "poster"}}])
+        out = MastodonAdminClient(API, "t").account_statuses(42, since_id="100", limit=10)
+        url = mock_urlopen.call_args[0][0].full_url
+        assert url == f"{API}/api/v1/accounts/42/statuses?since_id=100&limit=10&exclude_reblogs=true"
+        assert out[0]["id"] == "9"
+        assert out[0]["account_acct"] == "poster"
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_account_statuses_omits_since_id_when_not_given(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").account_statuses(42)
+        url = mock_urlopen.call_args[0][0].full_url
+        assert "since_id" not in url
+        assert "limit=40" in url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_count_hint_detects_next_link(self, mock_urlopen):
+        mock_urlopen.return_value = _resp(
+            [{"id": "1"}], headers={"Link": f'<{API}/api/v1/admin/reports?max_id=1>; rel="next"'},
+        )
+        count, has_next = MastodonAdminClient(API, "t").count_hint(
+            "/api/v1/admin/reports", params={"resolved": "false"},
+        )
+        assert count == 1
+        assert has_next is True
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_count_hint_no_next_link(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([{"id": "1"}, {"id": "2"}])
+        count, has_next = MastodonAdminClient(API, "t").count_hint("/api/v1/admin/reports")
+        assert count == 2
+        assert has_next is False
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_open_report_count_wraps_count_hint(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        count, has_next = MastodonAdminClient(API, "t").open_report_count()
+        assert (count, has_next) == (0, False)
+        assert "resolved=false" in mock_urlopen.call_args[0][0].full_url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_pending_account_count_wraps_count_hint(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").pending_account_count()
+        assert "status=pending" in mock_urlopen.call_args[0][0].full_url
+
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -312,6 +557,16 @@ class TestMastodonRouteAuth:
         ("post", "/moderation/mastodon/accounts/1/unsuspend"),
         ("post", "/moderation/mastodon/domain_blocks"),
         ("post", "/moderation/mastodon/domain_blocks/1/delete"),
+        ("get", "/moderation/mastodon/watch"),
+        ("post", "/moderation/mastodon/watch"),
+        ("post", "/moderation/mastodon/watch/1/delete"),
+        ("get", "/moderation/mastodon/alerts"),
+        ("post", "/moderation/mastodon/alerts/1/ack"),
+        ("post", "/moderation/mastodon/alerts/ack_all"),
+        ("get", "/moderation/mastodon/new_accounts"),
+        ("post", "/moderation/mastodon/watch/poll"),
+        ("get", "/moderation/mastodon/summary"),
+        ("post", "/moderation/mastodon/watch/save"),
     ])
     def test_requires_login(self, client, method, path):
         resp = getattr(client, method)(path, follow_redirects=False)

@@ -79,6 +79,46 @@ class TestModeratorAllowed:
         assert b"managed by an administrator" in resp.data
         assert b"/moderation/mastodon/save" not in resp.data
 
+    def test_moderator_can_reach_watch_and_summary(self, moderator_client):
+        resp = moderator_client.get("/moderation/mastodon/watch", follow_redirects=False)
+        assert resp.status_code == 200
+        resp = moderator_client.get("/moderation/mastodon/summary", follow_redirects=False)
+        assert resp.status_code == 200
+
+    def test_moderator_dashboard_shows_moderation_summary_card(self, moderator_client):
+        resp = moderator_client.get("/", follow_redirects=False)
+        assert resp.status_code == 200
+        # The JS that fetches the summary references this id unconditionally, so
+        # check for the (Jinja-gated) HTML element itself rather than the bare id.
+        assert b'id="moderationSummaryCard"' in resp.data
+
+
+# ---------------------------------------------------------------------------
+# Dashboard: the moderation summary card is gated on can_moderate, not just
+# on being logged in -- a viewer (can_moderate=False) must not see it.
+# ---------------------------------------------------------------------------
+
+
+class TestModerationSummaryCardHiddenForViewer:
+    def test_viewer_dashboard_hides_moderation_summary_card(self, app, client):
+        from models import Role, User, db
+
+        with app.app_context():
+            viewer_role = Role.query.filter_by(name="viewer").first()
+            user = User(username="_mod_summary_viewer", display_name="V", role_id=viewer_role.id)
+            user.set_password("test-only-ViewerPass123!")
+            db.session.add(user)
+            db.session.commit()
+        try:
+            client.post("/login", data={"username": "_mod_summary_viewer", "password": "test-only-ViewerPass123!"})
+            resp = client.get("/", follow_redirects=False)
+            assert resp.status_code == 200
+            assert b'id="moderationSummaryCard"' not in resp.data
+        finally:
+            with app.app_context():
+                User.query.filter_by(username="_mod_summary_viewer").delete()
+                db.session.commit()
+
 
 # ---------------------------------------------------------------------------
 # Model: the builtin moderator role definition

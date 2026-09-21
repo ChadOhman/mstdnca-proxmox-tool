@@ -60,6 +60,60 @@
 </div>
 {% endif %}
 
+{% if current_user.can_moderate %}
+<!-- Moderation summary (async-loaded) -->
+<div class="card bg-dark mb-4" id="moderationSummaryCard">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-shield-exclamation"></i> Moderation</h5>
+        <a href="/moderation/?tab=mastodon" class="small">Open Moderation <i class="bi bi-arrow-right"></i></a>
+    </div>
+    <div class="card-body">
+        <div id="modSummaryLoading" class="text-center text-muted py-2">
+            <div class="spinner-border spinner-border-sm me-2" role="status"></div>Loading moderation summary...
+        </div>
+        <div id="modSummaryNotConfigured" class="text-muted small d-none">Mastodon moderation is not configured.</div>
+        <div id="modSummaryContent" class="d-none">
+            <div class="row g-3 mb-2 text-center">
+                <div class="col-6 col-md-3">
+                    <a href="/moderation/?tab=mastodon" class="card bg-dark h-100 stat-card text-decoration-none">
+                        <div class="card-body text-center py-3">
+                            <div class="fs-4 fw-bold text-warning" id="modSummaryOpenReports">&mdash;</div>
+                            <div class="small text-muted">Open Reports</div>
+                        </div>
+                    </a>
+                </div>
+                <div class="col-6 col-md-3">
+                    <a href="/moderation/?tab=mastodon" class="card bg-dark h-100 stat-card text-decoration-none">
+                        <div class="card-body text-center py-3">
+                            <div class="fs-4 fw-bold text-info" id="modSummaryPending">&mdash;</div>
+                            <div class="small text-muted">Pending Approvals</div>
+                        </div>
+                    </a>
+                </div>
+                <div class="col-6 col-md-3">
+                    <a href="/moderation/?tab=mastodon" class="card bg-dark h-100 stat-card text-decoration-none">
+                        <div class="card-body text-center py-3">
+                            <div class="fs-4 fw-bold text-danger" id="modSummaryUnacked">&mdash;</div>
+                            <div class="small text-muted">Unacknowledged Alerts</div>
+                        </div>
+                    </a>
+                </div>
+                <div class="col-6 col-md-3">
+                    <a href="/moderation/?tab=mastodon" class="card bg-dark h-100 stat-card text-decoration-none">
+                        <div class="card-body text-center py-3">
+                            <div class="fs-4 fw-bold text-light" id="modSummaryWatched">&mdash;</div>
+                            <div class="small text-muted">Watched Accounts</div>
+                        </div>
+                    </a>
+                </div>
+            </div>
+            <div id="modSummaryLiveError" class="text-muted small mb-2 d-none"></div>
+            <div id="modSummaryRecentAlerts" class="small"></div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 {# Infrastructure cards: hidden for roles without can_view_guests (e.g. moderator) #}
 {% if current_user.can_view_guests %}
 <!-- Infrastructure Overview -->
@@ -355,6 +409,66 @@
 
 {% block scripts %}
 <script>
+// ── Moderation summary (async) ────────────────────────────────────────────
+(function() {
+    const card = document.getElementById('moderationSummaryCard');
+    if (!card) return;
+
+    function fmtWhen(iso) {
+        if (!iso) return '';
+        const d = new Date(iso);
+        return isNaN(d) ? escHtml(iso) : escHtml(d.toLocaleString());
+    }
+
+    function kindLabel(kind) {
+        return { watched_post: 'Watched post', new_account: 'New account', silent_login: 'Silent login' }[kind] || kind;
+    }
+
+    function showError(msg) {
+        document.getElementById('modSummaryLoading').classList.add('d-none');
+        const errEl = document.getElementById('modSummaryLiveError');
+        errEl.textContent = msg;
+        errEl.classList.remove('d-none');
+    }
+
+    fetch('/moderation/mastodon/summary', { cache: 'no-store' })
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(data => {
+            document.getElementById('modSummaryLoading').classList.add('d-none');
+            if (!data.configured) {
+                document.getElementById('modSummaryNotConfigured').classList.remove('d-none');
+                return;
+            }
+            document.getElementById('modSummaryContent').classList.remove('d-none');
+            document.getElementById('modSummaryOpenReports').textContent =
+                data.open_reports ? (data.open_reports.count + (data.open_reports.more ? '+' : '')) : '—';
+            document.getElementById('modSummaryPending').textContent =
+                data.pending_accounts ? (data.pending_accounts.count + (data.pending_accounts.more ? '+' : '')) : '—';
+            document.getElementById('modSummaryUnacked').textContent =
+                (data.unacked_total === undefined || data.unacked_total === null) ? '—' : data.unacked_total;
+            document.getElementById('modSummaryWatched').textContent =
+                (data.watch_total === undefined || data.watch_total === null) ? '—' : data.watch_total;
+
+            if (data.live_error) {
+                const errEl = document.getElementById('modSummaryLiveError');
+                errEl.textContent = data.live_error;
+                errEl.classList.remove('d-none');
+            }
+
+            const recent = data.recent_alerts || [];
+            const listEl = document.getElementById('modSummaryRecentAlerts');
+            if (!recent.length) {
+                listEl.innerHTML = '<span class="text-muted">No unacknowledged alerts.</span>';
+            } else {
+                listEl.innerHTML = '<div class="text-muted mb-1">Recent alerts</div>' + recent.map(a =>
+                    '<div>' + escHtml(kindLabel(a.kind)) + ': <span class="font-monospace">' + escHtml(a.acct || '') + '</span>'
+                    + ' <span class="text-muted">' + fmtWhen(a.created_at) + '</span></div>'
+                ).join('');
+            }
+        })
+        .catch(() => showError('Failed to load moderation summary.'));
+})();
+
 (function() {
     const CURRENT_TAG = {{ (current_tag or "") | tojson }};
     function formatBytes(bytes) {

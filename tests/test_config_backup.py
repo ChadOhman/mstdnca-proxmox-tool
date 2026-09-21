@@ -314,6 +314,24 @@ class TestExportRuleBasedRedaction:
                     Setting.query.filter_by(key=key).delete()
                 db.session.commit()
 
+    def test_export_redacts_moderation_discord_webhook(self, app, auth_client, seeded_config):
+        """The moderation channel's webhook URL must be redacted the same way
+        the admin discord_webhook_url is -- it matches _SECRET_KEY_PATTERN via
+        "webhook" in the key name, so no _EXTRA_SECRET_SETTING_KEYS entry is
+        needed, but that's worth pinning down with a test."""
+        with app.app_context():
+            Setting.set("discord_moderation_webhook_url", "https://discord.com/api/webhooks/1/test-only-mod-tok")
+            db.session.commit()
+        try:
+            raw = auth_client.get("/settings/config/export").data.decode("utf-8")
+            assert "test-only-mod-tok" not in raw
+            doc = json.loads(raw)
+            assert doc["settings"].get("discord_moderation_webhook_url") == "***REDACTED***"
+        finally:
+            with app.app_context():
+                Setting.query.filter_by(key="discord_moderation_webhook_url").delete()
+                db.session.commit()
+
     def test_export_redacts_any_fernet_looking_value_regardless_of_key_name(self, app, auth_client, seeded_config):
         """A key with no secret-shaped name is still redacted if its value is
         Fernet ciphertext -- the value-based signal is a backstop for keys the
@@ -391,6 +409,34 @@ class TestImportAuthCriticalBlocklist:
         assert resp.status_code == 200
         with app.app_context():
             assert Setting.get("service_check_interval") == before
+
+    def test_moderation_watch_poll_minutes_out_of_range_is_skipped(self, app, auth_client):
+        """moderation_watch_poll_minutes is registered in _INTERVAL_SETTING_KEYS,
+        so an absurd value must be bounds-checked (via parse_interval) rather than
+        trusted verbatim, regardless of whether core.scheduler.INTERVAL_BOUNDS
+        has its own entry for the key yet -- parse_interval falls back to a
+        generic bound when a key has none, so it can never crash or skip
+        validation entirely."""
+        with app.app_context():
+            before = Setting.get("moderation_watch_poll_minutes")
+        doc = {
+            "version": 1, "hosts": [], "tags": [], "guests": [], "roles": [],
+            "settings": {"moderation_watch_poll_minutes": "999999999"},
+        }
+        resp = self._upload(auth_client, doc)
+        assert resp.status_code == 200
+        with app.app_context():
+            assert Setting.get("moderation_watch_poll_minutes") == before
+
+    def test_moderation_watch_poll_minutes_valid_value_is_imported(self, app, auth_client):
+        doc = {
+            "version": 1, "hosts": [], "tags": [], "guests": [], "roles": [],
+            "settings": {"moderation_watch_poll_minutes": "5"},
+        }
+        resp = self._upload(auth_client, doc)
+        assert resp.status_code == 200
+        with app.app_context():
+            assert Setting.get("moderation_watch_poll_minutes") == "5"
 
 
 class TestImportRolesOptIn:
