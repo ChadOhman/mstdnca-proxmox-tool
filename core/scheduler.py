@@ -29,6 +29,7 @@ INTERVAL_BOUNDS = {
     "unifi_api_poll_interval": (1, 1440, 5),         # minutes
     "prometheus_collect_interval": (10, 86400, 60),  # seconds
     "moderation_check_interval_hours": (1, 8760, 24),
+    "moderation_watch_poll_minutes": (1, 1440, 5),
 }
 
 VALID_WINDOW_DAYS = frozenset({
@@ -1332,6 +1333,79 @@ def _run_moderation_check(app):
             logger.error("Scheduled moderation check failed: %s", "; ".join(result.get("errors", [])))
 
 
+# Adaptive back-off state for the moderation watch poll: two consecutive
+# "short" runs (deferred for lack of rate-limit budget, or a 429) double the
+# effective interval (capped at 6x the configured minutes); a clean run
+# resets it. Module-level because the job itself is a plain function re-run
+# by APScheduler on its own thread, not an object with per-job state.
+_watch_stretch = {"consecutive_short": 0, "factor": 1}
+_WATCH_STRETCH_MAX_FACTOR = 6
+_WATCH_STRETCH_THRESHOLD = 2
+
+
+def _run_moderation_watch_poll(app):
+    """Poll watched Mastodon accounts, new signups, and silent logins for alerts."""
+    with app.app_context():
+        from models import Setting
+
+        if Setting.get("moderation_watch_alerts_enabled", "false") != "true":
+            return
+
+        now = datetime.now(timezone.utc)
+        backoff_raw = Setting.get("moderation_watch_backoff_until")
+        if backoff_raw:
+            try:
+                backoff_until = datetime.fromisoformat(backoff_raw)
+            except ValueError:
+                backoff_until = None
+            if backoff_until and backoff_until > now:
+                logger.info("Moderation watch poll skipped: backing off until %s", backoff_raw)
+                return
+
+        from core.moderation_watch import build_admin_client, run_watch_poll
+
+        client, err = build_admin_client()
+        if err:
+            logger.error("Moderation watch poll could not build a Mastodon client: %s", err)
+            return
+
+        result = run_watch_poll(client)
+
+        if result.get("backoff_until"):
+            Setting.set("moderation_watch_backoff_until", result["backoff_until"])
+        elif Setting.get("moderation_watch_backoff_until"):
+            Setting.set("moderation_watch_backoff_until", "")
+
+        short_run = bool(result.get("deferred") or result.get("backoff_until"))
+        if short_run:
+            _watch_stretch["consecutive_short"] += 1
+            if _watch_stretch["consecutive_short"] >= _WATCH_STRETCH_THRESHOLD:
+                new_factor = min(_WATCH_STRETCH_MAX_FACTOR, _watch_stretch["factor"] * 2)
+                if new_factor != _watch_stretch["factor"]:
+                    _watch_stretch["factor"] = new_factor
+                    configured = interval_setting("moderation_watch_poll_minutes")
+                    reschedule_moderation_watch(configured * new_factor)
+                    logger.info(
+                        "Moderation watch poll stretched to every %d minutes after repeated short runs",
+                        configured * new_factor,
+                    )
+        else:
+            _watch_stretch["consecutive_short"] = 0
+            if _watch_stretch["factor"] != 1:
+                _watch_stretch["factor"] = 1
+                configured = interval_setting("moderation_watch_poll_minutes")
+                reschedule_moderation_watch(configured)
+                logger.info("Moderation watch poll interval restored to every %d minutes", configured)
+
+        if result.get("errors"):
+            logger.error("Moderation watch poll completed with errors: %s", "; ".join(result["errors"]))
+        else:
+            logger.info(
+                "Moderation watch poll complete: checked %d/%d watches, alerts %s",
+                result.get("checked", 0), result.get("watch_total", 0), result.get("alerts", {}),
+            )
+
+
 def _purge_old_update_history(app):
     """Delete update-history and scan-result rows past their retention period.
 
@@ -1444,6 +1518,7 @@ def init_scheduler(app):
         unifi_poll_minutes = interval_setting("unifi_api_poll_interval")
         prometheus_collect_seconds = interval_setting("prometheus_collect_interval")
         moderation_hours = interval_setting("moderation_check_interval_hours")
+        moderation_watch_minutes = interval_setting("moderation_watch_poll_minutes")
 
     # Discovery job - refresh hosts periodically
     _scheduler.add_job(
@@ -1677,6 +1752,17 @@ def init_scheduler(app):
         max_instances=1,
     )
 
+    # Moderation watch poll - watched accounts, new signups, silent logins
+    _scheduler.add_job(
+        _run_moderation_watch_poll,
+        trigger=IntervalTrigger(minutes=moderation_watch_minutes),
+        args=[app],
+        id="moderation_watch_poll",
+        name="Poll watched Mastodon accounts and new signups",
+        replace_existing=True,
+        max_instances=1,
+    )
+
     # Update history / scan result retention purge - runs daily
     _scheduler.add_job(
         _purge_old_update_history,
@@ -1719,3 +1805,17 @@ def reschedule_jobs(interval_hours, discovery_hours, service_check_minutes):
     _scheduler.reschedule_job("discovery", trigger=IntervalTrigger(hours=discovery_hours))
     _scheduler.reschedule_job("service_health", trigger=IntervalTrigger(minutes=service_check_minutes))
     logger.info(f"Scheduler rescheduled: discovery every {discovery_hours}h, scan every {interval_hours}h, service check every {service_check_minutes}m")
+
+
+def reschedule_moderation_watch(minutes):
+    """Reschedule the moderation watch poll job to a new interval (minutes). No-op if not running.
+
+    Kept separate from ``reschedule_jobs`` (rather than adding a parameter to
+    it) because this is also called from within the job itself, to stretch or
+    restore its own interval based on recent run outcomes -- see
+    ``_run_moderation_watch_poll``.
+    """
+    if _scheduler is None or not _scheduler.running:
+        return
+    _scheduler.reschedule_job("moderation_watch_poll", trigger=IntervalTrigger(minutes=minutes))
+    logger.info(f"Moderation watch poll rescheduled to every {minutes}m")

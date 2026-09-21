@@ -136,6 +136,104 @@ class TestDiscordSettings:
             assert Setting.get("discord_webhook_url") != "https://discord.com/not-a-webhook"
 
 
+class TestModerationDiscordSettings:
+    """The moderation Discord channel has its own webhook URL/enabled flag,
+    saved and tested independently from the admin Discord card."""
+
+    def test_save_valid_webhook_and_enabled(self, app, auth_client):
+        resp = auth_client.post(
+            "/settings/discord/moderation",
+            data={
+                "discord_moderation_webhook_url": "https://discord.com/api/webhooks/321/mod-tok",
+                "discord_moderation_enabled": "on",
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            assert Setting.get("discord_moderation_webhook_url") == "https://discord.com/api/webhooks/321/mod-tok"
+            assert Setting.get("discord_moderation_enabled") == "true"
+
+    def test_save_rejects_non_discord_host(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_moderation_webhook_url", "")
+
+        resp = auth_client.post(
+            "/settings/discord/moderation",
+            data={"discord_moderation_webhook_url": "https://evil.example.com/api/webhooks/1/tok"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+
+        with app.app_context():
+            assert Setting.get("discord_moderation_webhook_url") != "https://evil.example.com/api/webhooks/1/tok"
+
+    def test_blank_webhook_keeps_existing(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_moderation_webhook_url", "https://discord.com/api/webhooks/1/existing")
+
+        auth_client.post(
+            "/settings/discord/moderation",
+            data={"discord_moderation_webhook_url": ""},
+            follow_redirects=False,
+        )
+
+        with app.app_context():
+            assert Setting.get("discord_moderation_webhook_url") == "https://discord.com/api/webhooks/1/existing"
+
+    def test_enabled_toggle_off_when_checkbox_absent(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_moderation_enabled", "true")
+
+        auth_client.post(
+            "/settings/discord/moderation",
+            data={},
+            follow_redirects=False,
+        )
+
+        with app.app_context():
+            assert Setting.get("discord_moderation_enabled") == "false"
+
+    def test_save_does_not_touch_admin_discord_settings(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_webhook_url", "https://discord.com/api/webhooks/1/admin-untouched")
+            Setting.set("discord_enabled", "true")
+
+        auth_client.post(
+            "/settings/discord/moderation",
+            data={
+                "discord_moderation_webhook_url": "https://discord.com/api/webhooks/2/mod",
+                "discord_moderation_enabled": "on",
+            },
+            follow_redirects=False,
+        )
+
+        with app.app_context():
+            assert Setting.get("discord_webhook_url") == "https://discord.com/api/webhooks/1/admin-untouched"
+            assert Setting.get("discord_enabled") == "true"
+
+    def test_test_route_calls_moderation_sender(self, app, auth_client):
+        with app.app_context():
+            Setting.set("discord_moderation_webhook_url", "https://discord.com/api/webhooks/1/mod")
+            Setting.set("discord_moderation_enabled", "true")
+
+        with patch("core.notifier.send_moderation_test_notification") as mock_send:
+            mock_send.return_value = (True, "Notification sent successfully")
+            resp = auth_client.post("/settings/discord/moderation/test", follow_redirects=False)
+
+        assert resp.status_code == 302
+        mock_send.assert_called_once()
+
+    def test_test_route_flashes_failure_message(self, app, auth_client):
+        with patch("core.notifier.send_moderation_test_notification") as mock_send:
+            mock_send.return_value = (False, "Discord webhook URL not configured")
+            resp = auth_client.post("/settings/discord/moderation/test", follow_redirects=True)
+
+        assert resp.status_code == 200
+        assert b"Test notification failed" in resp.data
+
+
 class TestDiscordWebhookMasking:
     """GHSA-qq45-f2h2-9j4q: the Discord webhook URL must never be rendered into
     the settings page — neither in a visible field nor in a hidden input used

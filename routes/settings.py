@@ -54,6 +54,8 @@ def _get_settings_dict():
     return {
         "discord_webhook_url_set": bool(Setting.get("discord_webhook_url")),
         "discord_enabled": Setting.get("discord_enabled", "false"),
+        "discord_moderation_webhook_url_set": bool(Setting.get("discord_moderation_webhook_url")),
+        "discord_moderation_enabled": Setting.get("discord_moderation_enabled", "false"),
         "discord_notify_updates": Setting.get("discord_notify_updates", "true"),
         "discord_notify_updates_security_only": Setting.get("discord_notify_updates_security_only", "false"),
         "discord_notify_mastodon": Setting.get("discord_notify_mastodon", "true"),
@@ -263,6 +265,51 @@ def test_discord():
 
     from core.notifier import send_test_notification
     ok, message = send_test_notification()
+    if ok:
+        flash(f"Test notification sent: {message}", "success")
+    else:
+        flash(f"Test notification failed: {message}", "error")
+
+    return redirect(url_for("settings.index"))
+
+
+@bp.route("/discord/moderation", methods=["POST"])
+def save_discord_moderation():
+    """Save the moderation Discord channel's webhook URL and enabled flag.
+
+    Kept separate from ``save_discord`` so moderation alerts (watched-account
+    posts, new signups, silent-login sweeps) can be routed to a different
+    Discord channel than server/upgrade events.
+    """
+    webhook_url = request.form.get("discord_moderation_webhook_url", "").strip()
+    enabled = "discord_moderation_enabled" in request.form
+
+    if webhook_url:
+        from core.notifier import validate_discord_webhook_url
+        ok, reason = validate_discord_webhook_url(webhook_url)
+        if not ok:
+            flash(f"Invalid Discord webhook URL: {reason}.", "error")
+            return redirect(url_for("settings.index"))
+        Setting.set("discord_moderation_webhook_url", webhook_url)
+    Setting.set("discord_moderation_enabled", "true" if enabled else "false")
+
+    log_action("settings_discord_moderation_save", "settings", resource_name="discord_moderation")
+    db.session.commit()
+    flash("Moderation Discord settings saved.", "success")
+    return redirect(url_for("settings.index"))
+
+
+@bp.route("/discord/moderation/test", methods=["POST"])
+def test_discord_moderation():
+    # Save settings first (same pattern as the admin channel's test route)
+    save_discord_moderation()
+
+    from core.notifier import send_moderation_test_notification
+    ok, message = send_moderation_test_notification()
+
+    log_action("discord_moderation_test", "settings", resource_name="discord_moderation")
+    db.session.commit()
+
     if ok:
         flash(f"Test notification sent: {message}", "success")
     else:

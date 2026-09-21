@@ -39,12 +39,13 @@ class CollaborationHub:
 
     def connect(self, user_id: int, username: str, display_name: str,
                 page: str = "/", is_admin: bool = False,
-                tag_ids: set | list | None = None) -> queue.Queue:
+                tag_ids: set | list | None = None, can_moderate: bool = False) -> queue.Queue:
         """Register an SSE connection and return the event queue for this user.
 
-        ``is_admin``/``tag_ids`` are captured here (while a request context still
-        exists) so :meth:`broadcast` can filter guest-scoped events per recipient
-        without touching the database on the fan-out path.
+        ``is_admin``/``tag_ids``/``can_moderate`` are captured here (while a
+        request context still exists) so :meth:`broadcast` can filter
+        guest-scoped and moderators-only events per recipient without
+        touching the database on the fan-out path.
         """
         q: queue.Queue = queue.Queue(maxsize=200)
         with self._lock:
@@ -57,6 +58,7 @@ class CollaborationHub:
                 "queue": q,
                 "is_admin": bool(is_admin),
                 "tag_ids": set(tag_ids or ()),
+                "can_moderate": bool(can_moderate),
             }
         self._push_presence()
         return q
@@ -92,16 +94,30 @@ class CollaborationHub:
         delivered only to admins and to users holding one of those tags; the key
         itself is stripped before delivery.  Events without it (presence, host
         activity) go to everyone as before.
+
+        An event carrying ``moderators_only: True`` is delivered only to
+        recipients connected with ``can_moderate=True``; that key is likewise
+        stripped before delivery. Presence payloads never carry either key and
+        are unaffected.
         """
         tag_ids = event.get("guest_tag_ids")
         if tag_ids is not None:
             event = {k: v for k, v in event.items() if k != "guest_tag_ids"}
             tag_ids = set(tag_ids)
+
+        moderators_only = event.get("moderators_only", False)
+        if "moderators_only" in event:
+            event = {k: v for k, v in event.items() if k != "moderators_only"}
+
         with self._lock:
-            targets = [(u.get("is_admin", False), u.get("tag_ids") or set(), u["queue"])
-                       for u in self._users.values()]
-        for is_admin, user_tags, q in targets:
+            targets = [
+                (u.get("is_admin", False), u.get("tag_ids") or set(), u.get("can_moderate", False), u["queue"])
+                for u in self._users.values()
+            ]
+        for is_admin, user_tags, can_moderate, q in targets:
             if tag_ids is not None and not is_admin and not (tag_ids & user_tags):
+                continue
+            if moderators_only and not can_moderate:
                 continue
             try:
                 q.put_nowait(event)

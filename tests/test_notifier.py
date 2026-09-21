@@ -35,6 +35,9 @@ from core.notifier import (
     send_host_update_notification,
     send_jitsi_update_notification,
     send_mastodon_update_notification,
+    send_moderation_alert_notification,
+    send_moderation_silent_login_summary,
+    send_moderation_test_notification,
     send_peertube_update_notification,
     send_service_failed_notification,
     send_service_recovery_notification,
@@ -2505,3 +2508,260 @@ class TestAutoUpdateTagScoping:
         field_names = [f["name"] for f in body["embeds"][0]["fields"]]
         assert any("keep" in n for n in field_names)
         assert not any("drop" in n for n in field_names)
+
+
+# ---------------------------------------------------------------------------
+# Moderation Discord channel -- its own webhook/enabled pair, never falls
+# back to the admin webhook.
+# ---------------------------------------------------------------------------
+
+_ADMIN_URL = "https://discord.com/api/webhooks/1/admin-tok"
+_MOD_URL = "https://discord.com/api/webhooks/2/mod-tok"
+
+
+class TestModerationChannelRouting:
+    def _enable_both(self, app):
+        Setting.set("discord_enabled", "true")
+        Setting.set("discord_webhook_url", _ADMIN_URL)
+        Setting.set("discord_moderation_enabled", "true")
+        Setting.set("discord_moderation_webhook_url", _MOD_URL)
+
+    def test_moderation_test_notification_posts_to_moderation_url_only(self, app):
+        with app.app_context():
+            self._enable_both(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                ok, _ = send_moderation_test_notification()
+
+        assert ok is True
+        assert len(captured) == 1
+        assert captured[0].full_url == _MOD_URL
+
+    def test_moderation_alert_posts_to_moderation_url_only(self, app):
+        with app.app_context():
+            self._enable_both(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_moderation_alert_notification("watched_post", "someone@example.social")
+
+        assert len(captured) == 1
+        assert captured[0].full_url == _MOD_URL
+
+    def test_silent_login_summary_posts_to_moderation_url_only(self, app):
+        with app.app_context():
+            self._enable_both(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_moderation_silent_login_summary(3, ["a", "b", "c"])
+
+        assert len(captured) == 1
+        assert captured[0].full_url == _MOD_URL
+
+    def test_moderation_disabled_sends_nothing_and_does_not_fall_back(self, app):
+        """Moderation channel disabled -- must not send, and must NOT fall back
+        to the (enabled) admin webhook."""
+        with app.app_context():
+            Setting.set("discord_enabled", "true")
+            Setting.set("discord_webhook_url", _ADMIN_URL)
+            Setting.set("discord_moderation_enabled", "false")
+            Setting.set("discord_moderation_webhook_url", _MOD_URL)
+
+        with patch("urllib.request.urlopen") as mock_open:
+            with app.app_context():
+                ok, msg = send_moderation_test_notification()
+
+        assert ok is False
+        mock_open.assert_not_called()
+
+    def test_moderation_unset_sends_nothing(self, app):
+        with app.app_context():
+            Setting.set("discord_enabled", "true")
+            Setting.set("discord_webhook_url", _ADMIN_URL)
+            s = Setting.query.filter_by(key="discord_moderation_webhook_url").first()
+            if s:
+                db.session.delete(s)
+            s2 = Setting.query.filter_by(key="discord_moderation_enabled").first()
+            if s2:
+                db.session.delete(s2)
+            db.session.commit()
+
+        with patch("urllib.request.urlopen") as mock_open:
+            with app.app_context():
+                ok, msg = send_moderation_test_notification()
+
+        assert ok is False
+        mock_open.assert_not_called()
+
+    def test_admin_senders_unaffected_use_admin_url(self, app):
+        """Existing admin-channel senders must still post to the admin webhook
+        and must be unaffected by the moderation channel's config."""
+        with app.app_context():
+            self._enable_both(app)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                ok, _ = send_test_notification()
+
+        assert ok is True
+        assert len(captured) == 1
+        assert captured[0].full_url == _ADMIN_URL
+
+    def test_admin_disabled_does_not_block_moderation_send(self, app):
+        """The two channels' enabled flags are fully independent."""
+        with app.app_context():
+            Setting.set("discord_enabled", "false")
+            Setting.set("discord_webhook_url", _ADMIN_URL)
+            Setting.set("discord_moderation_enabled", "true")
+            Setting.set("discord_moderation_webhook_url", _MOD_URL)
+
+        fake_resp = _make_urlopen_mock(status=204)
+        with patch("urllib.request.urlopen", return_value=fake_resp) as mock_open:
+            with app.app_context():
+                ok, _ = send_moderation_test_notification()
+
+        assert ok is True
+        mock_open.assert_called_once()
+
+
+class TestModerationAlertEmbeds:
+    def _enable(self, app):
+        Setting.set("discord_moderation_enabled", "true")
+        Setting.set("discord_moderation_webhook_url", _MOD_URL)
+
+    def test_watched_post_title_and_color(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        captured = []
+        fake_resp = _make_urlopen_mock(status=204)
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_moderation_alert_notification(
+                    "watched_post", "watched@example.social",
+                    url="https://example.social/@watched/1", excerpt="hello world",
+                )
+
+        body = json.loads(captured[0].data.decode())
+        embed = body["embeds"][0]
+        assert embed["title"] == "Watched account posted: @watched@example.social"
+        assert embed["color"] == 14431557  # _COLOR_RED
+        assert "hello world" in embed["description"]
+        assert "https://example.social/@watched/1" in embed["description"]
+        assert embed["footer"]["text"] == "Review in MCAT → Moderation"
+
+    def test_new_account_title_and_color(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        captured = []
+        fake_resp = _make_urlopen_mock(status=204)
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_moderation_alert_notification("new_account", "newbie@example.social")
+
+        body = json.loads(captured[0].data.decode())
+        embed = body["embeds"][0]
+        assert embed["title"] == "New local account: @newbie@example.social"
+        assert embed["color"] == 5227511  # _COLOR_CYAN
+
+    def test_unknown_kind_falls_back_to_generic_title(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        captured = []
+        fake_resp = _make_urlopen_mock(status=204)
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_moderation_alert_notification("something_else", "who@example.social")
+
+        body = json.loads(captured[0].data.decode())
+        assert body["embeds"][0]["title"] == "Moderation alert: @who@example.social"
+
+    def test_excerpt_truncated_to_300_chars(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        captured = []
+        fake_resp = _make_urlopen_mock(status=204)
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        long_excerpt = "x" * 500
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_moderation_alert_notification("watched_post", "acct", excerpt=long_excerpt)
+
+        body = json.loads(captured[0].data.decode())
+        # description is excerpt only here (no url) so its length is the truncated excerpt
+        assert len(body["embeds"][0]["description"]) == 300
+
+    def test_silent_login_summary_lists_up_to_five_handles(self, app):
+        with app.app_context():
+            self._enable(app)
+
+        captured = []
+        fake_resp = _make_urlopen_mock(status=204)
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return fake_resp
+
+        accts = [f"user{i}" for i in range(8)]
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with app.app_context():
+                send_moderation_silent_login_summary(8, accts)
+
+        body = json.loads(captured[0].data.decode())
+        embed = body["embeds"][0]
+        assert embed["title"] == "8 accounts with logins but no posts"
+        listed = embed["description"].splitlines()
+        assert len(listed) == 5
+        assert listed[0] == "@user0"

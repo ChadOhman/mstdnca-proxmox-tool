@@ -216,6 +216,7 @@ class TestInitScheduler:
             "ipmi_snapshot_purge",
             "revoked_token_prune",
             "moderation_check",
+            "moderation_watch_poll",
             "update_history_purge",
             "ai_upgrade_analysis",
         }
@@ -496,6 +497,177 @@ class TestRescheduleJobs:
         for job_id in ("mastodon_check", "ghost_check"):
             trigger = calls[job_id].kwargs.get("trigger") or calls[job_id][1]["trigger"]
             assert trigger.interval.total_seconds() / 3600 == pytest.approx(18.0)
+
+
+# ---------------------------------------------------------------------------
+# reschedule_moderation_watch
+# ---------------------------------------------------------------------------
+
+
+class TestRescheduleModerationWatch:
+    @pytest.fixture(autouse=True)
+    def _reset_global(self):
+        import core.scheduler as sched_mod
+
+        sched_mod._scheduler = None
+        yield
+        sched_mod._scheduler = None
+
+    def test_noop_when_scheduler_is_none(self):
+        import core.scheduler as sched_mod
+
+        sched_mod._scheduler = None
+        sched_mod.reschedule_moderation_watch(10)  # must not raise
+
+    def test_noop_when_scheduler_not_running(self):
+        import core.scheduler as sched_mod
+
+        mock_sched = MagicMock()
+        mock_sched.running = False
+        sched_mod._scheduler = mock_sched
+
+        sched_mod.reschedule_moderation_watch(10)
+
+        mock_sched.reschedule_job.assert_not_called()
+
+    def test_reschedules_moderation_watch_poll_job(self):
+        import core.scheduler as sched_mod
+
+        mock_sched = MagicMock()
+        mock_sched.running = True
+        sched_mod._scheduler = mock_sched
+
+        sched_mod.reschedule_moderation_watch(20)
+
+        mock_sched.reschedule_job.assert_called_once()
+        call = mock_sched.reschedule_job.call_args
+        assert call.args[0] == "moderation_watch_poll"
+        trigger = call.kwargs.get("trigger") or call[1]["trigger"]
+        assert trigger.interval.total_seconds() / 60 == pytest.approx(20.0)
+
+
+# ---------------------------------------------------------------------------
+# _run_moderation_watch_poll
+# ---------------------------------------------------------------------------
+
+
+class TestRunModerationWatchPoll:
+    @pytest.fixture(autouse=True)
+    def _reset_stretch(self):
+        import core.scheduler as sched_mod
+
+        sched_mod._watch_stretch = {"consecutive_short": 0, "factor": 1}
+        yield
+        sched_mod._watch_stretch = {"consecutive_short": 0, "factor": 1}
+
+    def _app(self, settings):
+        app = _make_app()
+        mock_setting = MagicMock()
+        mock_setting.get.side_effect = lambda key, default=None: settings.get(key, default)
+        mock_setting.set = MagicMock()
+
+        def _set(key, value):
+            settings[key] = value
+
+        mock_setting.set.side_effect = _set
+        return app, mock_setting
+
+    @patch("core.moderation_watch.build_admin_client")
+    @patch("core.moderation_watch.run_watch_poll")
+    def test_skips_when_disabled(self, mock_run, mock_build):
+        import core.scheduler as sched_mod
+
+        app, mock_setting = self._app({"moderation_watch_alerts_enabled": "false"})
+        with patch("models.Setting", mock_setting):
+            sched_mod._run_moderation_watch_poll(app)
+
+        mock_build.assert_not_called()
+        mock_run.assert_not_called()
+
+    @patch("core.moderation_watch.build_admin_client")
+    @patch("core.moderation_watch.run_watch_poll")
+    def test_skips_when_in_backoff(self, mock_run, mock_build):
+        from datetime import datetime, timedelta, timezone
+
+        import core.scheduler as sched_mod
+
+        future = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        app, mock_setting = self._app({
+            "moderation_watch_alerts_enabled": "true",
+            "moderation_watch_backoff_until": future,
+        })
+        with patch("models.Setting", mock_setting):
+            sched_mod._run_moderation_watch_poll(app)
+
+        mock_build.assert_not_called()
+        mock_run.assert_not_called()
+
+    @patch("core.moderation_watch.build_admin_client")
+    @patch("core.moderation_watch.run_watch_poll")
+    def test_logs_error_when_client_build_fails(self, mock_run, mock_build):
+        import core.scheduler as sched_mod
+
+        mock_build.return_value = (None, "no token configured")
+        app, mock_setting = self._app({"moderation_watch_alerts_enabled": "true"})
+        with patch("models.Setting", mock_setting):
+            sched_mod._run_moderation_watch_poll(app)
+
+        mock_run.assert_not_called()
+
+    @patch("core.scheduler.reschedule_moderation_watch")
+    @patch("core.moderation_watch.build_admin_client")
+    @patch("core.moderation_watch.run_watch_poll")
+    def test_clean_run_resets_stretch_and_reschedules_if_needed(self, mock_run, mock_build, mock_reschedule):
+        import core.scheduler as sched_mod
+
+        sched_mod._watch_stretch = {"consecutive_short": 1, "factor": 2}
+        mock_build.return_value = (MagicMock(), None)
+        mock_run.return_value = {"checked": 1, "watch_total": 1, "alerts": {}, "deferred": False,
+                                  "backoff_until": None, "errors": []}
+        app, mock_setting = self._app({"moderation_watch_alerts_enabled": "true",
+                                        "moderation_watch_poll_minutes": "5"})
+        with patch("models.Setting", mock_setting):
+            sched_mod._run_moderation_watch_poll(app)
+
+        assert sched_mod._watch_stretch == {"consecutive_short": 0, "factor": 1}
+        mock_reschedule.assert_called_once_with(5)
+
+    @patch("core.scheduler.reschedule_moderation_watch")
+    @patch("core.moderation_watch.build_admin_client")
+    @patch("core.moderation_watch.run_watch_poll")
+    def test_two_short_runs_stretch_the_interval(self, mock_run, mock_build, mock_reschedule):
+        import core.scheduler as sched_mod
+
+        mock_build.return_value = (MagicMock(), None)
+        mock_run.return_value = {"checked": 0, "watch_total": 1, "alerts": {}, "deferred": True,
+                                  "backoff_until": None, "errors": []}
+        app, mock_setting = self._app({"moderation_watch_alerts_enabled": "true",
+                                        "moderation_watch_poll_minutes": "5"})
+        with patch("models.Setting", mock_setting):
+            sched_mod._run_moderation_watch_poll(app)
+            assert sched_mod._watch_stretch["consecutive_short"] == 1
+            mock_reschedule.assert_not_called()
+
+            sched_mod._run_moderation_watch_poll(app)
+
+        assert sched_mod._watch_stretch == {"consecutive_short": 2, "factor": 2}
+        mock_reschedule.assert_called_once_with(10)
+
+    @patch("core.scheduler.reschedule_moderation_watch")
+    @patch("core.moderation_watch.build_admin_client")
+    @patch("core.moderation_watch.run_watch_poll")
+    def test_backoff_result_persists_setting(self, mock_run, mock_build, mock_reschedule):
+        import core.scheduler as sched_mod
+
+        mock_build.return_value = (MagicMock(), None)
+        mock_run.return_value = {"checked": 0, "watch_total": 1, "alerts": {}, "deferred": False,
+                                  "backoff_until": "2026-09-21T12:00:00+00:00", "errors": []}
+        app, mock_setting = self._app({"moderation_watch_alerts_enabled": "true",
+                                        "moderation_watch_poll_minutes": "5"})
+        with patch("models.Setting", mock_setting):
+            sched_mod._run_moderation_watch_poll(app)
+
+        mock_setting.set.assert_any_call("moderation_watch_backoff_until", "2026-09-21T12:00:00+00:00")
 
 
 # ---------------------------------------------------------------------------

@@ -255,6 +255,58 @@ class TestCollaborationHubBroadcast:
         assert _drain(q) == []
 
 
+class TestCollaborationHubModeratorsOnlyBroadcast:
+    """moderators_only events must reach only recipients connected with
+    can_moderate=True, and the flag itself must be stripped before delivery."""
+
+    def test_reaches_only_moderator_subscribers(self):
+        hub = CollaborationHub()
+        q_mod = hub.connect(1, "mod", "Mod", can_moderate=True)
+        q_plain = hub.connect(2, "plain", "Plain", can_moderate=False)
+        _drain(q_mod)
+        _drain(q_plain)
+
+        hub.broadcast({"type": "activity", "action": "moderation_watch_hit", "moderators_only": True})
+
+        mod_events = [e for e in _drain(q_mod) if e.get("type") == "activity"]
+        plain_events = [e for e in _drain(q_plain) if e.get("type") == "activity"]
+        assert len(mod_events) == 1
+        assert plain_events == []
+
+    def test_flag_is_stripped_from_delivered_event(self):
+        hub = CollaborationHub()
+        q_mod = hub.connect(1, "mod", "Mod", can_moderate=True)
+        _drain(q_mod)
+
+        hub.broadcast({"type": "activity", "action": "moderation_watch_hit", "moderators_only": True})
+
+        event = next(e for e in _drain(q_mod) if e.get("type") == "activity")
+        assert "moderators_only" not in event
+
+    def test_events_without_flag_reach_everyone(self):
+        hub = CollaborationHub()
+        q_mod = hub.connect(1, "mod", "Mod", can_moderate=True)
+        q_plain = hub.connect(2, "plain", "Plain", can_moderate=False)
+        _drain(q_mod)
+        _drain(q_plain)
+
+        hub.broadcast({"type": "activity", "action": "host_add"})
+
+        assert [e for e in _drain(q_mod) if e.get("type") == "activity"]
+        assert [e for e in _drain(q_plain) if e.get("type") == "activity"]
+
+    def test_default_can_moderate_is_false(self):
+        """A connection made without passing can_moderate must not receive
+        moderators_only events (safe default)."""
+        hub = CollaborationHub()
+        q = hub.connect(1, "alice", "Alice")
+        _drain(q)
+
+        hub.broadcast({"type": "activity", "action": "moderation_watch_hit", "moderators_only": True})
+
+        assert [e for e in _drain(q) if e.get("type") == "activity"] == []
+
+
 class TestCollaborationHubGetOnlineUsers:
     def test_returns_empty_when_no_users(self):
         hub = CollaborationHub()

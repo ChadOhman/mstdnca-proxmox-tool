@@ -90,7 +90,7 @@ _AUTH_CRITICAL_SETTING_KEYS = frozenset({
 _INTERVAL_SETTING_KEYS = frozenset({
     "scan_interval", "discovery_interval", "service_check_interval",
     "unifi_api_poll_interval", "prometheus_collect_interval",
-    "moderation_check_interval_hours",
+    "moderation_check_interval_hours", "moderation_watch_poll_minutes",
 })
 
 # Host config fields that are safe to export (no secrets).  Explicitly EXCLUDES

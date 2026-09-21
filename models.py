@@ -888,6 +888,53 @@ class Setting(db.Model):
             g.pop("_settings_cache", None)
 
 
+class ModerationWatch(db.Model):
+    """A Mastodon account flagged for follow-up: new posts trigger an alert."""
+    __tablename__ = "moderation_watches"
+
+    id = db.Column(db.Integer, primary_key=True)
+    mastodon_account_id = db.Column(db.String(32), unique=True, nullable=False, index=True)
+    acct = db.Column(db.String(320), nullable=False)
+    reason = db.Column(db.Text, nullable=True)
+    added_by_user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    added_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at = db.Column(db.DateTime, nullable=True)
+    auto_added = db.Column(db.Boolean, default=False)
+    last_status_id = db.Column(db.String(32), nullable=True)
+    last_checked_at = db.Column(db.DateTime, nullable=True)
+
+    added_by = db.relationship("User", backref="moderation_watches", lazy=True)
+
+    def __repr__(self):
+        return f"<ModerationWatch acct={self.acct}>"
+
+
+class ModerationAlert(db.Model):
+    """A deduplicated alert raised by the moderation watch poll."""
+    __tablename__ = "moderation_alerts"
+
+    KINDS = ("watched_post", "new_account", "silent_login")
+
+    id = db.Column(db.Integer, primary_key=True)
+    kind = db.Column(db.String(24), index=True)
+    dedupe_key = db.Column(db.String(96), unique=True, nullable=False)
+    mastodon_account_id = db.Column(db.String(32), index=True)
+    acct = db.Column(db.String(320))
+    status_id = db.Column(db.String(32), nullable=True)
+    status_url = db.Column(db.String(512), nullable=True)
+    excerpt = db.Column(db.String(300), nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    acknowledged_at = db.Column(db.DateTime, nullable=True)
+    acknowledged_by_user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    @staticmethod
+    def make_dedupe_key(kind, account_id, status_id=None):
+        return f"{kind}:{account_id}:{status_id or ''}"
+
+    def __repr__(self):
+        return f"<ModerationAlert {self.kind} acct={self.acct}>"
+
+
 class AuditLog(db.Model):
     __tablename__ = "audit_logs"
 

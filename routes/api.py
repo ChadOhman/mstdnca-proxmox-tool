@@ -1667,7 +1667,8 @@ def collab_stream():
     is_admin = current_user.is_admin
     tag_ids = {t.id for t in current_user.allowed_tags}
     event_queue = collab_hub.connect(user_id, username, display_name, page=page,
-                                     is_admin=is_admin, tag_ids=tag_ids)
+                                     is_admin=is_admin, tag_ids=tag_ids,
+                                     can_moderate=current_user.can_moderate)
 
     # Revocation is otherwise only enforced in before_request, which a stream
     # that never returns does not run again.  Capture the tracked session id up

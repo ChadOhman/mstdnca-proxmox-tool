@@ -61,9 +61,20 @@ def _parse_retry_after(value):
     return min(seconds, _MAX_RETRY_AFTER_SECONDS)
 
 
-def _get_discord_config():
-    webhook_url = Setting.get("discord_webhook_url")
-    enabled = Setting.get("discord_enabled", "false") == "true"
+def _get_discord_config(channel="admin"):
+    """Return the webhook url/enabled pair for a Discord channel.
+
+    ``channel`` is ``"admin"`` (server/upgrade events, the original single
+    webhook) or ``"moderation"`` (watched-account posts, new signups, silent-
+    login sweeps) -- each has its own webhook URL and enabled flag so the two
+    kinds of alerts can be routed to different Discord channels.
+    """
+    if channel == "moderation":
+        webhook_url = Setting.get("discord_moderation_webhook_url")
+        enabled = Setting.get("discord_moderation_enabled", "false") == "true"
+    else:
+        webhook_url = Setting.get("discord_webhook_url")
+        enabled = Setting.get("discord_enabled", "false") == "true"
     return {"webhook_url": webhook_url, "enabled": enabled}
 
 
@@ -85,9 +96,14 @@ def guest_matches_notify_tags(guest):
     return any(tag.id in wanted for tag in guest.tags)
 
 
-def _send_discord(embeds, _allow_retry=True):
-    """POST embeds to the configured Discord webhook. Returns (ok, message)."""
-    config = _get_discord_config()
+def _send_discord(embeds, *, channel="admin", _allow_retry=True):
+    """POST embeds to the configured Discord webhook. Returns (ok, message).
+
+    ``channel`` selects which webhook/enabled pair to use -- ``"admin"``
+    (default, server/upgrade events) or ``"moderation"`` (its own separate
+    webhook). Never falls back from one channel's webhook to the other's.
+    """
+    config = _get_discord_config(channel=channel)
 
     if not config["enabled"]:
         return False, "Discord notifications are disabled"
@@ -125,7 +141,7 @@ def _send_discord(embeds, _allow_retry=True):
             if retry_after is not None:
                 logger.warning(f"Discord webhook rate-limited; retrying after {retry_after}s")
                 time.sleep(retry_after)
-                return _send_discord(embeds, _allow_retry=False)
+                return _send_discord(embeds, channel=channel, _allow_retry=False)
         try:
             body = json.loads(e.read().decode())
             detail = body.get("message", "")
@@ -659,3 +675,93 @@ def send_service_recovery_notification(guest_name, service_name):
         logger.info(f"Service-recovery notification sent: {service_name} on {guest_name}")
     else:
         logger.error(f"Failed to send service-recovery notification: {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Moderation Discord channel
+#
+# These sit on their own webhook/enabled pair (see _get_discord_config's
+# "moderation" channel) so watched-account posts, new signups, and
+# silent-login sweeps land in a separate Discord channel from server/upgrade
+# events. When the moderation channel is disabled or unset, they return
+# (False, msg) and log at INFO -- this is an expected, low-severity state
+# (moderation alerting is opt-in), not an error, and there is deliberately no
+# fallback to the admin webhook.
+# ---------------------------------------------------------------------------
+
+_MODERATION_FOOTER = {"text": "Review in MCAT \u2192 Moderation"}
+
+# kind -> (title template, color). Any other kind falls back to a generic
+# title/color below.
+_MODERATION_ALERT_KINDS = {
+    "watched_post": ("Watched account posted: @{acct}", _COLOR_RED),
+    "new_account": ("New local account: @{acct}", _COLOR_CYAN),
+}
+
+
+def send_moderation_test_notification():
+    """Send a test notification to the moderation Discord channel."""
+    embeds = [{
+        "title": "Moderation Discord channel test",
+        "description": "Moderation Discord notifications are working correctly!",
+        "color": _COLOR_GREEN,
+    }]
+
+    ok, msg = _send_discord(embeds, channel="moderation")
+    if ok:
+        logger.info("Moderation test notification sent")
+    else:
+        logger.info(f"Moderation test notification not sent: {msg}")
+    return ok, msg
+
+
+def send_moderation_alert_notification(kind, acct, url=None, excerpt=None):
+    """Send a moderation alert (watched account posted / new local signup).
+
+    kind: "watched_post" or "new_account". Any other value falls back to a
+    generic "Moderation alert: @{acct}" title/color so an unrecognized kind
+    still produces a sensible notification rather than a crash.
+    """
+    template, color = _MODERATION_ALERT_KINDS.get(kind, ("Moderation alert: @{acct}", _COLOR_YELLOW))
+    title = template.format(acct=acct)
+
+    excerpt_text = (excerpt or "").strip()[:300]
+    description_parts = [p for p in (excerpt_text, url) if p]
+
+    embed = {
+        "title": title,
+        "color": color,
+        "footer": _MODERATION_FOOTER,
+    }
+    if description_parts:
+        embed["description"] = "\n\n".join(description_parts)
+
+    ok, msg = _send_discord([embed], channel="moderation")
+    if ok:
+        logger.info(f"Moderation alert sent: {title}")
+    else:
+        logger.info(f"Moderation alert not sent ({title}): {msg}")
+    return ok, msg
+
+
+def send_moderation_silent_login_summary(count, sample_accts):
+    """Send a summary of accounts that have logged in but never posted.
+
+    sample_accts: iterable of account handles; only the first 5 are listed.
+    """
+    sample = list(sample_accts)[:5]
+
+    embed = {
+        "title": f"{count} accounts with logins but no posts",
+        "color": _COLOR_YELLOW,
+        "footer": _MODERATION_FOOTER,
+    }
+    if sample:
+        embed["description"] = "\n".join(f"@{acct}" for acct in sample)
+
+    ok, msg = _send_discord([embed], channel="moderation")
+    if ok:
+        logger.info(f"Moderation silent-login summary sent ({count} accounts)")
+    else:
+        logger.info(f"Moderation silent-login summary not sent: {msg}")
+    return ok, msg
