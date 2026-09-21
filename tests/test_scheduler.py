@@ -669,6 +669,60 @@ class TestRunModerationWatchPoll:
 
         mock_setting.set.assert_any_call("moderation_watch_backoff_until", "2026-09-21T12:00:00+00:00")
 
+    @patch("core.moderation_watch.build_bot_client")
+    @patch("core.moderation_watch.build_admin_client")
+    @patch("core.moderation_watch.run_watch_poll")
+    def test_welcome_bot_build_failure_still_runs_poll(self, mock_run, mock_build, mock_build_bot):
+        import core.scheduler as sched_mod
+
+        mock_build.return_value = (MagicMock(), None)
+        mock_build_bot.return_value = (None, "no bot token configured")
+        mock_run.return_value = {"checked": 0, "watch_total": 0, "alerts": {}, "deferred": False,
+                                  "backoff_until": None, "errors": []}
+        app, mock_setting = self._app({"moderation_watch_alerts_enabled": "true",
+                                        "moderation_welcome_enabled": "true"})
+        with patch("models.Setting", mock_setting):
+            sched_mod._run_moderation_watch_poll(app)
+
+        mock_build_bot.assert_called_once()
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs.get("bot_client") is None
+
+    @patch("core.moderation_watch.build_bot_client")
+    @patch("core.moderation_watch.build_admin_client")
+    @patch("core.moderation_watch.run_watch_poll")
+    def test_welcome_bot_client_is_passed_through(self, mock_run, mock_build, mock_build_bot):
+        import core.scheduler as sched_mod
+
+        mock_build.return_value = (MagicMock(), None)
+        bot_client = MagicMock()
+        mock_build_bot.return_value = (bot_client, None)
+        mock_run.return_value = {"checked": 0, "watch_total": 0, "alerts": {}, "deferred": False,
+                                  "backoff_until": None, "errors": []}
+        app, mock_setting = self._app({"moderation_watch_alerts_enabled": "true",
+                                        "moderation_welcome_enabled": "true"})
+        with patch("models.Setting", mock_setting):
+            sched_mod._run_moderation_watch_poll(app)
+
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs.get("bot_client") is bot_client
+
+    @patch("core.moderation_watch.build_bot_client")
+    @patch("core.moderation_watch.build_admin_client")
+    @patch("core.moderation_watch.run_watch_poll")
+    def test_welcome_bot_not_built_when_disabled(self, mock_run, mock_build, mock_build_bot):
+        import core.scheduler as sched_mod
+
+        mock_build.return_value = (MagicMock(), None)
+        mock_run.return_value = {"checked": 0, "watch_total": 0, "alerts": {}, "deferred": False,
+                                  "backoff_until": None, "errors": []}
+        app, mock_setting = self._app({"moderation_watch_alerts_enabled": "true"})
+        with patch("models.Setting", mock_setting):
+            sched_mod._run_moderation_watch_poll(app)
+
+        mock_build_bot.assert_not_called()
+        assert mock_run.call_args.kwargs.get("bot_client") is None
+
 
 # ---------------------------------------------------------------------------
 # _run_scan — lazy-import job function tests

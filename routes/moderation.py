@@ -76,6 +76,8 @@ _ADMIN_ONLY_ENDPOINTS = frozenset({
     "moderation.mastodon_save",
     "moderation.mastodon_test",
     "moderation.mastodon_watch_save",
+    "moderation.mastodon_welcome_save",
+    "moderation.mastodon_welcome_test",
 })
 
 # Guards the check-then-set on the manual "run poll now" job (TOCTOU): without
@@ -129,7 +131,7 @@ def index():
         except (json.JSONDecodeError, TypeError):
             pass
 
-    from core.moderation_watch import get_watch_settings
+    from core.moderation_watch import get_watch_settings, get_welcome_settings
 
     active_tab = "mastodon" if request.args.get("tab") == "mastodon" else "peertube"
     return render_template(
@@ -140,6 +142,7 @@ def index():
         active_tab=active_tab,
         can_configure=current_user.is_admin,
         watch_settings=get_watch_settings(),
+        welcome_settings=get_welcome_settings(),
     )
 
 
@@ -264,6 +267,41 @@ def _mastodon_json(fn, *, audit=None):
         return jsonify({"ok": False, "error": exc.message}), 502
     except ValueError as exc:  # validate_domain
         return jsonify({"ok": False, "error": str(exc)}), 400
+    if audit:
+        action, resource_type, resource_name, details = audit
+        log_action(action, resource_type, resource_name=resource_name, details=details)
+        db.session.commit()
+    body = {"ok": True}
+    if isinstance(payload, dict):
+        body.update(payload)
+    return jsonify(body)
+
+
+def _get_bot_client():
+    """Build a welcome-bot client from settings, or return (None, error_message).
+
+    Thin wrapper over ``core.moderation_watch.build_bot_client`` kept as its own
+    function (rather than called inline) so tests can patch
+    ``routes.moderation._get_bot_client`` the same way they patch
+    ``_get_mastodon_client``.
+    """
+    from core.moderation_watch import build_bot_client
+
+    return build_bot_client()
+
+
+def _bot_json(fn, *, audit=None):
+    """Run ``fn(client)`` against the welcome-bot client and wrap the outcome as JSON.
+
+    Mirrors ``_mastodon_json`` but builds its client via ``_get_bot_client()``.
+    """
+    client, err = _get_bot_client()
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    try:
+        payload = fn(client)
+    except MastodonAPIError as exc:
+        return jsonify({"ok": False, "error": exc.message}), 502
     if audit:
         action, resource_type, resource_name, details = audit
         log_action(action, resource_type, resource_name=resource_name, details=details)
@@ -658,6 +696,23 @@ def mastodon_alerts_ack_all():
     return jsonify({"ok": True, "count": count})
 
 
+def _welcomed_at_by_account_id(account_ids):
+    """Return {account_id: welcomed_at ISO string} for the given account ids that have a
+    :class:`ModerationWelcome` row, in a single query.
+    """
+    from models import ModerationWelcome
+
+    account_ids = [a for a in account_ids if a]
+    if not account_ids:
+        return {}
+    rows = (
+        ModerationWelcome.query
+        .filter(ModerationWelcome.mastodon_account_id.in_(account_ids))
+        .all()
+    )
+    return {row.mastodon_account_id: _utc_iso(row.sent_at) for row in rows}
+
+
 @bp.route("/mastodon/new_accounts")
 def mastodon_new_accounts():
     days = request.args.get("days", 7, type=int) or 7
@@ -667,11 +722,97 @@ def mastodon_new_accounts():
         since = datetime.now(timezone.utc) - timedelta(days=days)
         accounts = c.list_local_accounts(newer_than=since, max_pages=3)
         watched_ids = _watched_account_ids([a.get("id") for a in accounts])
+        welcomed_at = _welcomed_at_by_account_id([a.get("id") for a in accounts])
         for a in accounts:
             a["watched"] = a.get("id") in watched_ids
+            a["welcomed_at"] = welcomed_at.get(a.get("id"))
         return {"accounts": accounts}
 
     return _mastodon_json(_do)
+
+
+# ---------------------------------------------------------------------------
+# Welcome bot: automatic/manual welcome DMs to newly discovered accounts.
+# See core/moderation_watch.py for send_welcome/build_bot_client/get_welcome_settings.
+# ---------------------------------------------------------------------------
+
+
+@bp.route("/mastodon/accounts/<int:account_id>/welcome", methods=["POST"])
+def mastodon_welcome_send(account_id):
+    from core.moderation_watch import send_welcome
+
+    acct = _form_text("acct")
+    if not acct:
+        return jsonify({"ok": False, "error": "acct is required"}), 400
+    force = request.form.get("force") == "1"
+
+    client, err = _get_bot_client()
+    if err:
+        return jsonify({"ok": False, "error": "Welcome bot is not configured"}), 400
+
+    account = {
+        "id": str(account_id),
+        "username": acct.split("@")[0].lstrip("@"),
+        "acct": acct.lstrip("@"),
+        "display_name": _form_text("display_name") or None,
+    }
+
+    # send_welcome never raises MastodonAPIError itself -- a post failure comes
+    # back as (None, exc.message) -- so no try/except is needed here.
+    rec, error = send_welcome(client, account, sent_by_user_id=current_user.id, force=force)
+
+    if error == "already welcomed":
+        return jsonify({"ok": False, "error": error}), 409
+    if error:
+        return jsonify({"ok": False, "error": error}), 502
+
+    return jsonify({
+        "ok": True,
+        "welcome": {
+            "sent_at": _utc_iso(rec.sent_at),
+            "status_id": rec.status_id,
+            "automatic": rec.sent_by_user_id is None,
+        },
+    })
+
+
+@bp.route("/mastodon/welcome/save", methods=["POST"])
+def mastodon_welcome_save():
+    from auth.credential_store import encrypt
+    from core.mastodon_admin import validate_welcome_template
+
+    template = request.form.get("welcome_template", "")
+    err = validate_welcome_template(template)
+    if err:
+        flash(err, "error")
+        return redirect(url_for("moderation.index", tab="mastodon"))
+
+    new_token = request.form.get("bot_token", "").strip()
+    token_changed = bool(new_token)
+    if new_token:
+        Setting.set("moderation_bot_token", encrypt(new_token))
+
+    Setting.set("moderation_welcome_template", template.strip())
+    enabled = _form_flag("welcome_enabled")
+    Setting.set("moderation_welcome_enabled", "true" if enabled else "false")
+
+    log_action(
+        "moderation_welcome_config_save",
+        "moderation",
+        details={"enabled": enabled, "template_len": len(template.strip()), "token_changed": token_changed},
+    )
+    db.session.commit()
+
+    flash("Welcome message settings saved.", "success")
+    return redirect(url_for("moderation.index", tab="mastodon"))
+
+
+@bp.route("/mastodon/welcome/test", methods=["POST"])
+def mastodon_welcome_test():
+    return _bot_json(
+        lambda c: {"account": c.verify()},
+        audit=("mastodon_welcome_test", "moderation", None, None),
+    )
 
 
 @bp.route("/mastodon/watch/poll", methods=["POST"])

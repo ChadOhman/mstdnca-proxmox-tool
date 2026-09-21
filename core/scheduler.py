@@ -1362,14 +1362,21 @@ def _run_moderation_watch_poll(app):
                 logger.info("Moderation watch poll skipped: backing off until %s", backoff_raw)
                 return
 
-        from core.moderation_watch import build_admin_client, run_watch_poll
+        from core.moderation_watch import build_admin_client, build_bot_client, run_watch_poll
 
         client, err = build_admin_client()
         if err:
             logger.error("Moderation watch poll could not build a Mastodon client: %s", err)
             return
 
-        result = run_watch_poll(client)
+        bot_client = None
+        if Setting.get("moderation_welcome_enabled", "false") == "true":
+            bot_client, bot_err = build_bot_client()
+            if bot_err:
+                logger.warning("Moderation watch poll could not build a welcome bot client: %s", bot_err)
+                bot_client = None
+
+        result = run_watch_poll(client, bot_client=bot_client)
 
         if result.get("backoff_until"):
             Setting.set("moderation_watch_backoff_until", result["backoff_until"])

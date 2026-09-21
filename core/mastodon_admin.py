@@ -53,6 +53,19 @@ _LINK_NEXT_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
 # Maximum characters of a reported status kept in the summary sent to the UI.
 _STATUS_EXCERPT_LEN = 300
 
+# Mastodon's hard status-length cap. The welcome bot posts a single direct
+# message, so this doubles as the budget ``render_welcome`` enforces.
+MAX_STATUS_CHARS = 500
+# Template variables ``render_welcome``/``validate_welcome_template`` accept.
+WELCOME_TEMPLATE_VARS = ("username", "display_name", "acct")
+DEFAULT_WELCOME_TEMPLATE = (
+    "Welcome to the instance! Take a look at the local timeline to see what "
+    "people are posting, and follow anyone who catches your eye -- you can "
+    "also follow a hashtag to track a topic. Check out the About page for "
+    "our house rules, and consider adding a bio and an avatar so people know "
+    "you're a real person."
+)
+
 
 class MastodonAPIError(Exception):
     """An Admin API call failed. ``message`` is safe to show to the user."""
@@ -398,6 +411,88 @@ class MastodonAdminClient(_MastodonClientBase):
 
     def pending_account_count(self):
         return self.count_hint("/api/v2/admin/accounts", params={"status": "pending"})
+
+
+class MastodonBotClient(_MastodonClientBase):
+    """Minimal client for the welcome-bot account: verify identity, post a direct message.
+
+    Uses a separate (non-admin) user token -- the bot posts as itself, it does
+    not act on other accounts -- so this is kept apart from
+    :class:`MastodonAdminClient` even though it shares the same transport.
+    """
+
+    def verify(self):
+        """Check the bot token works. Returns a small summary dict."""
+        me, _ = self._request("GET", "/api/v1/accounts/verify_credentials")
+        return {
+            "id": me.get("id"),
+            "acct": me.get("acct", ""),
+            "display_name": me.get("display_name", ""),
+            "bot": bool(me.get("bot")),
+        }
+
+    def post_direct(self, text, idempotency_key):
+        """Post ``text`` as a direct-visibility status. Returns a status summary."""
+        data, _ = self._request(
+            "POST",
+            "/api/v1/statuses",
+            body={"status": text, "visibility": "direct"},
+            headers={"Idempotency-Key": idempotency_key},
+        )
+        return summarize_status(data)
+
+
+class _SafeDict(dict):
+    """A ``dict`` for ``str.format_map`` that leaves unknown ``{key}`` placeholders literal
+    instead of raising ``KeyError``.
+    """
+
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+
+def render_welcome(template, account):
+    """Render a welcome-message template for ``account`` and prefix the mention.
+
+    ``account`` is one of the account dicts carried by
+    ``moderation_watch._discover_new_accounts`` (has ``username``,
+    ``display_name``, ``acct``). Raises ``ValueError`` if the rendered
+    message would exceed Mastodon's status length limit.
+    """
+    username = account["username"]
+    display_name = account.get("display_name") or username
+    acct = account.get("acct") or username
+    rendered = template.format_map(_SafeDict(username=username, display_name=display_name, acct=acct))
+    text = f"@{account['username']} " + rendered.strip()
+    if len(text) > MAX_STATUS_CHARS:
+        raise ValueError(f"Welcome message would be {len(text)} characters; Mastodon allows {MAX_STATUS_CHARS}")
+    return text
+
+
+def validate_welcome_template(template):
+    """Return an error message for a bad welcome template, or ``None`` if it's usable.
+
+    Renders against a worst-case sample account (30-char username/display
+    name) so a template that only goes over budget for long names is still
+    caught before it's saved.
+    """
+    if not template or not template.strip():
+        return "Welcome message template cannot be empty"
+    sample = {
+        "username": "a" * 30,
+        "display_name": "a" * 30,
+        "acct": "a" * 30,
+    }
+    try:
+        render_welcome(template, sample)
+    except ValueError as exc:
+        return str(exc)
+    except (KeyError, IndexError):
+        return (
+            "Welcome message template has an invalid placeholder "
+            "(only {username}, {display_name} and {acct} are supported)"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------- summaries

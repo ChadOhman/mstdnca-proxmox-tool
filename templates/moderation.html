@@ -174,7 +174,8 @@
 
     <!-- Mastodon Moderation -->
     <div class="tab-pane fade{% if active_tab == 'mastodon' %} show active{% endif %}" id="mastodon-pane" role="tabpanel" aria-labelledby="mastodon-tab"
-         data-configured="{{ 'true' if settings.mastodon_api_url and settings.mastodon_api_token else 'false' }}">
+         data-configured="{{ 'true' if settings.mastodon_api_url and settings.mastodon_api_token else 'false' }}"
+         data-welcome-configured="{{ 'true' if welcome_settings is defined and welcome_settings.bot_configured else 'false' }}">
         <div class="row g-4">
             <!-- Configuration -->
             <div class="col-lg-5">
@@ -400,6 +401,58 @@
         </div>
         {% endif %}
 
+        <!-- Welcome message -->
+        {% if can_configure %}
+        <div class="card bg-dark mt-4" id="masto-welcome-card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-chat-heart"></i> Welcome Message</h5>
+            </div>
+            <div class="card-body">
+                <form method="post" action="/moderation/mastodon/welcome/save">
+                    <div class="mb-3">
+                        <label class="form-label" for="welcome_bot_token">Bot Access Token</label>
+                        <input type="password" class="form-control font-monospace" id="welcome_bot_token" name="bot_token"
+                               autocomplete="off"
+                               placeholder="{{ '********' if welcome_settings is defined and welcome_settings.bot_configured else '' }}">
+                        <div class="form-text">
+                            Access token for the bot account, scope <code>write:statuses</code>. Separate from the admin token.
+                            Leave blank to keep the existing token.
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-info mt-2" id="masto-welcome-test-btn"
+                                data-masto-welcome-test
+                                {{ 'disabled' if not (welcome_settings is defined and welcome_settings.bot_configured) }}>
+                            <i class="bi bi-plug"></i> Test bot token
+                        </button>
+                        <div id="masto-welcome-test-result" class="small mt-2" aria-live="polite"></div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="welcome_template">Message Template</label>
+                        <textarea class="form-control" id="welcome_template" name="welcome_template" rows="6"
+                                  maxlength="480">{{ welcome_settings.template if welcome_settings is defined else '' }}</textarea>
+                        <div class="form-text d-flex justify-content-between flex-wrap gap-2">
+                            <span>Variables: {username}, {display_name}, {acct}</span>
+                            <span id="masto-welcome-count">0 / 480 characters (the @mention is added automatically)</span>
+                        </div>
+                    </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="welcome_enabled" name="welcome_enabled"
+                               {{ 'checked' if welcome_settings is defined and welcome_settings.enabled }}>
+                        <label class="form-check-label" for="welcome_enabled">Automatically welcome new accounts</label>
+                        <div class="form-text">
+                            Sends one direct-visibility mention per newly discovered account; the poll must be enabled. Off by default.
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="bi bi-check-lg"></i> Save Settings
+                    </button>
+                    <div class="text-muted small mt-2">
+                        Only accounts discovered after the first poll are welcomed; nothing is sent retroactively.
+                    </div>
+                </form>
+            </div>
+        </div>
+        {% endif %}
+
         <!-- Domain blocks -->
         <div class="card bg-dark mt-4" id="masto-domains-card">
             <div class="card-header d-flex justify-content-between align-items-center">
@@ -586,6 +639,7 @@
     const pane = document.getElementById('mastodon-pane');
     if (!pane) return;
     const configured = pane.dataset.configured === 'true';
+    const welcomeConfigured = pane.dataset.welcomeConfigured === 'true';
     const loaded = { reports: false, pending: false, domains: false, watches: false, alerts: false, new_accounts: false };
 
     // ── helpers ───────────────────────────────────────────────────────────
@@ -674,6 +728,74 @@
             .finally(() => { testBtn.disabled = false; });
     });
 
+    // ── welcome message settings ────────────────────────────────────────────
+    const welcomeTestBtn = document.getElementById('masto-welcome-test-btn');
+    const welcomeTestOut = document.getElementById('masto-welcome-test-result');
+    if (welcomeTestBtn) welcomeTestBtn.addEventListener('click', () => {
+        welcomeTestBtn.disabled = true;
+        welcomeTestOut.innerHTML = '<span class="text-muted">Testing…</span>';
+        api('/moderation/mastodon/welcome/test', new FormData())
+            .then(d => {
+                const a = d.account || {};
+                welcomeTestOut.innerHTML = '<span class="text-success"><i class="bi bi-check-circle"></i> Bot is '
+                    + '<strong class="font-monospace">' + escHtml(a.acct) + '</strong>'
+                    + (a.display_name ? ' (' + escHtml(a.display_name) + ')' : '') + '.</span>';
+            })
+            .catch(e => { welcomeTestOut.innerHTML = errorBox(e.message); })
+            .finally(() => { welcomeTestBtn.disabled = false; });
+    });
+
+    const welcomeTemplateEl = document.getElementById('welcome_template');
+    const welcomeCountEl = document.getElementById('masto-welcome-count');
+    function updateWelcomeCount() {
+        if (!welcomeTemplateEl || !welcomeCountEl) return;
+        welcomeCountEl.textContent = welcomeTemplateEl.value.length + ' / 480 characters (the @mention is added automatically)';
+    }
+    if (welcomeTemplateEl) {
+        welcomeTemplateEl.addEventListener('input', updateWelcomeCount);
+        updateWelcomeCount();
+    }
+
+    // Sends (or re-sends) the welcome mention for one account. On a 409 "already
+    // welcomed" conflict, confirms with the moderator and retries with force=1.
+    function sendWelcome(accountId, acct, force) {
+        return api('/moderation/mastodon/accounts/' + encodeURIComponent(accountId) + '/welcome',
+            formData({ acct: acct, force: force ? '1' : undefined }))
+            .catch(err => {
+                if (!force && err.message === 'already welcomed') {
+                    return confirmDialog('This account was already welcomed. Send again?').then(ok => {
+                        if (!ok) throw err;
+                        return sendWelcome(accountId, acct, true);
+                    });
+                }
+                throw err;
+            });
+    }
+
+    pane.addEventListener('click', e => {
+        const btn = e.target.closest('[data-masto-welcome]');
+        if (!btn) return;
+        const accountId = btn.dataset.accountId;
+        const acct = btn.dataset.acct;
+        const inAccountPanel = !!btn.closest('#masto-account-panel');
+        btn.disabled = true;
+        sendWelcome(accountId, acct)
+            .then(d => {
+                const sentAt = d.welcome && d.welcome.sent_at;
+                if (inAccountPanel) {
+                    const errEl = document.getElementById('masto-account-error');
+                    if (errEl) errEl.innerHTML = '<span class="text-success"><i class="bi bi-check-circle"></i> Welcome sent'
+                        + (sentAt ? ' ' + fmtDate(sentAt) : '') + '.</span>';
+                }
+                if (loaded.new_accounts) loadNewAccounts();
+            })
+            .catch(err => {
+                const target = inAccountPanel ? document.getElementById('masto-account-error') : btn.closest('td');
+                if (target) target.innerHTML = errorBox(err.message);
+            })
+            .finally(() => { btn.disabled = false; });
+    });
+
     // ── account panel + action modal ──────────────────────────────────────
     const acctPanel = document.getElementById('masto-account-panel');
     const actionModalEl = document.getElementById('mastoActionModal');
@@ -744,6 +866,9 @@
         if (a.sensitized) html += '<button type="button" class="btn btn-sm btn-outline-success" data-act="unsensitive">Clear sensitive</button>';
         if (!a.domain) html += '<button type="button" class="btn btn-sm btn-outline-info" data-act="watch">'
               + '<i class="bi bi-eye"></i> Watch</button>';
+        if (!a.domain && welcomeConfigured) html += '<button type="button" class="btn btn-sm btn-outline-info" data-masto-welcome'
+              + ' data-account-id="' + escHtml(String(a.id)) + '" data-acct="' + escHtml(a.acct || '') + '">'
+              + '<i class="bi bi-chat-heart"></i> Send welcome</button>';
         html += '</div><div class="mt-2" id="masto-account-error"></div>';
         acctPanel.innerHTML = html;
         acctPanel.classList.remove('text-muted');
@@ -1197,13 +1322,19 @@
             return;
         }
         let html = '<div class="table-responsive"><table class="table table-dark table-striped table-hover mb-0 align-middle">'
-            + '<thead><tr><th>Handle</th><th>Created</th><th>Posts</th><th>Last login</th><th class="text-end">Actions</th></tr></thead><tbody>';
+            + '<thead><tr><th>Handle</th><th>Created</th><th>Posts</th><th>Last login</th><th>Welcome</th><th class="text-end">Actions</th></tr></thead><tbody>';
         accounts.forEach(a => {
             html += '<tr data-account-id="' + escHtml(String(a.id)) + '">'
                 + '<td>' + acctLink(a) + '</td>'
                 + '<td class="small">' + fmtDate(a.created_at) + '</td>'
                 + '<td class="small">' + (a.statuses_count || 0) + '</td>'
                 + '<td class="small">' + (a.last_login_at ? fmtDate(a.last_login_at) : '<span class="text-muted">never</span>') + '</td>'
+                + '<td class="small">' + (a.welcomed_at
+                    ? '<span class="badge bg-success" title="' + fmtDate(a.welcomed_at) + '">Welcomed</span>'
+                    : (welcomeConfigured
+                        ? '<button type="button" class="btn btn-sm btn-outline-info" data-masto-welcome'
+                          + ' data-account-id="' + escHtml(String(a.id)) + '" data-acct="' + escHtml(a.acct || '') + '">Send welcome</button>'
+                        : '')) + '</td>'
                 + '<td class="text-end">' + (a.watched
                     ? '<span class="badge bg-secondary">Watched</span>'
                     : '<button type="button" class="btn btn-sm btn-outline-info" data-new-account-watch>Watch</button>') + '</td>'
