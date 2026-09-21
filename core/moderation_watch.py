@@ -41,6 +41,7 @@ SILENT_SCAN_MIN_HOURS = 24
 # Cap on how many welcome DMs one poll will send, so a burst of signups (or a
 # bootstrap-adjacent bug) can't turn into a wall of bot posts in one run.
 MAX_WELCOMES_PER_RUN = 20
+WELCOME_RENDER_ERROR = "Welcome message template is invalid or too long; fix it under Welcome message settings"
 
 # User-facing settings and their string defaults (see routes/settings.py for
 # the form that edits these). Job-only bookkeeping keys (cursor, last-run
@@ -139,8 +140,9 @@ def build_bot_client():
         return None, "Welcome bot token not configured"
     try:
         plain = decrypt(token)
-    except CredentialStoreError as exc:
-        return None, str(exc)
+    except CredentialStoreError:
+        logger.warning("Welcome bot token could not be decrypted", exc_info=True)
+        return None, "Failed to decrypt the welcome bot token"
     if not plain:
         return None, "Failed to decrypt the welcome bot token"
     return MastodonBotClient(api_url, plain), None
@@ -261,8 +263,11 @@ def send_welcome(bot_client, account, *, sent_by_user_id=None, force=False, temp
 
     try:
         text = render_welcome(template, account)
-    except ValueError as exc:
-        return None, str(exc)
+    except (ValueError, KeyError, IndexError):
+        # Our own render error (over budget) or a malformed template: keep the
+        # exception text in the log, hand the caller a fixed message.
+        logger.warning("Welcome message could not be rendered for %s", account.get("acct"), exc_info=True)
+        return None, WELCOME_RENDER_ERROR
 
     try:
         status = bot_client.post_direct(text, idempotency_key=f"welcome-{account_id}")

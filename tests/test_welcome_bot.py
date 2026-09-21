@@ -330,8 +330,9 @@ class TestSendWelcome:
             record, err = send_welcome(bot, account, template="x" * 600)
 
             assert record is None
-            assert err is not None
-            assert "500" in err
+            from core.moderation_watch import WELCOME_RENDER_ERROR
+
+            assert err == WELCOME_RENDER_ERROR  # fixed text: never the exception message
             bot.post_direct.assert_not_called()
 
 
