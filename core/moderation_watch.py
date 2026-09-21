@@ -121,8 +121,9 @@ def build_admin_client():
         return None, "Mastodon API URL or token not configured"
     try:
         plain = decrypt(token)
-    except CredentialStoreError as exc:
-        return None, str(exc)
+    except CredentialStoreError:
+        logger.warning("Mastodon API token could not be decrypted", exc_info=True)
+        return None, "Failed to decrypt the Mastodon API token"
     if not plain:
         return None, "Failed to decrypt the Mastodon API token"
     return MastodonAdminClient(api_url, plain), None

@@ -513,7 +513,7 @@ class TestWatchSave:
 
 
 class TestTemplateScriptSyntax:
-    _SCRIPT_RE = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", re.DOTALL | re.IGNORECASE)
+    _SCRIPT_RE = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script\b[^>]*>", re.DOTALL | re.IGNORECASE)
 
     def _assert_scripts_are_valid(self, html):
         if shutil.which("node") is None:
