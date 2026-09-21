@@ -89,7 +89,10 @@ def scoped(app):
         db.session.add(foreign_svc)
 
         # Roles: each holds one capability but is not admin-tier.
-        manager = _make_role("_scoped_manager", level=1, can_manage_guests=True)
+        # can_view_guests=True on "manager" preserves this fixture's intent (a
+        # user who can act on guests they're scoped to) now that /guests/*
+        # is gated on that flag in addition to the per-guest tag check.
+        manager = _make_role("_scoped_manager", level=1, can_manage_guests=True, can_view_guests=True)
         svc_editor = _make_role("_scoped_svc", level=1, can_view_services=True, can_edit_services=True)
         updater = _make_role("_scoped_updater", level=1, can_update=True)
         viewer = _make_role("_scoped_viewer", level=1)

@@ -1260,9 +1260,9 @@
 <script>
 // Pre-fill permissions when base tier changes in the Add Custom Role modal
 const tierPerms = {
-    viewer: [],
-    operator: ['can_ssh', 'can_update'],
-    admin: ['can_ssh', 'can_update', 'can_manage_users', 'can_manage_hosts', 'can_manage_guests', 'can_restart_unifi']
+    viewer: ['can_view_guests'],
+    operator: ['can_ssh', 'can_update', 'can_view_guests'],
+    admin: ['can_ssh', 'can_update', 'can_manage_users', 'can_manage_hosts', 'can_manage_guests', 'can_restart_unifi', 'can_view_guests']
 };
 
 function prefillPermissions(tier) {

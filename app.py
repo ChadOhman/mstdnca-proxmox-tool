@@ -88,8 +88,10 @@ def create_app(test_config=None):
         _migrate_smcipmi_to_ipmi_exporter()
         _migrate_guest_lock_column()
         _migrate_user_security_columns()
+        _migrate_guest_view_permission()
         _ensure_guest_vmid_unique_index()
         _seed_roles()
+        _migrate_moderator_role()
         _ensure_default_admin()
 
     # Read version from file
@@ -449,6 +451,29 @@ def _migrate_user_security_columns():
     _add_column_if_missing("users", "must_change_password", "BOOLEAN DEFAULT 0")
 
 
+def _migrate_guest_view_permission():
+    """Add the can_view_guests permission column to roles created before it.
+
+    Runs only on the upgrade that adds the column (``_add_column_if_missing``
+    returns True exactly once, on the ALTER TABLE that creates it), so it
+    backfills every existing role -- including custom ones -- to True.  That
+    keeps the Guests and Update History pages visible to whoever could already
+    see them before this permission existed; without the one-time guard a
+    later run would re-run the UPDATE and stomp an admin's deliberate removal
+    of the permission from a role.
+    """
+    added = _add_column_if_missing("roles", "can_view_guests", "BOOLEAN DEFAULT 0")
+    if not added:
+        return
+    try:
+        db.session.execute(db.text("UPDATE roles SET can_view_guests = 1"))
+        db.session.commit()
+        logger.info("Backfilled can_view_guests permission onto existing roles")
+    except Exception:
+        db.session.rollback()
+        logger.warning("Failed to backfill roles.can_view_guests", exc_info=True)
+
+
 def _ensure_guest_vmid_unique_index():
     """Create the (proxmox_host_id, vmid) unique index on pre-existing databases.
 
@@ -503,6 +528,28 @@ def _seed_roles():
         db.session.add(role)
     db.session.commit()
     logger.info(f"Seeded {len(DEFAULT_ROLES)} default roles.")
+
+
+def _migrate_moderator_role():
+    """Insert the builtin moderator role on deployments that predate it.
+
+    Only fires when no role named "moderator" exists yet, so a deployment
+    that already has one -- whether it is the builtin row this function
+    would insert, or a custom role an admin created with the same name --
+    is left untouched.  Must run after ``_migrate_guest_view_permission()``
+    so a freshly-inserted moderator row keeps ``can_view_guests=False``
+    instead of being swept up by that column's backfill.
+    """
+    try:
+        if Role.query.filter_by(name="moderator").first() is not None:
+            return
+        moderator_data = next(r for r in DEFAULT_ROLES if r["name"] == "moderator")
+        db.session.add(Role(**moderator_data))
+        db.session.commit()
+        logger.info("Added the builtin moderator role")
+    except Exception:
+        db.session.rollback()
+        logger.warning("Failed to add the builtin moderator role", exc_info=True)
 
 
 INITIAL_ADMIN_PASSWORD_FILE = "initial-admin-password"

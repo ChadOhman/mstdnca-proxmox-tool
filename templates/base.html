@@ -40,18 +40,22 @@
                         </a>
                     </li>
                     {% endif %}
+                    {% if current_user.can_view_guests %}
                     <li class="nav-item">
                         <a class="nav-link {% if request.blueprint == 'guests' %}active{% endif %}" href="/guests"
                            {% if request.blueprint == 'guests' %}aria-current="page"{% endif %}>
                             <i class="bi bi-pc-display"></i> Guests
                         </a>
                     </li>
+                    {% endif %}
+                    {% if current_user.can_view_guests %}
                     <li class="nav-item">
                         <a class="nav-link {% if request.blueprint == 'trends' %}active{% endif %}" href="/trends"
                            {% if request.blueprint == 'trends' %}aria-current="page"{% endif %}>
                             <i class="bi bi-graph-up-arrow"></i> Update History
                         </a>
                     </li>
+                    {% endif %}
                     {% if current_user.can_ssh %}
                     <li class="nav-item">
                         <a class="nav-link {% if request.blueprint == 'terminal' %}active{% endif %}" href="/terminal"
