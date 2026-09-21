@@ -27,6 +27,7 @@
         <div class="row g-4">
             <!-- Configuration -->
             <div class="col-lg-6">
+                {% if can_configure %}
                 <div class="card bg-dark">
                     <div class="card-header">
                         <h5 class="mb-0"><i class="bi bi-gear"></i> PeerTube Moderation Configuration</h5>
@@ -69,6 +70,11 @@
                         </form>
                     </div>
                 </div>
+                {% else %}
+                <div class="card bg-dark">
+                    <div class="card-body text-muted small">API connection settings are managed by an administrator.</div>
+                </div>
+                {% endif %}
             </div>
 
             <!-- Status & Run -->
@@ -172,6 +178,7 @@
         <div class="row g-4">
             <!-- Configuration -->
             <div class="col-lg-5">
+                {% if can_configure %}
                 <div class="card bg-dark h-100">
                     <div class="card-header">
                         <h5 class="mb-0"><i class="bi bi-gear"></i> Mastodon Admin API</h5>
@@ -206,6 +213,11 @@
                         <div id="masto-test-result" class="mt-3 small" aria-live="polite"></div>
                     </div>
                 </div>
+                {% else %}
+                <div class="card bg-dark h-100">
+                    <div class="card-body text-muted small">API connection settings are managed by an administrator.</div>
+                </div>
+                {% endif %}
             </div>
 
             <!-- Account lookup -->

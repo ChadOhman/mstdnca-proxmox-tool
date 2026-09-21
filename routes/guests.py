@@ -39,6 +39,14 @@ def _get_tag_backup_defaults(guest):
 bp = Blueprint("guests", __name__)
 
 
+@bp.before_request
+@login_required
+def _require_guest_view():
+    if not current_user.can_view_guests:
+        flash("You don't have permission to view guests.", "error")
+        return redirect(url_for("dashboard.index"))
+
+
 def _require_guest_access(guest):
     """Return a redirect response when the current user may not act on `guest`.
 

@@ -26,11 +26,13 @@
                 {% endif %}
             </ul>
         </div>
+        {% if current_user.can_view_guests %}
         <form method="post" action="/api/scan-all">
             <button type="submit" class="btn btn-primary">
                 <i class="bi bi-arrow-clockwise"></i> Scan All Guests
             </button>
         </form>
+        {% endif %}
     </div>
 </div>
 
@@ -58,6 +60,8 @@
 </div>
 {% endif %}
 
+{# Infrastructure cards: hidden for roles without can_view_guests (e.g. moderator) #}
+{% if current_user.can_view_guests %}
 <!-- Infrastructure Overview -->
 <div class="row g-3 mb-3">
     <div class="col-6 col-md-4 col-lg-2">
@@ -186,6 +190,7 @@
         </div>
     </div>
 </div>
+{% endif %}
 
 <!-- Host Performance (async-loaded, auto-refreshes every 30s) -->
 {% if current_user.can_view_hosts or current_user.can_manage_hosts %}
@@ -222,8 +227,10 @@
         </div>
     </div>
 </div>
+{% endif %}
 
 <!-- Guest Resources (async-loaded, auto-refreshes every 30s) -->
+{% if current_user.can_view_guests %}
 <div class="card bg-dark mb-4" id="guestStatsCard">
     <p class="visually-hidden" id="guestStatsStatus" aria-live="polite"></p>
     <div class="card-header d-flex justify-content-between align-items-center">
@@ -256,6 +263,8 @@
 </div>
 {% endif %}
 
+{# Pending Updates: hidden for roles without can_view_guests (e.g. moderator) #}
+{% if current_user.can_view_guests %}
 <div class="row g-4">
     <div class="col-12">
         <div class="card bg-dark">
@@ -341,6 +350,7 @@
         </div>
     </div>
 </div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}

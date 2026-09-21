@@ -68,16 +68,32 @@ def _parse_iso(value):
         return None
 
 
+# Endpoints that change moderation configuration (API URLs, tokens, the
+# PeerTube auto-ban switch). Moderators may operate the tools but only
+# administrators may reconfigure them.
+_ADMIN_ONLY_ENDPOINTS = frozenset({
+    "moderation.save",
+    "moderation.mastodon_save",
+    "moderation.mastodon_test",
+})
+
+
 @bp.before_request
 @login_required
 def _require_login():
-    # Moderation exposes user PII (emails) and an auto-ban surface, so it is
-    # gated at the admin tier in addition to the grantable can_moderate flag —
-    # can_moderate alone must not unlock this feature for a non-admin (H2).
-    # current_user.is_admin is role_level >= 3 (admin / super_admin).
-    if not (current_user.is_admin and current_user.can_moderate):
+    # can_moderate is only grantable by a super_admin on the Roles tab, so it
+    # is itself the access gate for the operational moderation surface. Like
+    # Mastodon's own moderator role, that surface includes account emails and
+    # IPs in the live cards (account lookup, reports, pending approvals) — a
+    # moderator needs those to do the job. Reconfiguring where those tools
+    # point (API URLs, tokens, the PeerTube auto-ban switch) stays admin-tier,
+    # enforced below via _ADMIN_ONLY_ENDPOINTS.
+    if not current_user.can_moderate:
         flash("You don't have permission to access moderation.", "error")
         return redirect(url_for("dashboard.index"))
+    if request.endpoint in _ADMIN_ONLY_ENDPOINTS and not current_user.is_admin:
+        flash("Administrator access is required to change moderation settings.", "error")
+        return redirect(url_for("moderation.index"))
 
 
 def _get_moderation_settings():
@@ -114,6 +130,7 @@ def index():
         last_result=last_result,
         job=_moderation_job,
         active_tab=active_tab,
+        can_configure=current_user.is_admin,
     )
 
 

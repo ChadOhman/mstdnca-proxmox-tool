@@ -771,8 +771,10 @@ class TestModerationResultNoPIIPersisted:
 # ---------------------------------------------------------------------------
 
 
-class TestModerationAdminGate:
-    """can_moderate alone must not unlock moderation for a non-admin user."""
+class TestModerationGate:
+    """can_moderate unlocks the operational moderation surface for a non-admin
+    user, but configuration (API URLs, tokens, the auto-ban switch) stays
+    admin-tier."""
 
     def _make_non_admin_moderator(self, app):
         """Create an operator-tier role with can_moderate=True and a user in it."""
@@ -804,27 +806,65 @@ class TestModerationAdminGate:
             Role.query.filter_by(name="_mod_test_operator_mod").delete()
             db.session.commit()
 
-    def test_non_admin_with_can_moderate_denied_all_routes(self, app, client):
+    def _login(self, client):
+        client.post(
+            "/login",
+            data={"username": "_mod_test_nonadmin", "password": "TestPass123!"},
+            follow_redirects=False,
+        )
+
+    def test_non_admin_moderator_allowed_operational_routes(self, app, client):
         self._make_non_admin_moderator(app)
         try:
-            client.post(
-                "/login",
-                data={"username": "_mod_test_nonadmin", "password": "TestPass123!"},
-                follow_redirects=False,
-            )
-            for method, path in [
-                ("get", "/moderation/"),
-                ("post", "/moderation/run"),
-                ("get", "/moderation/status"),
-                ("post", "/moderation/save"),
-            ]:
-                resp = getattr(client, method)(path, follow_redirects=False)
-                # before_request redirects away from the moderation blueprint.
-                assert resp.status_code == 302, f"{method} {path} not denied"
-                assert "/moderation" not in resp.headers.get("Location", ""), \
-                    f"{method} {path} was allowed for a non-admin moderator"
+            self._login(client)
+
+            resp = client.get("/moderation/", follow_redirects=False)
+            assert resp.status_code == 200
+            assert b'action="/moderation/mastodon/save"' not in resp.data
+            assert b"managed by an administrator" in resp.data
+
+            resp = client.get("/moderation/status", follow_redirects=False)
+            assert resp.status_code == 200
+
+            resp = client.post("/moderation/run", follow_redirects=False)
+            assert resp.status_code == 302
+            assert resp.headers.get("Location", "").endswith("/moderation/")
         finally:
             self._cleanup(app)
+
+    def test_non_admin_moderator_denied_config_routes(self, app, client):
+        from models import Setting
+
+        self._make_non_admin_moderator(app)
+        try:
+            self._login(client)
+
+            with app.app_context():
+                original_url = Setting.get("moderation_peertube_api_url", "")
+
+            for method, path, data in [
+                ("post", "/moderation/save", {"peertube_api_url": "https://evil.example"}),
+                ("post", "/moderation/mastodon/save", {"mastodon_api_url": "https://evil.example"}),
+                ("post", "/moderation/mastodon/test", {}),
+            ]:
+                resp = getattr(client, method)(path, data=data, follow_redirects=False)
+                assert resp.status_code == 302, f"{method} {path} not denied"
+                assert resp.headers.get("Location", "").endswith("/moderation/"), \
+                    f"{method} {path} was allowed for a non-admin moderator"
+
+            with app.app_context():
+                assert Setting.get("moderation_peertube_api_url", "") == original_url
+        finally:
+            self._cleanup(app)
+
+    def test_admin_still_allowed_config_routes(self, auth_client):
+        resp = auth_client.post(
+            "/moderation/save",
+            data={"peertube_api_url": "https://peertube.example.com"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        assert resp.headers.get("Location", "").endswith("/moderation/")
 
 
 # ---------------------------------------------------------------------------

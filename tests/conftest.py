@@ -5,10 +5,11 @@ import tempfile
 import pytest
 
 from app import create_app
-from models import User
+from models import Role, User
 from models import db as _db
 
 _TEST_ADMIN_PASSWORD = "TestPass123!"
+_TEST_MODERATOR_PASSWORD = "test-only-ModeratorPass123!"
 
 # The suite uses a file-backed SQLite database in a per-session temp directory
 # rather than ``sqlite:///:memory:``.  An in-memory database is served through
@@ -87,6 +88,32 @@ def auth_client(app):
         c.post(
             "/login",
             data={"username": "admin", "password": _TEST_ADMIN_PASSWORD},
+            follow_redirects=False,
+        )
+        yield c
+
+
+@pytest.fixture(scope="session")
+def moderator_user(app):
+    """A user in the builtin moderator role, created once per test session."""
+    with app.app_context():
+        user = User.query.filter_by(username="_moderator_fixture").first()
+        if user is None:
+            role = Role.query.filter_by(name="moderator").first()
+            user = User(username="_moderator_fixture", display_name="Moderator Fixture", role_id=role.id)
+            user.set_password(_TEST_MODERATOR_PASSWORD)
+            _db.session.add(user)
+            _db.session.commit()
+        return user.id
+
+
+@pytest.fixture()
+def moderator_client(app, moderator_user):
+    """A test client pre-authenticated as the builtin moderator-role user."""
+    with app.test_client() as c:
+        c.post(
+            "/login",
+            data={"username": "_moderator_fixture", "password": _TEST_MODERATOR_PASSWORD},
             follow_redirects=False,
         )
         yield c

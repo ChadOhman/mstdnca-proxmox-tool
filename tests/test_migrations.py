@@ -207,3 +207,127 @@ class TestGuestVmidIndexMigration:
                 for row in db.session.execute(db.text("PRAGMA index_list(guests)")).fetchall()
             }
         assert "uq_guest_host_vmid" not in names
+
+
+class TestGuestViewPermissionAndModeratorRole:
+    def test_legacy_builtin_roles_get_can_view_guests(self, legacy_db):
+        """Every pre-existing builtin role must gain the new permission."""
+        app = _boot(legacy_db)
+
+        for role_name in ("super_admin", "admin", "operator", "viewer"):
+            assert _role_perms(app, role_name)["can_view_guests"], (
+                f"{role_name} did not get can_view_guests on upgrade"
+            )
+
+    def test_legacy_custom_role_gets_can_view_guests(self, legacy_db):
+        """A custom (non-builtin) legacy role must also be backfilled."""
+        conn = sqlite3.connect(legacy_db)
+        try:
+            conn.execute(
+                "INSERT INTO roles (name, display_name, level, is_builtin) VALUES (?, ?, ?, ?)",
+                ("custom_ops", "Custom Ops", 2, 0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        app = _boot(legacy_db)
+        assert _role_perms(app, "custom_ops")["can_view_guests"]
+
+    def test_moderator_role_is_inserted(self, legacy_db):
+        """The moderator role must be created with can_view_guests left False."""
+        from models import Role
+
+        app = _boot(legacy_db)
+        with app.app_context():
+            role = Role.query.filter_by(name="moderator").first()
+            assert role is not None
+            assert role.is_builtin
+            assert role.level == 2
+            assert role.can_moderate
+            assert not role.can_view_guests
+            for field in Role.PERMISSION_FIELDS:
+                if field in ("can_moderate", "can_view_guests"):
+                    continue
+                assert not getattr(role, field), f"moderator.{field} should be False"
+
+    def test_can_view_guests_backfill_is_one_time(self, legacy_db):
+        """An admin who removes the permission from a builtin role keeps it removed."""
+        from models import Role, db
+
+        app = _boot(legacy_db)
+        with app.app_context():
+            role = Role.query.filter_by(name="viewer").first()
+            role.can_view_guests = False
+            db.session.commit()
+
+        app2 = _boot(legacy_db)
+        assert not _role_perms(app2, "viewer")["can_view_guests"]
+
+    def test_pre_existing_custom_moderator_role_is_not_overwritten(self, legacy_db):
+        """A pre-existing custom role literally named 'moderator' must be left alone."""
+        conn = sqlite3.connect(legacy_db)
+        try:
+            conn.execute(
+                "INSERT INTO roles (name, display_name, level, is_builtin) VALUES (?, ?, ?, ?)",
+                ("moderator", "Custom Moderator", 1, 0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        from models import Role
+
+        app = _boot(legacy_db)
+        with app.app_context():
+            role = Role.query.filter_by(name="moderator").first()
+            assert role is not None
+            assert role.level == 1
+            assert not role.is_builtin
+            assert not role.can_moderate
+
+
+class TestFreshDatabaseRoleSeeding:
+    def test_fresh_database_seeds_five_roles_including_moderator(self, app):
+        from models import Role
+
+        with app.app_context():
+            # The session-scoped ``app`` fixture is shared with other test
+            # modules, some of which add their own custom roles -- so this
+            # asserts the five builtins are present rather than requiring an
+            # exact set (which would be order-dependent on the whole suite).
+            names = {role.name for role in Role.query.all()}
+            assert {"super_admin", "admin", "operator", "viewer", "moderator"} <= names
+
+            moderator = Role.query.filter_by(name="moderator").first()
+            assert moderator.is_builtin
+            assert moderator.level == 2
+            assert moderator.can_moderate
+            assert not moderator.can_view_guests
+            assert not moderator.can_use_ai
+
+    def test_can_view_guests_property_by_role(self, app):
+        from models import Role, User, db
+
+        with app.app_context():
+            def _make_user(username, role_name):
+                role = Role.query.filter_by(name=role_name).first()
+                user = User.query.filter_by(username=username).first()
+                if user is None:
+                    user = User(username=username, display_name=username, role_id=role.id)
+                    user.set_password("test-only-" + username)
+                    db.session.add(user)
+                    db.session.commit()
+                return user
+
+            admin_user = _make_user("_perm_check_admin", "admin")
+            operator_user = _make_user("_perm_check_operator", "operator")
+            viewer_user = _make_user("_perm_check_viewer", "viewer")
+            moderator_user = _make_user("_perm_check_moderator", "moderator")
+            super_admin_user = _make_user("_perm_check_super_admin", "super_admin")
+
+            assert admin_user.can_view_guests
+            assert operator_user.can_view_guests
+            assert viewer_user.can_view_guests
+            assert not moderator_user.can_view_guests
+            assert super_admin_user.can_view_guests

@@ -2,18 +2,25 @@
 
 Shows update-apply activity over time, a "chronically behind" ranking of
 guests with long-outstanding pending updates, and per-guest apply timelines.
-Read access mirrors the dashboard/guests pages: any authenticated user, with
-guest data scoped to the tags they can access (no dedicated permission flag
-exists for "view guests", so none is introduced here either).
+Read access mirrors the guests page: any authenticated user with
+can_view_guests, with guest data further scoped to the tags they can access.
 """
 
-from flask import Blueprint, render_template, request
+from flask import Blueprint, flash, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 
 from core.update_trends import DEFAULT_TREND_DAYS, chronically_behind, guest_history, weekly_apply_series
 from models import Guest
 
 bp = Blueprint("trends", __name__)
+
+
+@bp.before_request
+@login_required
+def _require_guest_view():
+    if not current_user.can_view_guests:
+        flash("You don't have permission to view guests.", "error")
+        return redirect(url_for("dashboard.index"))
 
 
 @bp.route("/")
