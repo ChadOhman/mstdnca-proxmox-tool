@@ -684,7 +684,7 @@ class TestPersistedResultShape:
             payload = json.loads(raw)
             assert set(payload.keys()) == {
                 "checked", "watch_total", "alerts", "deferred", "bootstrapped",
-                "backoff_until", "errors", "rate_limit",
+                "backoff_until", "errors", "rate_limit", "welcomed",
             }
             lowered = raw.lower()
             assert "email" not in lowered

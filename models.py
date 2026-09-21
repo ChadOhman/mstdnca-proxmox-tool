@@ -935,6 +935,23 @@ class ModerationAlert(db.Model):
         return f"<ModerationAlert {self.kind} acct={self.acct}>"
 
 
+class ModerationWelcome(db.Model):
+    """A welcome DM sent (by the bot, or manually) to a newly discovered account."""
+    __tablename__ = "moderation_welcomes"
+
+    id = db.Column(db.Integer, primary_key=True)
+    mastodon_account_id = db.Column(db.String(32), unique=True, nullable=False, index=True)
+    acct = db.Column(db.String(320), nullable=False)
+    sent_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    sent_by_user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    status_id = db.Column(db.String(32), nullable=True)
+
+    sent_by = db.relationship("User", backref="moderation_welcomes", lazy=True)
+
+    def __repr__(self):
+        return f"<ModerationWelcome acct={self.acct}>"
+
+
 class AuditLog(db.Model):
     __tablename__ = "audit_logs"
 

@@ -38,6 +38,10 @@ RATE_RESERVE = 60
 REQUEST_SPACING_SECONDS = 0.25
 ALERT_RETENTION_DAYS = 90
 SILENT_SCAN_MIN_HOURS = 24
+# Cap on how many welcome DMs one poll will send, so a burst of signups (or a
+# bootstrap-adjacent bug) can't turn into a wall of bot posts in one run.
+MAX_WELCOMES_PER_RUN = 20
+WELCOME_RENDER_ERROR = "Welcome message template is invalid or too long; fix it under Welcome message settings"
 
 # User-facing settings and their string defaults (see routes/settings.py for
 # the form that edits these). Job-only bookkeeping keys (cursor, last-run
@@ -102,6 +106,46 @@ def get_watch_settings():
             90, low=1,
         ),
     }
+
+
+def get_welcome_settings():
+    """Read the welcome-bot settings into a plain dict.
+
+    ``bot_configured`` reflects whether a bot token is stored -- it does not
+    verify the token works, only that ``send_welcome`` has something to try.
+    """
+    from core.mastodon_admin import DEFAULT_WELCOME_TEMPLATE
+    from models import Setting
+
+    return {
+        "enabled": Setting.get("moderation_welcome_enabled", "false") == "true",
+        "template": Setting.get("moderation_welcome_template", DEFAULT_WELCOME_TEMPLATE),
+        "bot_configured": bool(Setting.get("moderation_bot_token", "")),
+    }
+
+
+def build_bot_client():
+    """Build a welcome-bot client from settings, or return (None, error_message).
+
+    Mirrors :func:`build_admin_client` -- same Mastodon instance (the API
+    URL setting is shared), but a separate token scoped to the bot account.
+    """
+    from auth.credential_store import CredentialStoreError, decrypt
+    from core.mastodon_admin import MastodonBotClient
+    from models import Setting
+
+    api_url = Setting.get("moderation_mastodon_api_url", "")
+    token = Setting.get("moderation_bot_token", "")
+    if not api_url or not token:
+        return None, "Welcome bot token not configured"
+    try:
+        plain = decrypt(token)
+    except CredentialStoreError:
+        logger.warning("Welcome bot token could not be decrypted", exc_info=True)
+        return None, "Failed to decrypt the welcome bot token"
+    if not plain:
+        return None, "Failed to decrypt the welcome bot token"
+    return MastodonBotClient(api_url, plain), None
 
 
 def build_admin_client():
@@ -183,6 +227,79 @@ def record_alert(kind, account, status=None, *, notify=True):
             logger.exception("Failed to send moderation alert notification for %s", dedupe_key)
 
     return alert
+
+
+def welcome_record(account_id):
+    """Return the :class:`ModerationWelcome` row for ``account_id``, or ``None``."""
+    from models import ModerationWelcome
+
+    return ModerationWelcome.query.filter_by(mastodon_account_id=str(account_id)).first()
+
+
+def send_welcome(bot_client, account, *, sent_by_user_id=None, force=False, template=None):
+    """Send a welcome DM to ``account`` via ``bot_client``. Returns ``(record, error)``.
+
+    Refuses (returning ``(None, "already welcomed")``) when a
+    :class:`ModerationWelcome` row already exists for this account and
+    ``force`` is not set. On success, the row is inserted (or, when forcing,
+    updated) and audited under ``audience="moderators"``; ``sent_by_user_id``
+    left as ``None`` marks the send as automatic (from the poll) rather than
+    a moderator's manual action.
+    """
+    from core.mastodon_admin import MastodonAPIError, render_welcome
+    from models import ModerationWelcome, db
+
+    account_id = str(account.get("id"))
+    acct = account.get("acct", "")
+
+    existing = welcome_record(account_id)
+    if existing and not force:
+        return None, "already welcomed"
+
+    from core.mastodon_admin import DEFAULT_WELCOME_TEMPLATE
+    from models import Setting
+
+    template = template or Setting.get("moderation_welcome_template", DEFAULT_WELCOME_TEMPLATE)
+
+    try:
+        text = render_welcome(template, account)
+    except (ValueError, KeyError, IndexError):
+        # Our own render error (over budget) or a malformed template: keep the
+        # exception text in the log, hand the caller a fixed message.
+        logger.warning("Welcome message could not be rendered for %s", account.get("acct"), exc_info=True)
+        return None, WELCOME_RENDER_ERROR
+
+    try:
+        status = bot_client.post_direct(text, idempotency_key=f"welcome-{account_id}")
+    except MastodonAPIError as exc:
+        db.session.rollback()
+        return None, exc.message
+
+    status_id = status.get("id")
+    if existing:
+        existing.sent_at = datetime.now(timezone.utc)
+        existing.sent_by_user_id = sent_by_user_id
+        existing.status_id = status_id
+        existing.acct = acct
+        record = existing
+    else:
+        record = ModerationWelcome(
+            mastodon_account_id=account_id,
+            acct=acct,
+            sent_by_user_id=sent_by_user_id,
+            status_id=status_id,
+        )
+        db.session.add(record)
+
+    log_action(
+        "mastodon_welcome_send",
+        "mastodon_account",
+        resource_name=acct,
+        details={"account_id": account_id, "status_id": status_id, "automatic": sent_by_user_id is None},
+        audience="moderators",
+    )
+    db.session.commit()
+    return record, None
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +431,45 @@ def _discover_new_accounts(client, now, result, settings):
     result["new_accounts"] = new_accounts_out
 
 
+def _send_welcomes(bot_client, accounts, now, result):
+    """Send welcome DMs for freshly discovered ``accounts``, oldest-first.
+
+    Skipped entirely on a bootstrap run (``result["bootstrapped"]``), since
+    those accounts pre-date watching and shouldn't get a belated welcome.
+    """
+    from core.mastodon_admin import MastodonAPIError
+
+    if result["bootstrapped"] or not accounts:
+        return
+
+    bot_account_id = None
+    try:
+        bot_account_id = str(bot_client.verify().get("id"))
+    except MastodonAPIError:
+        logger.warning("Welcome bot token verification failed; continuing without self-exclusion")
+
+    welcomed = 0
+    for account in sorted(accounts, key=lambda a: a.get("created_at") or ""):
+        if welcomed >= MAX_WELCOMES_PER_RUN:
+            break
+        account_id = str(account.get("id"))
+        if bot_account_id and account_id == bot_account_id:
+            continue
+        if welcome_record(account_id):
+            continue
+        if not bot_client.budget_ok(RATE_RESERVE):
+            result["deferred"] = True
+            break
+
+        _, error = send_welcome(bot_client, account)
+        if error:
+            result["errors"].append(f"send_welcome: {error}")
+            continue
+        welcomed += 1
+
+    result["welcomed"] = welcomed
+
+
 def _scan_silent_logins(client, now, result, settings):
     """Flag accounts that have never posted but recently logged back in."""
     from models import Setting
@@ -369,7 +525,7 @@ def _scan_silent_logins(client, now, result, settings):
     Setting.set("moderation_watch_silent_last_scan_at", now.isoformat())
 
 
-def run_watch_poll(client, *, now=None, sleep=time.sleep, log=None):
+def run_watch_poll(client, *, bot_client=None, now=None, sleep=time.sleep, log=None):
     """Run one poll cycle: prune, check watches, discover signups, scan for silent logins.
 
     Every step is independent and wrapped in its own ``try/except
@@ -377,6 +533,11 @@ def run_watch_poll(client, *, now=None, sleep=time.sleep, log=None):
     aborts any remaining steps for this run and records ``backoff_until``.
     Returns the summary dict, which is also persisted to
     ``moderation_watch_last_run_result``.
+
+    ``bot_client`` (a :class:`core.mastodon_admin.MastodonBotClient`), when
+    given, sends welcome DMs to accounts discovered this run -- provided the
+    welcome feature is enabled in settings. Pass ``None`` (the default) to
+    skip welcomes entirely, e.g. when the bot token isn't configured.
     """
     from core.mastodon_admin import MastodonAPIError
     from models import Setting
@@ -394,6 +555,7 @@ def run_watch_poll(client, *, now=None, sleep=time.sleep, log=None):
         "backoff_until": None,
         "errors": [],
         "rate_limit": None,
+        "welcomed": 0,
     }
 
     def _note_error(step, exc):
@@ -424,6 +586,14 @@ def run_watch_poll(client, *, now=None, sleep=time.sleep, log=None):
         except MastodonAPIError as exc:
             aborted = _note_error("discover_new_accounts", exc)
 
+    if not aborted and bot_client is not None and result.get("new_accounts"):
+        welcome_settings = get_welcome_settings()
+        if welcome_settings["enabled"]:
+            try:
+                _send_welcomes(bot_client, result["new_accounts"], now, result)
+            except MastodonAPIError as exc:
+                aborted = _note_error("send_welcomes", exc)
+
     if not aborted:
         try:
             _scan_silent_logins(client, now, result, settings)
@@ -452,6 +622,7 @@ def run_watch_poll(client, *, now=None, sleep=time.sleep, log=None):
         "backoff_until": result["backoff_until"],
         "errors": result["errors"],
         "rate_limit": result["rate_limit"],
+        "welcomed": result.get("welcomed", 0),
     }
     Setting.set("moderation_watch_last_run_at", now.isoformat())
     Setting.set("moderation_watch_last_run_result", json.dumps(persisted))

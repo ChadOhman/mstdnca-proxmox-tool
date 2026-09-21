@@ -567,6 +567,9 @@ class TestMastodonRouteAuth:
         ("post", "/moderation/mastodon/watch/poll"),
         ("get", "/moderation/mastodon/summary"),
         ("post", "/moderation/mastodon/watch/save"),
+        ("post", "/moderation/mastodon/accounts/1/welcome"),
+        ("post", "/moderation/mastodon/welcome/save"),
+        ("post", "/moderation/mastodon/welcome/test"),
     ])
     def test_requires_login(self, client, method, path):
         resp = getattr(client, method)(path, follow_redirects=False)
