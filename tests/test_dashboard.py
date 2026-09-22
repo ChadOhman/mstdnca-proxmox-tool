@@ -93,3 +93,57 @@ class TestDashboardStatsHostUpdates:
         resp = auth_client.get("/?tag=web")
         assert resp.status_code == 200
         assert 'const CURRENT_TAG = "web";' in resp.data.decode()
+
+
+class TestAppUpdateBanner:
+    """The "new version of MCAT" banner must only appear for a strictly newer release."""
+
+    BANNER = b"A new version of MCAT is available"
+
+    @staticmethod
+    def _set_latest(app, version):
+        with app.app_context():
+            from models import Setting
+            Setting.set("latest_app_version", version)
+            db.session.commit()
+
+    @staticmethod
+    def _run(app, auth_client, monkeypatch, *, running, latest, stale):
+        monkeypatch.setitem(app.config, "APP_VERSION", running)
+        monkeypatch.setitem(app.config, "APP_VERSION_STALE", stale)
+        TestAppUpdateBanner._set_latest(app, latest)
+        try:
+            return auth_client.get("/").data
+        finally:
+            TestAppUpdateBanner._set_latest(app, "")
+
+    def test_no_banner_when_ahead_of_the_release_tag(self, app, auth_client, monkeypatch):
+        """Regression: a main checkout past v0.2.0 was told v0.2.0 was new."""
+        body = self._run(app, auth_client, monkeypatch, running="0.2.0", latest="0.2.0", stale=True)
+        assert self.BANNER not in body
+
+    def test_no_banner_when_exactly_on_the_release(self, app, auth_client, monkeypatch):
+        body = self._run(app, auth_client, monkeypatch, running="0.2.0", latest="0.2.0", stale=False)
+        assert self.BANNER not in body
+
+    def test_banner_when_a_newer_release_exists(self, app, auth_client, monkeypatch):
+        body = self._run(app, auth_client, monkeypatch, running="0.2.0", latest="0.3.0", stale=False)
+        assert self.BANNER in body
+        assert b"v0.3.0" in body
+
+    def test_banner_when_a_newer_release_exists_even_if_ahead_of_tag(self, app, auth_client, monkeypatch):
+        """Being on a branch past v0.2.0 does not hide a genuinely newer v0.3.0."""
+        body = self._run(app, auth_client, monkeypatch, running="0.2.0", latest="0.3.0", stale=True)
+        assert self.BANNER in body
+
+    def test_no_banner_when_latest_is_older(self, app, auth_client, monkeypatch):
+        body = self._run(app, auth_client, monkeypatch, running="0.3.0", latest="0.2.0", stale=False)
+        assert self.BANNER not in body
+
+    def test_no_banner_when_running_version_is_unknown(self, app, auth_client, monkeypatch):
+        body = self._run(app, auth_client, monkeypatch, running="unknown", latest="0.3.0", stale=True)
+        assert self.BANNER not in body
+
+    def test_no_banner_when_no_check_has_run(self, app, auth_client, monkeypatch):
+        body = self._run(app, auth_client, monkeypatch, running="0.2.0", latest="", stale=True)
+        assert self.BANNER not in body

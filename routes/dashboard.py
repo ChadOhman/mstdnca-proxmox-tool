@@ -1,6 +1,7 @@
 from flask import Blueprint, current_app, render_template, request, session
 from flask_login import current_user, login_required
 
+from apps.utils import _version_gt
 from core.dashboard_stats import get_dashboard_stats
 from models import ProxmoxHost, Setting, Tag
 
@@ -37,15 +38,14 @@ def index():
 
     tags = Tag.query.order_by(Tag.name).all()
 
-    # Check for app update availability (for admins)
+    # Check for app update availability (for admins).  Only a release that is
+    # strictly newer than the running VERSION counts: running ahead of the
+    # release tag (a branch checkout, APP_VERSION_STALE) is not an update.
     app_update_available = None
     if current_user.is_admin:
         latest_version = Setting.get("latest_app_version")
         current_version = current_app.config.get("APP_VERSION", "unknown")
-        is_stale = current_app.config.get("APP_VERSION_STALE", False)
-        if latest_version and latest_version != current_version:
-            app_update_available = latest_version
-        elif is_stale and latest_version:
+        if latest_version and _version_gt(latest_version, current_version):
             app_update_available = latest_version
 
     return render_template(
