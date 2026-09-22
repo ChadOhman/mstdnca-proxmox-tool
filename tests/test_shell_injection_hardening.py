@@ -14,6 +14,7 @@ point of use (so a value stored by an older release still cannot reach a shell)
 """
 
 import re
+import shlex
 from unittest.mock import patch
 
 import pytest
@@ -822,3 +823,141 @@ class TestMastodonRemoteContent:
         ])
         logs = []
         assert _remediate_ruby(fake, "mastodon", "/home/mastodon/live", logs.append) is True
+
+
+# ---------------------------------------------------------------------------
+# Mastodon account maintenance (tootctl accounts modify)
+# ---------------------------------------------------------------------------
+
+
+class TestMastodonMaintenanceCommands:
+    def _cmd(self, **overrides):
+        from core.mastodon_maintenance import build_modify_command
+        kwargs = {
+            "username": "alice",
+            "action": "disable_2fa",
+            "user": "mastodon",
+            "app_dir": "/home/mastodon/live",
+        }
+        kwargs.update(overrides)
+        return build_modify_command(**kwargs)
+
+    def test_disable_2fa_command(self):
+        assert self._cmd(action="disable_2fa") == (
+            "su - mastodon -c 'export PATH=$HOME/.rbenv/bin:$HOME/.rbenv/shims:$PATH; "
+            "cd /home/mastodon/live && RAILS_ENV=production bin/tootctl accounts modify alice "
+            "--disable-2fa'"
+        )
+
+    def test_reset_password_command(self):
+        assert self._cmd(action="reset_password") == (
+            "su - mastodon -c 'export PATH=$HOME/.rbenv/bin:$HOME/.rbenv/shims:$PATH; "
+            "cd /home/mastodon/live && RAILS_ENV=production bin/tootctl accounts modify alice "
+            "--reset-password'"
+        )
+
+    def test_confirm_email_command(self):
+        assert self._cmd(action="confirm_email") == (
+            "su - mastodon -c 'export PATH=$HOME/.rbenv/bin:$HOME/.rbenv/shims:$PATH; "
+            "cd /home/mastodon/live && RAILS_ENV=production bin/tootctl accounts modify alice "
+            "--confirm'"
+        )
+
+    def test_change_email_command_with_confirm(self):
+        email = "a@b.example"
+        cmd = self._cmd(action="change_email", email=email, confirm=True)
+        assert cmd == (
+            "su - mastodon -c 'export PATH=$HOME/.rbenv/bin:$HOME/.rbenv/shims:$PATH; "
+            f"cd /home/mastodon/live && RAILS_ENV=production bin/tootctl accounts modify alice "
+            f"--email {shlex.quote(email)} --confirm'"
+        )
+
+    def test_change_email_command_without_confirm_omits_flag(self):
+        cmd = self._cmd(action="change_email", email="a@b.example")
+        assert "--confirm" not in cmd
+        assert cmd.endswith(f"--email {shlex.quote('a@b.example')}'")
+
+    def test_unknown_action_rejected(self):
+        with pytest.raises(ValueError):
+            self._cmd(action="delete_account")
+
+    @pytest.mark.parametrize("username", ["user@x", "a;rm -rf /", "a" * 31, ""])
+    def test_hostile_username_rejected(self, username):
+        with pytest.raises(ValueError):
+            self._cmd(username=username)
+
+    @pytest.mark.parametrize("email", ["not-an-email", "a'b@example.com; id", "a b@example.com", None])
+    def test_hostile_or_missing_email_rejected(self, email):
+        with pytest.raises(ValueError):
+            self._cmd(action="change_email", email=email)
+
+    @pytest.mark.parametrize("value", HOSTILE)
+    def test_hostile_user_setting_rejected(self, value):
+        with pytest.raises(ValueError):
+            self._cmd(user=value)
+
+    @pytest.mark.parametrize("value", HOSTILE)
+    def test_hostile_app_dir_setting_rejected(self, value):
+        with pytest.raises(ValueError):
+            self._cmd(app_dir=value)
+
+    def test_email_given_for_non_change_email_action_rejected(self):
+        with pytest.raises(ValueError):
+            self._cmd(action="disable_2fa", email="a@b.example")
+
+
+class TestRunMaintenanceFailsClosed:
+    """run_maintenance() must reject hostile input before any guest/credential/SSH lookup."""
+
+    def _settings(self, **overrides):
+        from models import Setting
+        values = {
+            "mastodon_guest_id": "1",
+            "mastodon_user": "mastodon",
+            "mastodon_app_dir": "/home/mastodon/live",
+        }
+        values.update(overrides)
+        for key, value in values.items():
+            Setting.set(key, value)
+
+    @pytest.mark.parametrize("username", ["user@x", "a;rm -rf /", "a" * 31, ""])
+    def test_hostile_username_never_opens_ssh(self, app, username):
+        from core.mastodon_maintenance import run_maintenance
+        with app.app_context():
+            self._settings()
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_maintenance("disable_2fa", username)
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()
+
+    @pytest.mark.parametrize("email", ["not-an-email", "a'b@example.com; id", "a b@example.com"])
+    def test_hostile_email_never_opens_ssh(self, app, email):
+        from core.mastodon_maintenance import run_maintenance
+        with app.app_context():
+            self._settings()
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_maintenance("change_email", "alice", email=email)
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()
+
+    @pytest.mark.parametrize("field,value", [
+        ("mastodon_user", "a;id"),
+        ("mastodon_app_dir", "/tmp'; id; #"),
+    ])
+    def test_hostile_settings_never_opens_ssh(self, app, field, value):
+        from core.mastodon_maintenance import run_maintenance
+        with app.app_context():
+            self._settings(**{field: value})
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_maintenance("disable_2fa", "alice")
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()
+
+    def test_unknown_action_never_opens_ssh(self, app):
+        from core.mastodon_maintenance import run_maintenance
+        with app.app_context():
+            self._settings()
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_maintenance("delete_account", "alice")
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()

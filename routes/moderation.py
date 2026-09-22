@@ -21,6 +21,14 @@ from core.mastodon_admin import (
     MastodonAPIError,
     validate_domain,
 )
+from core.mastodon_maintenance import (
+    INVALID_INPUT_MESSAGE,
+    MAINTENANCE_ACTIONS,
+    MaintenanceBusy,
+    build_modify_command,
+    maintenance_slot,
+    run_maintenance,
+)
 from core.moderation_log import KIND_FILTERS, MODERATION_ACTION_PREFIXES, moderation_log_filter
 from models import AuditLog, ModerationAlert, ModerationWatch, Setting, User, db
 
@@ -164,6 +172,8 @@ def _page_context():
         "status_limit": get_status_limit(),
         "token_account": _get_token_account(),
         "can_moderate_staff": current_user.can_moderate_staff,
+        "can_maintain_accounts": current_user.can_maintain_mastodon_accounts,
+        "maintenance_available": bool(Setting.get("mastodon_guest_id", "")),
     }
 
 
@@ -958,6 +968,87 @@ def mastodon_account_delete(account_id):
         audit=("mastodon_account_delete", "mastodon_account", acct,
                {"account_id": str(account_id), "domain": target.get("domain")}),
     )
+
+
+@bp.route("/mastodon/accounts/<int:account_id>/maintenance", methods=["POST"])
+def mastodon_account_maintenance(account_id):
+    if not current_user.can_maintain_mastodon_accounts:
+        log_action("mastodon_maintenance_refused", "mastodon_account",
+                   resource_name=str(account_id),
+                   details={"account_id": str(account_id), "action": _form_text("action"), "reason": "permission"})
+        db.session.commit()
+        return jsonify({"ok": False, "error": "Your role may not run account maintenance"}), 403
+
+    action = request.form.get("action", "")
+    if action not in MAINTENANCE_ACTIONS:
+        return jsonify({"ok": False, "error": "Unknown maintenance action"}), 400
+    acct = _form_text("acct")
+    email = _form_text("email") or None
+    confirm = _form_flag("confirm")
+
+    client, err = _get_mastodon_client()
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    try:
+        target = client.get_admin_account(account_id)
+    except MastodonAPIError as exc:
+        return jsonify({"ok": False, "error": exc.message}), 502
+
+    if target.get("domain"):
+        return jsonify({"ok": False, "error": "Maintenance actions apply to local accounts only"}), 400
+
+    if target.get("is_staff") and not current_user.can_moderate_staff:
+        log_action("mastodon_account_action_refused", "mastodon_account",
+                   resource_name=acct or target.get("acct") or str(account_id),
+                   details={"account_id": str(account_id), "type": f"maintenance:{action}",
+                            "target_role": target.get("role_name", "")})
+        db.session.commit()
+        return jsonify({"ok": False, "error": STAFF_TARGET_ERROR}), 403
+
+    username = target.get("username")
+
+    # Pre-validate with the same settings run_maintenance() will use, so a bad
+    # input (e.g. an invalid email) maps to 400 before the maintenance lock or
+    # any SSH attempt -- run_maintenance() itself swallows this same ValueError
+    # into an ok=False result, which is the wrong status code for a client error.
+    user_setting = Setting.get("mastodon_user", "mastodon")
+    app_dir_setting = Setting.get("mastodon_app_dir", "/home/mastodon/live")
+    try:
+        build_modify_command(
+            username, action, email=email, confirm=confirm, user=user_setting, app_dir=app_dir_setting
+        )
+    except ValueError as exc:
+        # Our own validator text, but keep exception strings out of JSON
+        # (CodeQL py/stack-trace-exposure); the detail goes to the log.
+        logger.warning("Maintenance input rejected for %s on account %s: %s", action, account_id, exc)
+        return jsonify({"ok": False, "error": INVALID_INPUT_MESSAGE}), 400
+
+    try:
+        with maintenance_slot():
+            result = run_maintenance(action, username, email=email, confirm=confirm)
+    except MaintenanceBusy:
+        return jsonify({"ok": False, "error": "Another maintenance action is running"}), 409
+
+    log_action(
+        f"mastodon_maintenance_{action}",
+        "mastodon_account",
+        resource_name=acct or username,
+        details={
+            "account_id": str(account_id),
+            "ok": result["ok"],
+            "email_changed": action == "change_email" and result["ok"],
+        },
+    )
+    db.session.commit()
+
+    if not result["ok"]:
+        return jsonify({"ok": False, "error": result["message"]}), 502
+
+    return jsonify({
+        "ok": True,
+        "message": result["message"],
+        "password": result["password"] if action == "reset_password" else None,
+    })
 
 
 @bp.route("/mastodon/accounts/<int:account_id>/<lift>", methods=["POST"])
