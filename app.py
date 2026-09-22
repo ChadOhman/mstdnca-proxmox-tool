@@ -90,6 +90,7 @@ def create_app(test_config=None):
         _migrate_user_security_columns()
         _migrate_guest_view_permission()
         _migrate_moderate_staff_permission()
+        _migrate_maintain_accounts_permission()
         _ensure_guest_vmid_unique_index()
         _seed_roles()
         _migrate_moderator_role()
@@ -497,6 +498,31 @@ def _migrate_moderate_staff_permission():
     except Exception:
         db.session.rollback()
         logger.warning("Failed to backfill roles.can_moderate_staff", exc_info=True)
+
+
+def _migrate_maintain_accounts_permission():
+    """Add the can_maintain_mastodon_accounts permission column to pre-existing roles.
+
+    Runs only on the upgrade that adds the column (``_add_column_if_missing``
+    returns True exactly once, on the ALTER TABLE that creates it), so it is a
+    one-time backfill: a later boot never re-runs the UPDATE and stomp an
+    admin's deliberate removal of the permission from a role.  Backfilled to
+    True for roles at ``level >= 3`` (the admin tier and above), which covers
+    both the builtin admin/super_admin roles and any custom admin-tier roles
+    a deployment may have created before this permission existed -- those
+    roles could already act on any account, so 2FA/password/email maintenance
+    stays included.
+    """
+    added = _add_column_if_missing("roles", "can_maintain_mastodon_accounts", "BOOLEAN DEFAULT 0")
+    if not added:
+        return
+    try:
+        db.session.execute(db.text("UPDATE roles SET can_maintain_mastodon_accounts = 1 WHERE level >= 3"))
+        db.session.commit()
+        logger.info("Backfilled can_maintain_mastodon_accounts permission onto existing admin-tier roles")
+    except Exception:
+        db.session.rollback()
+        logger.warning("Failed to backfill roles.can_maintain_mastodon_accounts", exc_info=True)
 
 
 def _ensure_guest_vmid_unique_index():

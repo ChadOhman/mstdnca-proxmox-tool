@@ -185,6 +185,8 @@
          data-welcome-configured="{{ 'true' if welcome_settings is defined and welcome_settings.bot_configured else 'false' }}"
          data-can-moderate-staff="{{ 'true' if can_moderate_staff else 'false' }}"
          data-can-configure="{{ 'true' if can_configure else 'false' }}"
+         data-can-maintain-accounts="{{ 'true' if can_maintain_accounts is defined and can_maintain_accounts else 'false' }}"
+         data-maintenance-available="{{ 'true' if maintenance_available is defined and maintenance_available else 'false' }}"
          data-instance-url="{{ settings.mastodon_api_url }}"
          data-max-status-chars="{{ status_limit if status_limit is defined else 500 }}">
         <div class="row g-4">
@@ -748,6 +750,46 @@
     </div>
 </div>
 
+<!-- Mastodon account maintenance modal -->
+<div class="modal fade" id="mastoMaintenanceModal" tabindex="-1" aria-modal="true" role="dialog" aria-labelledby="masto-maint-title">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border-secondary">
+            <form id="masto-maint-form">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title" id="masto-maint-title">Account Maintenance</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Cancel"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-2">Account: <code id="masto-maint-acct"></code></p>
+                    <input type="hidden" id="masto-maint-account-id">
+                    <input type="hidden" id="masto-maint-action">
+                    <div id="masto-maint-note" class="form-text mb-3"></div>
+                    <div id="masto-maint-email-wrap" style="display:none">
+                        <div class="mb-2">
+                            <label class="form-label" for="masto-maint-email">New email address</label>
+                            <input type="email" id="masto-maint-email" class="form-control" maxlength="254">
+                        </div>
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="masto-maint-confirm">
+                            <label class="form-check-label" for="masto-maint-confirm">Mark the new address as confirmed</label>
+                        </div>
+                    </div>
+                    <div id="masto-maint-busy" class="text-muted small mb-2" style="display:none">
+                        <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>
+                        Running tootctl on the Mastodon guest (10–30 s)…
+                    </div>
+                    <div id="masto-maint-result" class="mb-2" style="display:none"></div>
+                    <div id="masto-maint-error" class="text-danger small" aria-live="polite"></div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-warning" id="masto-maint-submit">Run</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 {% endblock %}
 
 {% block scripts %}
@@ -797,12 +839,34 @@
     const configured = pane.dataset.configured === 'true';
     const welcomeConfigured = pane.dataset.welcomeConfigured === 'true';
     const canModerateStaff = pane.dataset.canModerateStaff === 'true';
+    const canMaintain = pane.dataset.canMaintainAccounts === 'true';
+    const maintenanceAvailable = pane.dataset.maintenanceAvailable === 'true';
     const instanceUrl = (pane.dataset.instanceUrl || '').replace(/\/+$/, '');
     const maxStatusChars = parseInt(pane.dataset.maxStatusChars, 10) || 500;
     const STAFF_LOCK_MSG = 'This account holds a Mastodon staff role; your role may not act on it';
     function staffLock(a) {
         return (a && a.is_staff && !canModerateStaff) ? ' disabled title="' + escHtml(STAFF_LOCK_MSG) + '"' : '';
     }
+    const MAINT_ROLE_MSG = 'Your role may not run account maintenance';
+    const MAINT_UNAVAILABLE_MSG = 'Configure the Mastodon app guest under Applications → Mastodon first';
+    function maintLock(a) {
+        if (a && a.is_staff && !canModerateStaff) return staffLock(a);
+        if (!canMaintain) return ' disabled title="' + escHtml(MAINT_ROLE_MSG) + '"';
+        if (!maintenanceAvailable) return ' disabled title="' + escHtml(MAINT_UNAVAILABLE_MSG) + '"';
+        return '';
+    }
+    const MAINT_LABELS = {
+        disable_2fa: 'Disable 2FA',
+        reset_password: 'Reset password',
+        confirm_email: 'Confirm email',
+        change_email: 'Change email',
+    };
+    const MAINT_NOTES = {
+        disable_2fa: 'Clears the authenticator app, backup codes and security keys. The user can then sign in with their password alone.',
+        reset_password: 'A random password is generated and shown once. Existing sessions stay signed in — tell the user to change it immediately.',
+        confirm_email: 'Marks the current email address as confirmed without sending a confirmation email.',
+        change_email: "Sets a new address. Without 'mark as confirmed' Mastodon emails a confirmation link to it.",
+    };
     const loaded = { reports: false, pending: false, domains: false, watches: false, alerts: false, new_accounts: false };
 
     // ── helpers ───────────────────────────────────────────────────────────
@@ -1254,7 +1318,21 @@
               + '<i class="bi bi-chat-heart"></i> Send welcome</button>';
         if (a.suspended && canConfigure) html += '<button type="button" class="btn btn-sm btn-outline-danger" data-act="delete">'
               + '<i class="bi bi-trash"></i> Delete account…</button>';
-        html += '</div><div class="mt-2" id="masto-account-error"></div>';
+        html += '</div>';
+
+        if (!a.domain) {
+            const maintAttr = maintLock(a);
+            html += '<div class="d-flex flex-wrap gap-2 mt-2">';
+            html += '<button type="button" class="btn btn-sm btn-outline-warning" data-maint="disable_2fa"' + maintAttr + '>Disable 2FA</button>';
+            html += '<button type="button" class="btn btn-sm btn-outline-warning" data-maint="reset_password"' + maintAttr + '>Reset password</button>';
+            if (!a.confirmed) {
+                html += '<button type="button" class="btn btn-sm btn-outline-warning" data-maint="confirm_email"' + maintAttr + '>Confirm email</button>';
+            }
+            html += '<button type="button" class="btn btn-sm btn-outline-warning" data-maint="change_email"' + maintAttr + '>Change email…</button>';
+            html += '</div>';
+        }
+
+        html += '<div class="mt-2" id="masto-account-error"></div>';
 
         acctPanel.innerHTML = html;
         acctPanel.classList.remove('text-muted');
@@ -1269,6 +1347,10 @@
                     .then(d => { if (d.account) renderAccount(d.account); })
                     .catch(err => { document.getElementById('masto-account-error').innerHTML = errorBox(err.message); });
             });
+        }));
+        acctPanel.querySelectorAll('[data-maint]').forEach(btn => btn.addEventListener('click', () => {
+            if (btn.disabled) return;
+            openMaintenanceModal(a, btn.dataset.maint);
         }));
 
         loadContext(a);
@@ -1739,6 +1821,82 @@
                     + '<i class="bi bi-check-circle"></i> Account @' + escHtml(acct) + ' deleted.</span></div>';
             })
             .catch(err => { errEl.textContent = err.message; deleteSubmitBtn.disabled = false; });
+    });
+
+    // ── account maintenance modal ───────────────────────────────────────────
+    const maintenanceModalEl = document.getElementById('mastoMaintenanceModal');
+    const maintenanceModal = bootstrap.Modal.getOrCreateInstance(maintenanceModalEl);
+
+    function openMaintenanceModal(a, action) {
+        document.getElementById('masto-maint-title').textContent = MAINT_LABELS[action] || 'Account Maintenance';
+        document.getElementById('masto-maint-acct').textContent = a.acct || a.id;
+        document.getElementById('masto-maint-account-id').value = a.id;
+        document.getElementById('masto-maint-action').value = action;
+        document.getElementById('masto-maint-note').textContent = MAINT_NOTES[action] || '';
+        document.getElementById('masto-maint-email-wrap').style.display = action === 'change_email' ? '' : 'none';
+        document.getElementById('masto-maint-email').value = '';
+        document.getElementById('masto-maint-confirm').checked = false;
+        document.getElementById('masto-maint-error').textContent = '';
+        document.getElementById('masto-maint-busy').style.display = 'none';
+        const resultEl = document.getElementById('masto-maint-result');
+        resultEl.innerHTML = '';
+        resultEl.style.display = 'none';
+        document.getElementById('masto-maint-submit').disabled = false;
+        maintenanceModalEl.dataset.acct = a.acct || '';
+        maintenanceModal.show();
+    }
+
+    document.getElementById('masto-maint-form').addEventListener('submit', e => {
+        e.preventDefault();
+        const errEl = document.getElementById('masto-maint-error');
+        const resultEl = document.getElementById('masto-maint-result');
+        const busyEl = document.getElementById('masto-maint-busy');
+        const submitBtn = document.getElementById('masto-maint-submit');
+        const id = document.getElementById('masto-maint-account-id').value;
+        const action = document.getElementById('masto-maint-action').value;
+        const acct = maintenanceModalEl.dataset.acct || '';
+        const email = document.getElementById('masto-maint-email').value;
+        const confirmNew = document.getElementById('masto-maint-confirm').checked;
+        errEl.textContent = '';
+        resultEl.innerHTML = '';
+        resultEl.style.display = 'none';
+        submitBtn.disabled = true;
+        busyEl.style.display = '';
+        api('/moderation/mastodon/accounts/' + encodeURIComponent(id) + '/maintenance', formData({
+            action: action,
+            acct: acct,
+            email: action === 'change_email' ? email : undefined,
+            confirm: confirmNew ? '1' : '0',
+        }))
+            .then(d => {
+                busyEl.style.display = 'none';
+                let html = escHtml(d.message || 'Done.');
+                if (d.password) {
+                    html += '<div class="alert alert-warning mt-2">New password (shown once): '
+                        + '<code id="masto-maint-password">' + escHtml(d.password) + '</code> '
+                        + '<button type="button" class="btn btn-sm btn-outline-secondary ms-2" id="masto-maint-copy">Copy</button></div>';
+                }
+                resultEl.innerHTML = html;
+                resultEl.style.display = '';
+                const copyBtn = document.getElementById('masto-maint-copy');
+                if (copyBtn) copyBtn.addEventListener('click', () => {
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(d.password).catch(() => {});
+                    }
+                });
+                if (acct) lookupAccount(acct);
+            })
+            .catch(err => {
+                busyEl.style.display = 'none';
+                errEl.innerHTML = errorBox(err.message);
+            })
+            .finally(() => { submitBtn.disabled = false; });
+    });
+
+    maintenanceModalEl.addEventListener('hidden.bs.modal', () => {
+        const resultEl = document.getElementById('masto-maint-result');
+        resultEl.innerHTML = '';
+        resultEl.style.display = 'none';
     });
 
     // ── watched accounts ──────────────────────────────────────────────────

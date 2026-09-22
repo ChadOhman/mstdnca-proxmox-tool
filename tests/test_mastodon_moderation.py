@@ -857,6 +857,7 @@ class TestMastodonRouteAuth:
         ("get", "/moderation/mastodon/reports/1/notify/preview?reporter_acct=x"),
         ("post", "/moderation/mastodon/reports/1/notify"),
         ("post", "/moderation/mastodon/report_notice/save"),
+        ("post", "/moderation/mastodon/accounts/1/maintenance"),
     ])
     def test_requires_login(self, client, method, path):
         resp = getattr(client, method)(path, follow_redirects=False)
@@ -984,6 +985,33 @@ class TestMastodonSettings:
         html = auth_client.get("/moderation/").data.decode()
         assert 'class="tab-pane fade show active" id="peertube-pane"' in html
         assert 'class="tab-pane fade" id="mastodon-pane"' in html
+
+    def test_index_can_maintain_accounts_for_admin(self, auth_client):
+        html = auth_client.get("/moderation/?tab=mastodon").data.decode()
+        assert 'data-can-maintain-accounts="true"' in html
+
+    def test_index_can_maintain_accounts_false_for_moderator(self, moderator_client):
+        html = moderator_client.get("/moderation/?tab=mastodon").data.decode()
+        assert 'data-can-maintain-accounts="false"' in html
+
+    def test_index_maintenance_available_reflects_setting(self, app, auth_client):
+        from models import Setting, db
+
+        with app.app_context():
+            Setting.set("mastodon_guest_id", "")
+            db.session.commit()
+        html = auth_client.get("/moderation/?tab=mastodon").data.decode()
+        assert 'data-maintenance-available="false"' in html
+
+        with app.app_context():
+            Setting.set("mastodon_guest_id", "3")
+            db.session.commit()
+        html = auth_client.get("/moderation/?tab=mastodon").data.decode()
+        assert 'data-maintenance-available="true"' in html
+
+        with app.app_context():
+            Setting.set("mastodon_guest_id", "")
+            db.session.commit()
 
     def test_real_client_factory_decrypts_token(self, app, auth_client):
         from auth.credential_store import encrypt
