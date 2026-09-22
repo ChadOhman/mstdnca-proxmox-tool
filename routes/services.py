@@ -651,14 +651,43 @@ _PG_EXPLAIN_MAX_LEN = 20_000
 _PG_READ_ONLY_START_RE = re.compile(r"^(?:\(\s*)*(SELECT|WITH|VALUES|TABLE)\b", re.IGNORECASE)
 _PG_PLAN_ONLY_WRITE_START_RE = re.compile(r"^(?:\(\s*)*(UPDATE|DELETE|INSERT)\b", re.IGNORECASE)
 
+# Every way _prepare_explain_sql can reject a query, keyed by a short reason
+# code. The routes answer with the constant looked up here rather than with
+# the exception's text, so no exception object ever flows into a response
+# (CodeQL py/stack-trace-exposure).
+_EXPLAIN_REJECT_MESSAGES = {
+    "empty": "query is required",
+    "too_long": f"query is too long (max {_PG_EXPLAIN_MAX_LEN} characters)",
+    "multi_statement": "Only a single SQL statement is allowed (no ';').",
+    "comment": "SQL comments are not allowed in the query.",
+    "meta_command": "psql meta-commands are not allowed in the query.",
+    "bad_start_analyze": "Query must start with SELECT, WITH, VALUES, or TABLE.",
+    "bad_start_plain": "Query must start with SELECT, WITH, VALUES, TABLE, UPDATE, DELETE, or INSERT.",
+}
+
+
+class ExplainSqlRejected(ValueError):
+    """Raised by _prepare_explain_sql; `reason` is a key of _EXPLAIN_REJECT_MESSAGES."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(_EXPLAIN_REJECT_MESSAGES[reason])
+
+
+def _explain_rejection_response(exc: ExplainSqlRejected):
+    """400 JSON reply for a rejected query, built from the constant table only."""
+    message = _EXPLAIN_REJECT_MESSAGES.get(exc.reason, "Query rejected.")
+    return jsonify({"ok": False, "message": message}), 400
+
 
 def _prepare_explain_sql(query: str, analyze: bool) -> str:
     """Validate and normalize a user-supplied statement for EXPLAIN [ANALYZE].
 
-    Raises ValueError (message is safe to show the caller) if `query` is not
-    a single, safely-shaped SQL statement. On success, returns the statement
-    with at most one trailing `;` stripped; the caller embeds it in the
-    read-only transaction body that is actually executed.
+    Raises ExplainSqlRejected (a ValueError whose `reason` keys
+    _EXPLAIN_REJECT_MESSAGES) if `query` is not a single, safely-shaped SQL
+    statement. On success, returns the statement with at most one trailing
+    `;` stripped; the caller embeds it in the read-only transaction body that
+    is actually executed.
 
     - length capped at `_PG_EXPLAIN_MAX_LEN` characters;
     - at most one trailing `;` is stripped; any other `;` means multiple
@@ -676,29 +705,28 @@ def _prepare_explain_sql(query: str, analyze: bool) -> str:
     """
     q = (query or "").strip()
     if not q:
-        raise ValueError("query is required")
+        raise ExplainSqlRejected("empty")
     if len(q) > _PG_EXPLAIN_MAX_LEN:
-        raise ValueError(f"query is too long (max {_PG_EXPLAIN_MAX_LEN} characters)")
+        raise ExplainSqlRejected("too_long")
 
     stripped = q.rstrip()
     if stripped.endswith(";"):
         stripped = stripped[:-1].rstrip()
     if not stripped:
-        raise ValueError("query is required")
+        raise ExplainSqlRejected("empty")
     if ";" in stripped:
-        raise ValueError("Only a single SQL statement is allowed (no ';').")
+        raise ExplainSqlRejected("multi_statement")
     if "--" in stripped or "/*" in stripped or "*/" in stripped:
-        raise ValueError("SQL comments are not allowed in the query.")
+        raise ExplainSqlRejected("comment")
     if "\\" in stripped:
-        raise ValueError("psql meta-commands are not allowed in the query.")
+        raise ExplainSqlRejected("meta_command")
 
     if _PG_READ_ONLY_START_RE.match(stripped):
         return stripped
     if not analyze and _PG_PLAN_ONLY_WRITE_START_RE.match(stripped):
         return stripped
 
-    allowed = "SELECT, WITH, VALUES, or TABLE" if analyze else "SELECT, WITH, VALUES, TABLE, UPDATE, DELETE, or INSERT"
-    raise ValueError(f"Query must start with {allowed}.")
+    raise ExplainSqlRejected("bad_start_analyze" if analyze else "bad_start_plain")
 
 
 def _explain_transaction_sql(explain_clause: str, statement: str) -> str:
@@ -734,8 +762,8 @@ def pg_explain(service_id):
         return jsonify({"ok": False, "message": "Invalid database name."}), 400
     try:
         statement = _prepare_explain_sql(query, analyze=False)
-    except ValueError as exc:
-        return jsonify({"ok": False, "message": str(exc)}), 400
+    except ExplainSqlRejected as exc:
+        return _explain_rejection_response(exc)
     import uuid
 
     from core.scanner import _execute_command
@@ -856,8 +884,8 @@ def pg_analyze_plan(service_id):
         return jsonify({"ok": False, "message": "Invalid database name."}), 400
     try:
         statement = _prepare_explain_sql(query, analyze=True)
-    except ValueError as exc:
-        return jsonify({"ok": False, "message": str(exc)}), 400
+    except ExplainSqlRejected as exc:
+        return _explain_rejection_response(exc)
 
     import uuid
 

@@ -364,3 +364,36 @@ class TestPgHardeningIsWired:
             assert "_prepare_explain_sql(" in src, view.__name__
             assert "_explain_transaction_sql(" in src, view.__name__
             assert "ON_ERROR_STOP=1" in src, view.__name__
+
+
+class TestExplainRejectionMessagesAreConstants:
+    """The 400 body for a rejected query comes from _EXPLAIN_REJECT_MESSAGES,
+    never from exception text (CodeQL py/stack-trace-exposure on the routes)."""
+
+    def test_helper_raises_reason_coded_exception(self):
+        from routes.services import _EXPLAIN_REJECT_MESSAGES, ExplainSqlRejected
+
+        with pytest.raises(ExplainSqlRejected) as info:
+            _prepare_explain_sql("SELECT 1; DROP TABLE x", analyze=False)
+        assert info.value.reason == "multi_statement"
+        assert str(info.value) == _EXPLAIN_REJECT_MESSAGES["multi_statement"]
+
+    @patch("core.scanner._execute_command")
+    def test_route_message_is_table_constant(self, mock_exec, auth_client, pg_service):
+        from routes.services import _EXPLAIN_REJECT_MESSAGES
+
+        svc_id, _ = pg_service
+        for path, query, reason in (
+            ("pg/explain", "SELECT 1; DROP TABLE x", "multi_statement"),
+            ("pg/explain", "SELECT 1 -- hidden", "comment"),
+            ("pg/analyze-plan", "DELETE FROM users", "bad_start_analyze"),
+            ("pg/analyze-plan", r"\! id", "meta_command"),
+        ):
+            resp = auth_client.post(
+                f"/services/{svc_id}/{path}",
+                data=json.dumps({"database": "mydb", "query": query}),
+                content_type="application/json",
+            )
+            assert resp.status_code == 400, (path, query)
+            assert resp.get_json()["message"] == _EXPLAIN_REJECT_MESSAGES[reason]
+        mock_exec.assert_not_called()
