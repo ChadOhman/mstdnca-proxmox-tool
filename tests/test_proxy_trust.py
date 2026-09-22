@@ -258,6 +258,59 @@ class TestProxiedDeployment:
 
 
 # ---------------------------------------------------------------------------
+# Cloudflare traffic never qualifies for the LAN bypass, whatever the trust setting
+# ---------------------------------------------------------------------------
+
+_CLOUDFLARE_VISITOR = {
+    "X-Forwarded-For": "198.51.100.60",
+    "CF-Connecting-IP": "198.51.100.60",
+    "Cf-Ray": "8a1b2c3d4e5f6789-YYZ",
+}
+
+
+class TestCloudflareVisitorsAreNotLocal:
+    def test_direct_deployment_cloudflared_on_lan_does_not_bypass(self, direct_app):
+        """The reported bug: TRUSTED_PROXY_COUNT=0, cloudflared peer inside 10/8."""
+        with direct_app.test_client() as c:
+            resp = c.get(
+                "/",
+                environ_base={"REMOTE_ADDR": "10.0.4.20"},
+                headers=_CLOUDFLARE_VISITOR,
+                follow_redirects=False,
+            )
+        assert resp.status_code == 302
+        assert "/login" in resp.headers["Location"]
+
+    def test_proxied_deployment_cloudflared_on_lan_does_not_bypass(self, proxied_app):
+        with proxied_app.test_client() as c:
+            resp = c.get(
+                "/",
+                environ_base={"REMOTE_ADDR": "10.0.4.20"},
+                headers=_CLOUDFLARE_VISITOR,
+                follow_redirects=False,
+            )
+        assert resp.status_code == 302
+        assert "/login" in resp.headers["Location"]
+
+    def test_proxied_deployment_lan_visitor_via_cloudflare_does_not_bypass(self, proxied_app):
+        """Even a visitor whose CF-Connecting-IP is inside the subnet came from outside."""
+        with proxied_app.test_client() as c:
+            resp = c.get(
+                "/",
+                environ_base={"REMOTE_ADDR": "10.0.4.20"},
+                headers={"X-Forwarded-For": "10.0.0.99", "CF-Connecting-IP": "10.0.0.99"},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 302
+        assert "/login" in resp.headers["Location"]
+
+    def test_direct_lan_request_without_cloudflare_markers_still_bypasses(self, direct_app):
+        with direct_app.test_client() as c:
+            resp = c.get("/", environ_base={"REMOTE_ADDR": "10.0.4.21"}, follow_redirects=False)
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # Rate-limit dictionaries must not grow without bound
 # ---------------------------------------------------------------------------
 

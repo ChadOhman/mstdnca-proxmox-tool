@@ -279,6 +279,8 @@ Under **Settings > Local Network Access**, requests from a trusted subnet are au
 
 No subnets are trusted until you enter them — the field starts empty, and `0.0.0.0/0` / `::/0` are rejected. These sessions are recorded like any other login (visible and revocable under **Profile > Sessions** and **Security > Sessions**, audited as `login_local_bypass`) and are re-checked on every request, so disabling the bypass or narrowing the subnet list ends them immediately. Because the match is on the connection's source address, this feature only behaves correctly behind a proxy when `TRUSTED_PROXY_COUNT` is set (see [Deployment](#deployment-reverse-proxies-and-client-ips)).
 
+Requests that arrive through Cloudflare are never eligible for the bypass, regardless of `TRUSTED_PROXY_COUNT`. The presence of `CF-Connecting-IP`, `Cf-Ray`, `Cf-Access-Jwt-Assertion` or the `CF_Authorization` cookie marks a request as external, so a `cloudflared` running on a trusted subnet cannot turn every Cloudflare visitor into an admin session — those visitors fall through to Cloudflare Access or the login page. Forging these markers can only deny a client the bypass, never grant it. If you see the log message "Cloudflare traffic is arriving from a trusted-subnet peer", set `TRUSTED_PROXY_COUNT=1` so audit and rate-limit entries record the real client IP.
+
 ## Updating
 
 ### From the Web UI

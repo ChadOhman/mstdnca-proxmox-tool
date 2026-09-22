@@ -399,3 +399,164 @@ class TestBypassSessionTracking:
 
         with app.app_context():
             assert db.session.get(UserSession, record_id).revoked is True
+
+
+# ---------------------------------------------------------------------------
+# Traffic that came through Cloudflare is never "local"
+# ---------------------------------------------------------------------------
+
+class TestCloudflareTrafficNeverBypasses:
+    """Regression: with cloudflared on the LAN and TRUSTED_PROXY_COUNT=0, every
+    Cloudflare visitor used to arrive from cloudflared's trusted-subnet address
+    and be auto-logged-in as admin.  Cloudflare's own request markers must veto
+    the bypass no matter what the TCP peer looks like.
+    """
+
+    @staticmethod
+    def _enable(app, subnets="10.0.0.0/8"):
+        with app.app_context():
+            Setting.set("local_bypass_enabled", "true")
+            Setting.set("trusted_subnets", subnets)
+            db.session.commit()
+
+    @staticmethod
+    def _disable(app):
+        with app.app_context():
+            Setting.set("local_bypass_enabled", "false")
+            db.session.commit()
+
+    @staticmethod
+    def _assert_login_redirect(resp):
+        assert resp.status_code == 302
+        assert "/login" in resp.headers["Location"]
+
+    def test_cf_connecting_ip_from_trusted_peer_is_not_bypassed(self, app):
+        """The exact production shape: cloudflared at 10.0.4.x forwarding a public visitor."""
+        self._enable(app)
+        try:
+            with app.test_client() as c:
+                resp = c.get(
+                    "/",
+                    environ_base={"REMOTE_ADDR": "10.0.4.20"},
+                    headers={
+                        "CF-Connecting-IP": "203.0.113.77",
+                        "X-Forwarded-For": "203.0.113.77",
+                        "Cf-Ray": "8a1b2c3d4e5f6789-YYZ",
+                    },
+                    follow_redirects=False,
+                )
+            self._assert_login_redirect(resp)
+        finally:
+            self._disable(app)
+
+    def test_cf_access_jwt_header_from_trusted_peer_is_not_bypassed(self, app):
+        self._enable(app)
+        try:
+            with app.test_client() as c:
+                resp = c.get(
+                    "/",
+                    environ_base={"REMOTE_ADDR": "10.0.4.20"},
+                    headers={"Cf-Access-Jwt-Assertion": "not-a-real-token"},
+                    follow_redirects=False,
+                )
+            self._assert_login_redirect(resp)
+        finally:
+            self._disable(app)
+
+    def test_cf_ray_alone_from_trusted_peer_is_not_bypassed(self, app):
+        self._enable(app)
+        try:
+            with app.test_client() as c:
+                resp = c.get(
+                    "/",
+                    environ_base={"REMOTE_ADDR": "10.0.4.20"},
+                    headers={"Cf-Ray": "8a1b2c3d4e5f6789-YYZ"},
+                    follow_redirects=False,
+                )
+            self._assert_login_redirect(resp)
+        finally:
+            self._disable(app)
+
+    def test_cf_authorization_cookie_from_trusted_peer_is_not_bypassed(self, app):
+        self._enable(app)
+        try:
+            with app.test_client() as c:
+                c.set_cookie("CF_Authorization", "not-a-real-token")
+                resp = c.get(
+                    "/",
+                    environ_base={"REMOTE_ADDR": "10.0.4.20"},
+                    follow_redirects=False,
+                )
+            self._assert_login_redirect(resp)
+        finally:
+            self._disable(app)
+
+    def test_no_bypass_session_or_audit_entry_is_created(self, app):
+        self._enable(app)
+        try:
+            with app.app_context():
+                sessions_before = UserSession.query.filter_by(revoked=False).count()
+                audits_before = AuditLog.query.filter_by(action="login_local_bypass").count()
+            with app.test_client() as c:
+                c.get(
+                    "/",
+                    environ_base={"REMOTE_ADDR": "10.0.4.20"},
+                    headers={"CF-Connecting-IP": "203.0.113.78"},
+                    follow_redirects=False,
+                )
+            with app.app_context():
+                assert UserSession.query.filter_by(revoked=False).count() == sessions_before
+                assert AuditLog.query.filter_by(action="login_local_bypass").count() == audits_before
+        finally:
+            self._disable(app)
+
+    def test_plain_lan_request_still_bypasses(self, app):
+        """The guard must not break the feature it protects."""
+        self._enable(app)
+        try:
+            with app.test_client() as c:
+                assert c.get("/", environ_base={"REMOTE_ADDR": "10.0.4.21"}).status_code == 200
+        finally:
+            self._disable(app)
+
+    def test_existing_bypass_session_presented_via_cloudflare_is_revoked(self, app):
+        """A bypass cookie replayed through Cloudflare loses its session."""
+        self._enable(app)
+        try:
+            with app.test_client() as c:
+                assert c.get("/", environ_base={"REMOTE_ADDR": "10.0.4.22"}).status_code == 200
+                with app.app_context():
+                    record_id = (UserSession.query
+                                 .filter_by(revoked=False)
+                                 .order_by(UserSession.id.desc())
+                                 .first().id)
+                resp = c.get(
+                    "/",
+                    environ_base={"REMOTE_ADDR": "10.0.4.22"},
+                    headers={"CF-Connecting-IP": "203.0.113.79"},
+                    follow_redirects=False,
+                )
+                self._assert_login_redirect(resp)
+            with app.app_context():
+                assert db.session.get(UserSession, record_id).revoked is True
+        finally:
+            self._disable(app)
+
+    def test_operator_is_warned_once_about_missing_proxy_trust(self, app, caplog):
+        self._enable(app)
+        app._local_bypass_cf_peer_warned = False
+        try:
+            with caplog.at_level("WARNING", logger="auth.local_network"):
+                with app.test_client() as c:
+                    for _ in range(2):
+                        c.get(
+                            "/",
+                            environ_base={"REMOTE_ADDR": "10.0.4.23"},
+                            headers={"CF-Connecting-IP": "203.0.113.80"},
+                            follow_redirects=False,
+                        )
+            hits = [r for r in caplog.records if "Cloudflare traffic is arriving" in r.getMessage()]
+            assert len(hits) == 1
+            assert "TRUSTED_PROXY_COUNT" in hits[0].getMessage()
+        finally:
+            self._disable(app)
