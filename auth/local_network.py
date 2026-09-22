@@ -90,6 +90,31 @@ def _is_proxy_peer(addr):
     return parsed.is_loopback or parsed.is_private
 
 
+# Request markers that only exist when the request travelled through Cloudflare
+# (edge headers passed on by cloudflared, plus the Access session cookie).
+_CLOUDFLARE_HEADERS = ("Cf-Access-Jwt-Assertion", "CF-Connecting-IP", "Cf-Ray")
+_CLOUDFLARE_COOKIES = ("CF_Authorization",)
+
+
+def _came_through_cloudflare():
+    """True when the request carries Cloudflare's headers or Access cookie.
+
+    The local-network bypass exists for clients that reach the app *directly*
+    from the LAN.  A request that came in through Cloudflare is by definition
+    not one of those, even when the TCP peer is the cloudflared host sitting on
+    a trusted subnet (which is exactly what happens with ``TRUSTED_PROXY_COUNT``
+    left at 0).  Honouring the bypass there would log every Cloudflare visitor
+    in as admin.
+
+    Checking these markers is safe because forging them can only *deny* a
+    client the bypass: a direct LAN client that adds a ``CF-Connecting-IP``
+    header simply gets the normal login page.
+    """
+    if any(request.headers.get(name) for name in _CLOUDFLARE_HEADERS):
+        return True
+    return any(request.cookies.get(name) for name in _CLOUDFLARE_COOKIES)
+
+
 def _is_trusted(client_ip, networks):
     """Check if client_ip falls within any trusted network."""
     try:
@@ -113,6 +138,8 @@ def _bypass_session_still_valid():
     """
     if not _bypass_enabled():
         return False
+    if _came_through_cloudflare():
+        return False
     return _is_trusted(_get_client_ip(), _get_trusted_networks())
 
 
@@ -135,6 +162,28 @@ def _warn_if_proxy_trust_missing(app):
         "TRUSTED_PROXY_COUNT to the number of proxy hops you operate (usually 1) so client "
         "IPs resolve correctly; leave it at 0 when clients connect directly.",
         "Cloudflare Access is" if cf_enabled else "local-network bypass is",
+    )
+
+
+def _warn_once_if_cloudflare_peer_looks_local(app):
+    """Log one warning when Cloudflare traffic is arriving from a trusted peer.
+
+    That combination means the proxy hop is not being unwrapped (usually
+    ``TRUSTED_PROXY_COUNT=0`` with cloudflared on the LAN).  The bypass already
+    refuses such requests; this just tells the operator why client IPs in the
+    audit log and rate limiter are wrong.
+    """
+    if app.config.get("TRUSTED_PROXY_COUNT", 0):
+        return
+    if getattr(app, "_local_bypass_cf_peer_warned", False):
+        return
+    if not _is_trusted(_get_client_ip(), _get_trusted_networks()):
+        return
+    app._local_bypass_cf_peer_warned = True
+    logger.warning(
+        "Cloudflare traffic is arriving from a trusted-subnet peer while TRUSTED_PROXY_COUNT is 0. "
+        "The local-network bypass is refusing these requests, but audit and rate-limit IPs are "
+        "the proxy's address. Set TRUSTED_PROXY_COUNT=1 if cloudflared fronts this app."
     )
 
 
@@ -165,6 +214,12 @@ def init_local_bypass(app):
 
         # Check if bypass is enabled
         if not _bypass_enabled():
+            return
+
+        # Anything that arrived via Cloudflare is external traffic, whatever the
+        # TCP peer looks like.  CF Access (or the login page) must handle it.
+        if _came_through_cloudflare():
+            _warn_once_if_cloudflare_peer_looks_local(app)
             return
 
         client_ip = _get_client_ip()
