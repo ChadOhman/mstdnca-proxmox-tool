@@ -176,7 +176,9 @@
     <div class="tab-pane fade{% if active_tab == 'mastodon' %} show active{% endif %}" id="mastodon-pane" role="tabpanel" aria-labelledby="mastodon-tab"
          data-configured="{{ 'true' if settings.mastodon_api_url and settings.mastodon_api_token else 'false' }}"
          data-welcome-configured="{{ 'true' if welcome_settings is defined and welcome_settings.bot_configured else 'false' }}"
-         data-can-moderate-staff="{{ 'true' if can_moderate_staff else 'false' }}">
+         data-can-moderate-staff="{{ 'true' if can_moderate_staff else 'false' }}"
+         data-instance-url="{{ settings.mastodon_api_url }}"
+         data-max-status-chars="{{ status_limit if status_limit is defined else 500 }}">
         <div class="row g-4">
             <!-- Configuration -->
             <div class="col-lg-5">
@@ -270,6 +272,9 @@
                 </div>
             </div>
             <div class="card-body p-0">
+                <div class="small text-muted px-3 pt-3">
+                    Post-level actions (delete, mark sensitive) are done on the Mastodon report page; open a report with its # link.
+                </div>
                 <div id="masto-reports-body" class="p-3 small text-muted">Not loaded.</div>
             </div>
         </div>
@@ -439,7 +444,8 @@
                     <div class="mb-3">
                         <label class="form-label" for="welcome_template">Message Template</label>
                         <textarea class="form-control" id="welcome_template" name="welcome_template" rows="6"
-                                  maxlength="480">{{ welcome_settings.template if welcome_settings is defined else '' }}</textarea>
+                                  maxlength="{{ (status_limit - 20) if status_limit is defined else 480 }}"
+                                  data-max-chars="{{ (status_limit - 20) if status_limit is defined else 480 }}">{{ welcome_settings.template if welcome_settings is defined else '' }}</textarea>
                         <div class="form-text d-flex justify-content-between flex-wrap gap-2">
                             <span>Variables: {username}, {display_name}, {acct}</span>
                             <span id="masto-welcome-count">0 / 480 characters (the @mention is added automatically)</span>
@@ -459,6 +465,35 @@
                     <div class="text-muted small mt-2">
                         Only accounts discovered after the first poll are welcomed; nothing is sent retroactively.
                     </div>
+                </form>
+            </div>
+        </div>
+        {% endif %}
+
+        <!-- Reporter notice -->
+        {% if can_configure %}
+        <div class="card bg-dark mt-4" id="masto-report-notice-card">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="bi bi-chat-left-dots"></i> Reporter Notice</h5>
+            </div>
+            <div class="card-body">
+                <form method="post" action="/moderation/mastodon/report_notice/save">
+                    <div class="mb-3">
+                        <label class="form-label" for="report_notice_template">Message Template</label>
+                        <textarea class="form-control" id="report_notice_template" name="report_notice_template" rows="5"
+                                  maxlength="{{ (status_limit - 20) if status_limit is defined else 480 }}"
+                                  data-max-chars="{{ (status_limit - 20) if status_limit is defined else 480 }}">{{ report_notice_settings.template if report_notice_settings is defined else '' }}</textarea>
+                        <div class="form-text">
+                            Variables: {username}, {display_name}, {acct}, {report_id}. Sent from the welcome-bot account;
+                            moderators can edit each message before sending.
+                        </div>
+                        <div class="form-text">
+                            <span id="masto-report-notice-count">0 / 480 (the @mention is added automatically)</span>
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="bi bi-check-lg"></i> Save Settings
+                    </button>
                 </form>
             </div>
         </div>
@@ -553,12 +588,21 @@
                         <input class="form-check-input" type="checkbox" id="masto-action-notify">
                         <label class="form-check-label" for="masto-action-notify">Send email notification to the user</label>
                     </div>
+                    <div id="masto-action-remote-hint" class="form-text text-warning mb-2" style="display:none">
+                        Remote account: the email notification and note are not delivered (no local user), and suspend removes
+                        only this instance's copy.
+                    </div>
                     <div class="form-check mb-2" id="masto-action-report-wrap" style="display:none">
                         <input class="form-check-input" type="checkbox" id="masto-action-link-report" checked>
                         <label class="form-check-label" for="masto-action-link-report">
                             Link to report <span id="masto-action-report-label"></span> (resolves it)
                         </label>
                     </div>
+                    <div class="form-check mb-1" id="masto-action-notify-reporter-wrap" style="display:none">
+                        <input class="form-check-input" type="checkbox" id="masto-action-notify-reporter">
+                        <label class="form-check-label" for="masto-action-notify-reporter">Notify the reporter by DM afterwards</label>
+                    </div>
+                    <div id="masto-action-notify-reporter-hint" class="form-text mb-2"></div>
                     <div id="masto-action-error" class="text-danger small" aria-live="polite"></div>
                 </div>
                 <div class="modal-footer border-secondary">
@@ -597,6 +641,45 @@
                 <div class="modal-footer border-secondary">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                     <button type="submit" class="btn btn-primary" id="masto-watch-submit">Watch</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Mastodon report notice modal -->
+<div class="modal fade" id="mastoNoticeModal" tabindex="-1" aria-modal="true" role="dialog" aria-labelledby="mastoNoticeModalLabel">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border-secondary">
+            <form id="masto-notice-form">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title" id="mastoNoticeModalLabel">Notify reporter</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Cancel"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-2">
+                        Report #<span id="masto-notice-report-id"></span> &middot;
+                        reporter <span id="masto-notice-reporter-link" class="font-monospace"></span>
+                        <span id="masto-notice-notified" class="badge bg-success" style="display:none">Already notified</span>
+                    </p>
+                    <div class="mb-2">
+                        <div class="form-label small text-muted mb-1">Mention (added automatically)</div>
+                        <code id="masto-notice-mention"></code>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label" for="masto-notice-text">Message</label>
+                        <textarea class="form-control" id="masto-notice-text" rows="5"></textarea>
+                        <div class="form-text"><span id="masto-notice-count"></span></div>
+                    </div>
+                    <div id="masto-notice-remote-hint" class="form-text text-warning mb-2" style="display:none">
+                        Remote reporter: forwarded reports are signed by the remote instance's actor, not a person — only send
+                        if this is a real account.
+                    </div>
+                    <div id="masto-notice-error" class="text-danger small" aria-live="polite"></div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="masto-notice-submit">Send DM</button>
                 </div>
             </form>
         </div>
@@ -652,6 +735,8 @@
     const configured = pane.dataset.configured === 'true';
     const welcomeConfigured = pane.dataset.welcomeConfigured === 'true';
     const canModerateStaff = pane.dataset.canModerateStaff === 'true';
+    const instanceUrl = (pane.dataset.instanceUrl || '').replace(/\/+$/, '');
+    const maxStatusChars = parseInt(pane.dataset.maxStatusChars, 10) || 500;
     const STAFF_LOCK_MSG = 'This account holds a Mastodon staff role; your role may not act on it';
     function staffLock(a) {
         return (a && a.is_staff && !canModerateStaff) ? ' disabled title="' + escHtml(STAFF_LOCK_MSG) + '"' : '';
@@ -723,6 +808,21 @@
             : '<span class="font-monospace">' + label + '</span>';
     }
 
+    // Handle cell with links out to the Mastodon web UI / admin panel, when the
+    // instance URL is known. Falls back to a plain monospace span otherwise.
+    function profileLinks(acct, accountId) {
+        if (instanceUrl && acct) {
+            let html = '<a href="' + escHtml(instanceUrl) + '/@' + escHtml(acct) + '" target="_blank" rel="noopener" class="font-monospace">'
+                + escHtml(acct) + '</a>';
+            if (accountId) {
+                html += ' <a href="' + escHtml(instanceUrl) + '/admin/accounts/' + escHtml(String(accountId)) + '" target="_blank" rel="noopener"'
+                    + ' class="text-muted" title="Open in Mastodon admin"><i class="bi bi-shield-lock"></i></a>';
+            }
+            return html;
+        }
+        return '<span class="font-monospace">' + escHtml(acct || '') + '</span>';
+    }
+
     function notConfigured(target) {
         target.innerHTML = '<span class="text-muted">Save the instance URL and admin token first.</span>';
     }
@@ -767,11 +867,25 @@
     const welcomeCountEl = document.getElementById('masto-welcome-count');
     function updateWelcomeCount() {
         if (!welcomeTemplateEl || !welcomeCountEl) return;
-        welcomeCountEl.textContent = welcomeTemplateEl.value.length + ' / 480 characters (the @mention is added automatically)';
+        const max = parseInt(welcomeTemplateEl.dataset.maxChars, 10) || maxStatusChars;
+        welcomeCountEl.textContent = welcomeTemplateEl.value.length + ' / ' + max + ' characters (the @mention is added automatically)';
     }
     if (welcomeTemplateEl) {
         welcomeTemplateEl.addEventListener('input', updateWelcomeCount);
         updateWelcomeCount();
+    }
+
+    // ── reporter notice settings ────────────────────────────────────────────
+    const reportNoticeTemplateEl = document.getElementById('report_notice_template');
+    const reportNoticeCountEl = document.getElementById('masto-report-notice-count');
+    function updateReportNoticeCount() {
+        if (!reportNoticeTemplateEl || !reportNoticeCountEl) return;
+        const max = parseInt(reportNoticeTemplateEl.dataset.maxChars, 10) || maxStatusChars;
+        reportNoticeCountEl.textContent = reportNoticeTemplateEl.value.length + ' / ' + max + ' (the @mention is added automatically)';
+    }
+    if (reportNoticeTemplateEl) {
+        reportNoticeTemplateEl.addEventListener('input', updateReportNoticeCount);
+        updateReportNoticeCount();
     }
 
     // Sends (or re-sends) the welcome mention for one account. On a 409 "already
@@ -819,6 +933,7 @@
     const actionModalEl = document.getElementById('mastoActionModal');
     const actionModal = bootstrap.Modal.getOrCreateInstance(actionModalEl);
     let afterAction = null;  // callback invoked after a successful action
+    let pendingReport = null;  // report the "notify reporter" checkbox applies to
 
     function openActionModal(account, opts) {
         opts = opts || {};
@@ -826,7 +941,6 @@
         document.getElementById('masto-action-account-id').value = account.id;
         document.getElementById('masto-action-report-id').value = opts.reportId || '';
         document.getElementById('masto-action-text').value = '';
-        document.getElementById('masto-action-notify').checked = false;
         document.getElementById('masto-action-error').textContent = '';
         document.getElementById('masto-action-type').value = opts.type || 'silence';
         const wrap = document.getElementById('masto-action-report-wrap');
@@ -834,6 +948,42 @@
         document.getElementById('masto-action-report-label').textContent = opts.reportId ? '#' + opts.reportId : '';
         document.getElementById('masto-action-link-report').checked = !!opts.reportId;
         actionModalEl.dataset.acct = account.acct || '';
+
+        const notifyEl = document.getElementById('masto-action-notify');
+        const remoteHint = document.getElementById('masto-action-remote-hint');
+        if (account.domain) {
+            notifyEl.checked = false;
+            notifyEl.disabled = true;
+            remoteHint.style.display = '';
+        } else {
+            notifyEl.checked = false;
+            notifyEl.disabled = false;
+            remoteHint.style.display = 'none';
+        }
+
+        const reporterWrap = document.getElementById('masto-action-notify-reporter-wrap');
+        const reporterCheck = document.getElementById('masto-action-notify-reporter');
+        const reporterHint = document.getElementById('masto-action-notify-reporter-hint');
+        pendingReport = null;
+        if (opts.report && welcomeConfigured) {
+            pendingReport = opts.report;
+            reporterWrap.style.display = '';
+            const local = !(((opts.report.account && opts.report.account.acct) || '').includes('@'));
+            reporterCheck.checked = local && !opts.report.reporter_notified_at;
+            if (!local) {
+                reporterHint.textContent = 'Remote reporter: forwarded reports are signed by the remote instance\'s actor, '
+                    + 'not a person — only send if this is a real account.';
+            } else if (opts.report.reporter_notified_at) {
+                reporterHint.textContent = 'The reporter was already notified for this report.';
+            } else {
+                reporterHint.textContent = '';
+            }
+        } else {
+            reporterWrap.style.display = 'none';
+            reporterCheck.checked = false;
+            reporterHint.textContent = '';
+        }
+
         afterAction = opts.after || null;
         actionModal.show();
     }
@@ -845,6 +995,7 @@
         const id = document.getElementById('masto-action-account-id').value;
         const linkReport = document.getElementById('masto-action-link-report').checked;
         const reportId = document.getElementById('masto-action-report-id').value;
+        const notifyReporter = document.getElementById('masto-action-notify-reporter').checked;
         submit.disabled = true;
         errEl.textContent = '';
         api('/moderation/mastodon/accounts/' + encodeURIComponent(id) + '/action', formData({
@@ -858,6 +1009,7 @@
                 actionModal.hide();
                 if (d.account) renderAccount(d.account);
                 if (afterAction) afterAction(d);
+                if (notifyReporter && pendingReport) openNoticeModal(pendingReport);
             })
             .catch(err => { errEl.textContent = err.message; })
             .finally(() => { submit.disabled = false; });
@@ -950,17 +1102,28 @@
                     + '</div>';
             });
             if (r.forwarded) details += '<span class="badge bg-secondary">forwarded</span> ';
+            const notifyBtn = '<button type="button" class="btn btn-sm btn-outline-info me-1" data-report-act="notify"'
+                + (welcomeConfigured ? '' : ' disabled title="Configure the welcome bot token first"') + '>Notify reporter…</button>';
             html += '<tr data-report-id="' + escHtml(String(r.id)) + '">'
-                + '<td class="font-monospace">' + escHtml(String(r.id)) + '<div class="text-muted small">' + fmtDate(r.created_at) + '</div></td>'
+                + '<td class="font-monospace">' + (instanceUrl
+                    ? '<a href="' + escHtml(instanceUrl) + '/admin/reports/' + encodeURIComponent(r.id) + '" target="_blank" rel="noopener"'
+                      + ' title="Open in Mastodon admin">#' + escHtml(String(r.id)) + '</a>'
+                    : '#' + escHtml(String(r.id)))
+                    + '<div class="text-muted small">' + fmtDate(r.created_at) + '</div></td>'
                 + '<td>' + acctLink(t) + '<div class="mt-1">' + stateBadges(t) + '</div></td>'
-                + '<td>' + acctLink(r.account || {}) + '</td>'
+                + '<td>' + acctLink(r.account || {})
+                    + (r.reporter_notified_at
+                        ? ' <span class="badge bg-success ms-1" title="' + fmtDate(r.reporter_notified_at) + '">Reporter notified</span>'
+                        : '')
+                    + '</td>'
                 + '<td>' + escHtml(r.category || '') + '</td>'
                 + '<td style="max-width:28rem">' + details + '</td>'
                 + '<td class="text-end text-nowrap">'
                 + (resolved
-                    ? '<button type="button" class="btn btn-sm btn-outline-secondary" data-report-act="reopen">Reopen</button>'
+                    ? notifyBtn + '<button type="button" class="btn btn-sm btn-outline-secondary" data-report-act="reopen">Reopen</button>'
                     : '<button type="button" class="btn btn-sm btn-outline-danger me-1" data-report-act="action"' + staffLock(t) + '>Act on account…</button>'
-                      + '<button type="button" class="btn btn-sm btn-outline-success" data-report-act="resolve">Resolve</button>')
+                      + '<button type="button" class="btn btn-sm btn-outline-success me-1" data-report-act="resolve">Resolve</button>'
+                      + notifyBtn)
                 + '</td></tr>';
         });
         html += '</tbody></table></div><div class="p-2" id="masto-reports-error"></div>';
@@ -973,18 +1136,130 @@
             const errEl = document.getElementById('masto-reports-error');
             const act = btn.dataset.reportAct;
             if (act === 'action') {
-                openActionModal(r.target_account, { reportId: rid, after: loadReports });
+                openActionModal(r.target_account, { reportId: rid, report: r, after: loadReports });
+                return;
+            }
+            if (act === 'notify') {
+                openNoticeModal(r);
                 return;
             }
             confirmDialog((act === 'resolve' ? 'Resolve' : 'Reopen') + ' report #' + rid + '?').then(ok => {
                 if (!ok) return;
                 api('/moderation/mastodon/reports/' + encodeURIComponent(rid) + '/' + act, new FormData())
-                    .then(loadReports)
+                    .then(() => {
+                        loadReports();
+                        if (act === 'resolve') maybeOpenNoticeModal(r);
+                    })
                     .catch(err => { errEl.innerHTML = errorBox(err.message); });
             });
         }));
     }
     resolvedToggle.addEventListener('change', loadReports);
+
+    // ── report notice modal ─────────────────────────────────────────────────
+    const noticeModalEl = document.getElementById('mastoNoticeModal');
+    const noticeModal = bootstrap.Modal.getOrCreateInstance(noticeModalEl);
+    const noticeTextEl = document.getElementById('masto-notice-text');
+    const noticeCountEl = document.getElementById('masto-notice-count');
+    const noticeMentionEl = document.getElementById('masto-notice-mention');
+    const noticeErrorEl = document.getElementById('masto-notice-error');
+    const noticeNotifiedEl = document.getElementById('masto-notice-notified');
+    const noticeRemoteHintEl = document.getElementById('masto-notice-remote-hint');
+
+    function updateNoticeCount() {
+        const mention = noticeMentionEl.textContent || '';
+        const text = noticeTextEl.value || '';
+        const max = parseInt(noticeModalEl.dataset.maxChars, 10) || maxStatusChars;
+        const len = mention.length + 1 + text.length;
+        noticeCountEl.textContent = len + ' / ' + max;
+        noticeCountEl.classList.toggle('text-danger', len > max);
+    }
+    noticeTextEl.addEventListener('input', updateNoticeCount);
+
+    // Opens the "notify reporter" modal for report r and loads a prefilled
+    // message from the server (mention + template rendered with the reporter's
+    // name).
+    function openNoticeModal(r) {
+        const reporter = r.account || {};
+        noticeModalEl.dataset.reportId = r.id;
+        noticeModalEl.dataset.reporterId = reporter.id || '';
+        noticeModalEl.dataset.reporterAcct = reporter.acct || '';
+        noticeModalEl.dataset.displayName = reporter.display_name || '';
+        noticeModalEl.dataset.maxChars = String(maxStatusChars);
+        document.getElementById('masto-notice-report-id').textContent = r.id;
+        document.getElementById('masto-notice-reporter-link').innerHTML = acctLink(reporter);
+        noticeTextEl.value = '';
+        noticeMentionEl.textContent = '';
+        noticeErrorEl.textContent = '';
+        noticeNotifiedEl.style.display = 'none';
+        noticeRemoteHintEl.style.display = (reporter.acct || '').includes('@') ? '' : 'none';
+        updateNoticeCount();
+        noticeModal.show();
+
+        const params = new URLSearchParams({
+            reporter_acct: reporter.acct || '',
+            display_name: reporter.display_name || '',
+        });
+        api('/moderation/mastodon/reports/' + encodeURIComponent(r.id) + '/notify/preview?' + params.toString())
+            .then(d => {
+                noticeMentionEl.textContent = d.mention || '';
+                noticeTextEl.value = d.text || '';
+                noticeModalEl.dataset.maxChars = String(d.max_chars || maxStatusChars);
+                if (d.already_notified_at) {
+                    noticeNotifiedEl.style.display = '';
+                    noticeNotifiedEl.title = fmtDate(d.already_notified_at);
+                }
+                updateNoticeCount();
+            })
+            .catch(err => { noticeErrorEl.textContent = err.message; });
+    }
+
+    // Opens the notice modal automatically right after a report is resolved,
+    // but only when it makes sense: the welcome bot is configured, the
+    // reporter is local (has a mention target), and they haven't been
+    // notified yet.
+    function maybeOpenNoticeModal(r) {
+        if (!welcomeConfigured) return;
+        const reporterAcct = (r.account && r.account.acct) || '';
+        if (!reporterAcct || reporterAcct.includes('@')) return;
+        if (r.reporter_notified_at) return;
+        openNoticeModal(r);
+    }
+
+    // Sends the reporter-notice DM. On a 409 "already notified" conflict,
+    // confirms with the moderator and retries with force=1.
+    function sendReportNotice(force) {
+        const submit = document.getElementById('masto-notice-submit');
+        submit.disabled = true;
+        noticeErrorEl.textContent = '';
+        return api('/moderation/mastodon/reports/' + encodeURIComponent(noticeModalEl.dataset.reportId) + '/notify', formData({
+            reporter_id: noticeModalEl.dataset.reporterId,
+            reporter_acct: noticeModalEl.dataset.reporterAcct,
+            display_name: noticeModalEl.dataset.displayName,
+            text: noticeTextEl.value,
+            force: force ? '1' : undefined,
+        }))
+            .then(() => {
+                noticeModal.hide();
+                loadReports();
+            })
+            .catch(err => {
+                if (!force && err.message === 'already notified') {
+                    return confirmDialog('The reporter was already notified. Send again?').then(ok => {
+                        if (ok) return sendReportNotice(true);
+                        throw err;
+                    });
+                }
+                noticeErrorEl.textContent = err.message;
+                throw err;
+            })
+            .finally(() => { submit.disabled = false; });
+    }
+
+    document.getElementById('masto-notice-form').addEventListener('submit', e => {
+        e.preventDefault();
+        sendReportNotice(false).catch(() => { /* handled above */ });
+    });
 
     // ── pending approvals ─────────────────────────────────────────────────
     const pendingBody = document.getElementById('masto-pending-body');
@@ -1189,7 +1464,7 @@
             + '<thead><tr><th>Handle</th><th>Reason</th><th>Added by</th><th>Expires</th><th>Last checked</th><th class="text-end">Actions</th></tr></thead><tbody>';
         watches.forEach(w => {
             html += '<tr data-watch-id="' + escHtml(String(w.id)) + '">'
-                + '<td>' + acctLink({ acct: w.acct, id: w.account_id }) + (w.auto_added ? ' <span class="badge bg-secondary">auto</span>' : '') + '</td>'
+                + '<td>' + profileLinks(w.acct, w.account_id) + (w.auto_added ? ' <span class="badge bg-secondary">auto</span>' : '') + '</td>'
                 + '<td class="small">' + escHtml(w.reason || '') + '</td>'
                 + '<td class="small">' + escHtml(w.added_by || 'system') + '</td>'
                 + '<td class="small">' + (w.expires_at ? fmtDate(w.expires_at) : '<span class="text-muted">never</span>') + '</td>'
@@ -1267,7 +1542,7 @@
         alerts.forEach(a => {
             html += '<tr data-alert-id="' + escHtml(String(a.id)) + '">'
                 + '<td>' + alertKindBadge(a.kind) + '</td>'
-                + '<td>' + acctLink({ acct: a.acct, id: a.account_id }) + '</td>'
+                + '<td>' + profileLinks(a.acct, a.account_id) + '</td>'
                 + '<td class="small" style="max-width:24rem">' + escHtml(a.excerpt || '')
                 + (a.status_url ? ' <a href="' + escHtml(a.status_url) + '" target="_blank" rel="noopener">View</a>' : '') + '</td>'
                 + '<td class="small">' + fmtDate(a.created_at) + '</td>'
@@ -1343,7 +1618,7 @@
             + '<thead><tr><th>Handle</th><th>Created</th><th>Posts</th><th>Last login</th><th>Welcome</th><th class="text-end">Actions</th></tr></thead><tbody>';
         accounts.forEach(a => {
             html += '<tr data-account-id="' + escHtml(String(a.id)) + '">'
-                + '<td>' + acctLink(a) + '</td>'
+                + '<td>' + profileLinks(a.acct, a.id) + '</td>'
                 + '<td class="small">' + fmtDate(a.created_at) + '</td>'
                 + '<td class="small">' + (a.statuses_count || 0) + '</td>'
                 + '<td class="small">' + (a.last_login_at ? fmtDate(a.last_login_at) : '<span class="text-muted">never</span>') + '</td>'

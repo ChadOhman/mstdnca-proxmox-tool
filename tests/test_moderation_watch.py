@@ -33,6 +33,8 @@ _WATCH_SETTINGS_KEYS = [
     "moderation_watch_last_run_at",
     "moderation_watch_last_run_result",
     "moderation_watch_backoff_until",
+    "moderation_mastodon_max_chars",
+    "moderation_mastodon_max_chars_checked_at",
 ]
 
 
@@ -75,6 +77,9 @@ def _client(*, budget_ok=True, rate_limit=None, list_local_accounts=None, accoun
     client.rate_limit = rate_limit
     client.list_local_accounts.return_value = [] if list_local_accounts is None else list_local_accounts
     client.account_statuses.return_value = [] if account_statuses is None else account_statuses
+    # A bare MagicMock() return value isn't JSON-serializable, and run_watch_poll
+    # always persists its result -- give the status-limit refresh step something real.
+    client.max_status_chars.return_value = 500
     return client
 
 
@@ -86,6 +91,7 @@ def _silent_scan_client(accounts_for_silent_scan, *, budget_ok=True):
     client.budget_ok.return_value = budget_ok
     client.rate_limit = None
     client.account_statuses.return_value = []
+    client.max_status_chars.return_value = 500
 
     def _list_accounts(*args, **kwargs):
         if kwargs.get("max_pages") == 10:
@@ -147,6 +153,78 @@ class TestGetWatchSettings:
         with app.app_context():
             Setting.set("moderation_watch_silent_login_days", "not-a-number")
             assert get_watch_settings()["silent_login_days"] == 7
+
+
+# ---------------------------------------------------------------------------
+# get_status_limit / refresh_status_limit
+# ---------------------------------------------------------------------------
+
+
+class TestGetStatusLimit:
+    def test_default_is_500(self, app):
+        from core.moderation_watch import get_status_limit
+
+        with app.app_context():
+            assert get_status_limit() == 500
+
+    def test_reads_the_stored_value(self, app):
+        from core.moderation_watch import get_status_limit
+        from models import Setting
+
+        with app.app_context():
+            Setting.set("moderation_mastodon_max_chars", "1000")
+            assert get_status_limit() == 1000
+
+    def test_clamped_to_100_25000(self, app):
+        from core.moderation_watch import get_status_limit
+        from models import Setting
+
+        with app.app_context():
+            Setting.set("moderation_mastodon_max_chars", "5")
+            assert get_status_limit() == 100
+            Setting.set("moderation_mastodon_max_chars", "99999")
+            assert get_status_limit() == 25000
+
+    def test_non_numeric_falls_back_to_default(self, app):
+        from core.moderation_watch import get_status_limit
+        from models import Setting
+
+        with app.app_context():
+            Setting.set("moderation_mastodon_max_chars", "not-a-number")
+            assert get_status_limit() == 500
+
+
+class TestRefreshStatusLimit:
+    def test_stores_value_and_checked_at(self, app):
+        from core.moderation_watch import refresh_status_limit
+        from models import Setting
+
+        with app.app_context():
+            client = MagicMock()
+            client.max_status_chars.return_value = 1000
+
+            value = refresh_status_limit(client)
+
+            assert value == 1000
+            assert Setting.get("moderation_mastodon_max_chars") == "1000"
+            assert Setting.get("moderation_mastodon_max_chars_checked_at") is not None
+
+    def test_api_error_returns_cached_value_without_touching_settings(self, app):
+        from core.moderation_watch import refresh_status_limit
+        from models import Setting
+
+        with app.app_context():
+            Setting.set("moderation_mastodon_max_chars", "700")
+            Setting.set("moderation_mastodon_max_chars_checked_at", "2026-01-01T00:00:00+00:00")
+
+            client = MagicMock()
+            client.max_status_chars.side_effect = MastodonAPIError("boom")
+
+            value = refresh_status_limit(client)
+
+            assert value == 700
+            assert Setting.get("moderation_mastodon_max_chars") == "700"
+            assert Setting.get("moderation_mastodon_max_chars_checked_at") == "2026-01-01T00:00:00+00:00"
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +698,75 @@ class TestPrune:
 
 
 # ---------------------------------------------------------------------------
+# run_watch_poll - status-limit refresh
+# ---------------------------------------------------------------------------
+
+
+class TestStatusLimitRefreshInPoll:
+    def test_refreshes_when_checked_at_missing(self, app):
+        from core.moderation_watch import run_watch_poll
+        from models import Setting
+
+        now = datetime.now(timezone.utc)
+        with app.app_context():
+            _disable_discover_and_silent(now)
+            client = _client()
+            client.max_status_chars.return_value = 1234
+
+            result = run_watch_poll(client, now=now)
+
+            assert result["status_limit"] == 1234
+            assert Setting.get("moderation_mastodon_max_chars") == "1234"
+            assert Setting.get("moderation_mastodon_max_chars_checked_at") is not None
+
+    def test_refreshes_when_checked_at_is_stale(self, app):
+        from core.moderation_watch import run_watch_poll
+        from models import Setting
+
+        now = datetime.now(timezone.utc)
+        with app.app_context():
+            _disable_discover_and_silent(now)
+            Setting.set("moderation_mastodon_max_chars_checked_at", (now - timedelta(hours=25)).isoformat())
+            client = _client()
+            client.max_status_chars.return_value = 999
+
+            result = run_watch_poll(client, now=now)
+
+            assert result["status_limit"] == 999
+
+    def test_skips_when_checked_recently(self, app):
+        from core.moderation_watch import run_watch_poll
+        from models import Setting
+
+        now = datetime.now(timezone.utc)
+        with app.app_context():
+            _disable_discover_and_silent(now)
+            Setting.set("moderation_mastodon_max_chars_checked_at", now.isoformat())
+            Setting.set("moderation_mastodon_max_chars", "800")
+            client = _client()
+
+            result = run_watch_poll(client, now=now)
+
+            assert result["status_limit"] is None
+            client.max_status_chars.assert_not_called()
+            assert Setting.get("moderation_mastodon_max_chars") == "800"
+
+    def test_never_fails_the_run_on_refresh_error(self, app):
+        from core.moderation_watch import run_watch_poll
+
+        now = datetime.now(timezone.utc)
+        with app.app_context():
+            _disable_discover_and_silent(now)
+            client = _client()
+            client.max_status_chars.side_effect = RuntimeError("boom")
+
+            result = run_watch_poll(client, now=now)
+
+            assert result["status_limit"] is None
+            assert result["errors"] == []
+
+
+# ---------------------------------------------------------------------------
 # run_watch_poll - error handling / rate limits
 # ---------------------------------------------------------------------------
 
@@ -684,7 +831,7 @@ class TestPersistedResultShape:
             payload = json.loads(raw)
             assert set(payload.keys()) == {
                 "checked", "watch_total", "alerts", "deferred", "bootstrapped",
-                "backoff_until", "errors", "rate_limit", "welcomed",
+                "backoff_until", "errors", "rate_limit", "welcomed", "status_limit",
             }
             lowered = raw.lower()
             assert "email" not in lowered

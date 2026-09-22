@@ -82,6 +82,7 @@ _ADMIN_ONLY_ENDPOINTS = frozenset({
     "moderation.mastodon_watch_save",
     "moderation.mastodon_welcome_save",
     "moderation.mastodon_welcome_test",
+    "moderation.mastodon_report_notice_save",
 })
 
 # Guards the check-then-set on the manual "run poll now" job (TOCTOU): without
@@ -135,7 +136,12 @@ def index():
         except (json.JSONDecodeError, TypeError):
             pass
 
-    from core.moderation_watch import get_watch_settings, get_welcome_settings
+    from core.moderation_watch import (
+        get_report_notice_settings,
+        get_status_limit,
+        get_watch_settings,
+        get_welcome_settings,
+    )
 
     active_tab = "mastodon" if request.args.get("tab") == "mastodon" else "peertube"
     return render_template(
@@ -147,6 +153,8 @@ def index():
         can_configure=current_user.is_admin,
         watch_settings=get_watch_settings(),
         welcome_settings=get_welcome_settings(),
+        report_notice_settings=get_report_notice_settings(),
+        status_limit=get_status_limit(),
         token_account=_get_token_account(),
         can_moderate_staff=current_user.can_moderate_staff,
     )
@@ -401,10 +409,14 @@ def mastodon_save():
     # Only update the token if a new one was provided (not the placeholder)
     new_token = request.form.get("mastodon_api_token", "").strip()
     if new_token:
+        from core.moderation_watch import refresh_status_limit
+
         Setting.set("moderation_mastodon_api_token", encrypt(new_token))
         try:
-            account = MastodonAdminClient(api_url, new_token).verify()
+            client = MastodonAdminClient(api_url, new_token)
+            account = client.verify()
             _store_token_account(account)
+            refresh_status_limit(client)
         except MastodonAPIError as exc:
             Setting.set("moderation_mastodon_token_account", "")
             flash(f"Token saved but could not be verified: {exc.message}", "warning")
@@ -444,12 +456,32 @@ def _get_token_account():
 
 @bp.route("/mastodon/test", methods=["POST"])
 def mastodon_test():
+    from core.moderation_watch import refresh_status_limit
+
     def _do(c):
         account = c.verify()
         checked_at = _store_token_account(account)
-        return {"account": account, "checked_at": checked_at}
+        max_chars = refresh_status_limit(c)
+        return {"account": account, "checked_at": checked_at, "max_chars": max_chars}
 
     return _mastodon_json(_do)
+
+
+def _report_notice_by_report_id(report_ids):
+    """Return {report_id: iso} for the given report ids that have a
+    :class:`ModerationReportNotice` row, in a single query.
+    """
+    from models import ModerationReportNotice
+
+    report_ids = [str(r) for r in report_ids if r is not None]
+    if not report_ids:
+        return {}
+    rows = (
+        ModerationReportNotice.query
+        .filter(ModerationReportNotice.report_id.in_(report_ids))
+        .all()
+    )
+    return {row.report_id: _utc_iso(row.sent_at) for row in rows}
 
 
 # -- reports ---------------------------------------------------------------
@@ -457,7 +489,15 @@ def mastodon_test():
 @bp.route("/mastodon/reports")
 def mastodon_reports():
     resolved = request.args.get("resolved", "false") == "true"
-    return _mastodon_json(lambda c: {"reports": c.list_reports(resolved=resolved)})
+
+    def _do(c):
+        reports = c.list_reports(resolved=resolved)
+        notified = _report_notice_by_report_id([r.get("id") for r in reports])
+        for r in reports:
+            r["reporter_notified_at"] = notified.get(str(r.get("id")))
+        return {"reports": reports}
+
+    return _mastodon_json(_do)
 
 
 @bp.route("/mastodon/reports/<int:report_id>/resolve", methods=["POST"])
@@ -482,6 +522,93 @@ def mastodon_report_reopen(report_id):
         _do,
         audit=("mastodon_report_reopen", "mastodon_report", f"report {report_id}", {"report_id": str(report_id)}),
     )
+
+
+@bp.route("/mastodon/reports/<int:report_id>/notify/preview")
+def mastodon_report_notice_preview(report_id):
+    """Render a preview of the configured reporter-notice template for one report.
+
+    Read-only: never touches ``ModerationReportNotice`` other than to look up
+    whether the reporter has already been notified, so a moderator can open
+    the modal repeatedly without side effects.
+    """
+    from core.mastodon_admin import DEFAULT_REPORT_NOTICE_TEMPLATE, render_report_notice_body, report_notice_mention
+    from core.moderation_watch import REPORT_NOTICE_RENDER_ERROR, get_status_limit, report_notice_record
+
+    acct = (request.args.get("reporter_acct", "") or "").strip()[:320]
+    if not acct:
+        return jsonify({"ok": False, "error": "reporter_acct is required"}), 400
+    display_name = (request.args.get("display_name", "") or "").strip()[:320]
+
+    reporter = {
+        "id": None,
+        "acct": acct.lstrip("@"),
+        "username": acct.split("@")[0].lstrip("@"),
+        "display_name": display_name or None,
+    }
+
+    template = Setting.get("moderation_report_notice_template", DEFAULT_REPORT_NOTICE_TEMPLATE)
+    try:
+        text = render_report_notice_body(template, reporter, report_id)
+    except (KeyError, IndexError, ValueError):
+        return jsonify({"ok": False, "error": REPORT_NOTICE_RENDER_ERROR}), 400
+
+    existing = report_notice_record(report_id)
+    return jsonify({
+        "ok": True,
+        "mention": report_notice_mention(reporter),
+        "text": text,
+        "max_chars": get_status_limit(),
+        "already_notified_at": _utc_iso(existing.sent_at) if existing else None,
+    })
+
+
+@bp.route("/mastodon/reports/<int:report_id>/notify", methods=["POST"])
+def mastodon_report_notify(report_id):
+    from core.moderation_watch import REPORT_NOTICE_RENDER_ERROR, send_report_notice
+
+    reporter_id_raw = (request.form.get("reporter_id", "") or "").strip()
+    reporter_id = reporter_id_raw if reporter_id_raw.isdigit() else None
+    acct = _form_text("reporter_acct")
+    if not acct:
+        return jsonify({"ok": False, "error": "reporter_acct is required"}), 400
+    display_name = _form_text("display_name")
+    text = _form_text("text")
+    if not text:
+        return jsonify({"ok": False, "error": "text is required"}), 400
+    force = _form_flag("force")
+
+    client, err = _get_bot_client()
+    if err:
+        return jsonify({"ok": False, "error": "Welcome bot is not configured"}), 400
+
+    reporter = {
+        "id": reporter_id,
+        "acct": acct.lstrip("@"),
+        "username": acct.split("@")[0].lstrip("@"),
+        "display_name": display_name or None,
+    }
+
+    # send_report_notice already audits (audience="moderators") on success, so
+    # nothing further is logged here.
+    rec, error = send_report_notice(
+        client, report_id, reporter, text=text, sent_by_user_id=current_user.id, force=force
+    )
+
+    if error == "already notified":
+        return jsonify({"ok": False, "error": error}), 409
+    if error == REPORT_NOTICE_RENDER_ERROR or (error and error.startswith("Message would be")):
+        return jsonify({"ok": False, "error": error}), 400
+    if error:
+        return jsonify({"ok": False, "error": error}), 502
+
+    return jsonify({
+        "ok": True,
+        "notice": {
+            "sent_at": _utc_iso(rec.sent_at),
+            "status_id": rec.status_id,
+        },
+    })
 
 
 # -- pending approvals -----------------------------------------------------
@@ -842,9 +969,10 @@ def mastodon_welcome_send(account_id):
 def mastodon_welcome_save():
     from auth.credential_store import encrypt
     from core.mastodon_admin import validate_welcome_template
+    from core.moderation_watch import get_status_limit
 
     template = request.form.get("welcome_template", "")
-    err = validate_welcome_template(template)
+    err = validate_welcome_template(template, max_chars=get_status_limit())
     if err:
         flash(err, "error")
         return redirect(url_for("moderation.index", tab="mastodon"))
@@ -871,10 +999,40 @@ def mastodon_welcome_save():
 
 @bp.route("/mastodon/welcome/test", methods=["POST"])
 def mastodon_welcome_test():
-    return _bot_json(
-        lambda c: {"account": c.verify()},
-        audit=("mastodon_welcome_test", "moderation", None, None),
+    from core.moderation_watch import refresh_status_limit
+
+    def _do(c):
+        account = c.verify()
+        # The bot token also reads /api/v2/instance, so this is a convenient
+        # second opportunity (besides the admin token's own /mastodon/test)
+        # to refresh the cached status-length limit.
+        refresh_status_limit(c)
+        return {"account": account}
+
+    return _bot_json(_do, audit=("mastodon_welcome_test", "moderation", None, None))
+
+
+@bp.route("/mastodon/report_notice/save", methods=["POST"])
+def mastodon_report_notice_save():
+    from core.mastodon_admin import validate_report_notice_template
+    from core.moderation_watch import get_status_limit
+
+    template = request.form.get("report_notice_template", "")
+    err = validate_report_notice_template(template, max_chars=get_status_limit())
+    if err:
+        flash(err, "error")
+        return redirect(url_for("moderation.index", tab="mastodon"))
+
+    Setting.set("moderation_report_notice_template", template.strip())
+    log_action(
+        "moderation_report_notice_config_save",
+        "moderation",
+        details={"template_len": len(template.strip())},
     )
+    db.session.commit()
+
+    flash("Reporter notice settings saved.", "success")
+    return redirect(url_for("moderation.index", tab="mastodon"))
 
 
 @bp.route("/mastodon/watch/poll", methods=["POST"])

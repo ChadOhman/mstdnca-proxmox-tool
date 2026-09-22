@@ -961,6 +961,24 @@ class ModerationWelcome(db.Model):
         return f"<ModerationWelcome acct={self.acct}>"
 
 
+class ModerationReportNotice(db.Model):
+    """A "thanks for reporting" DM sent (by the bot, or manually) to a report's reporter."""
+    __tablename__ = "moderation_report_notices"
+
+    id = db.Column(db.Integer, primary_key=True)
+    report_id = db.Column(db.String(32), unique=True, nullable=False, index=True)
+    reporter_account_id = db.Column(db.String(32), nullable=True, index=True)
+    reporter_acct = db.Column(db.String(320), nullable=False)
+    sent_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    sent_by_user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    status_id = db.Column(db.String(32), nullable=True)
+
+    sent_by = db.relationship("User", backref="moderation_report_notices", lazy=True)
+
+    def __repr__(self):
+        return f"<ModerationReportNotice report_id={self.report_id}>"
+
+
 class AuditLog(db.Model):
     __tablename__ = "audit_logs"
 

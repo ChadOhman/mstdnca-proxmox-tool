@@ -9,6 +9,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.mastodon_admin import (
+    MAX_STATUS_CHARS,
+    MAX_STATUS_CHARS_CEILING,
+    MIN_STATUS_CHARS,
     MastodonAdminClient,
     MastodonAPIError,
     RateLimitState,
@@ -370,6 +373,55 @@ class TestClientTransport:
         assert c.budget_ok(60) is True
 
 
+class TestMaxStatusChars:
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_parses_v2_configuration(self, mock_urlopen):
+        mock_urlopen.return_value = _resp({"configuration": {"statuses": {"max_characters": 1000}}})
+        c = MastodonAdminClient(API, "t")
+
+        assert c.max_status_chars() == 1000
+        assert mock_urlopen.call_count == 1
+        assert "/api/v2/instance" in mock_urlopen.call_args[0][0].full_url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_falls_back_to_v1_max_toot_chars_on_404(self, mock_urlopen):
+        mock_urlopen.side_effect = [_http_error(404), _resp({"max_toot_chars": 700})]
+        c = MastodonAdminClient(API, "t")
+
+        assert c.max_status_chars() == 700
+        assert mock_urlopen.call_count == 2
+        assert "/api/v1/instance" in mock_urlopen.call_args_list[1][0][0].full_url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_defaults_to_500_when_both_lack_the_key(self, mock_urlopen):
+        mock_urlopen.side_effect = [_resp({"configuration": {"statuses": {}}}), _resp({"uri": "example.social"})]
+        c = MastodonAdminClient(API, "t")
+
+        assert c.max_status_chars() == MAX_STATUS_CHARS == 500
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_clamps_a_tiny_value_up_to_the_floor(self, mock_urlopen):
+        mock_urlopen.return_value = _resp({"configuration": {"statuses": {"max_characters": 5}}})
+        c = MastodonAdminClient(API, "t")
+
+        assert c.max_status_chars() == MIN_STATUS_CHARS == 100
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_clamps_a_huge_value_down_to_the_ceiling(self, mock_urlopen):
+        mock_urlopen.return_value = _resp({"configuration": {"statuses": {"max_characters": 99999}}})
+        c = MastodonAdminClient(API, "t")
+
+        assert c.max_status_chars() == MAX_STATUS_CHARS_CEILING == 25000
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_raises_when_both_endpoints_fail_for_a_non_404_reason(self, mock_urlopen):
+        mock_urlopen.side_effect = [_http_error(500, {"error": "boom"}), _http_error(500, {"error": "boom2"})]
+        c = MastodonAdminClient(API, "t")
+
+        with pytest.raises(MastodonAPIError):
+            c.max_status_chars()
+
+
 # ---------------------------------------------------------------------------
 # Client operations
 # ---------------------------------------------------------------------------
@@ -610,6 +662,9 @@ class TestMastodonRouteAuth:
         ("post", "/moderation/mastodon/accounts/1/welcome"),
         ("post", "/moderation/mastodon/welcome/save"),
         ("post", "/moderation/mastodon/welcome/test"),
+        ("get", "/moderation/mastodon/reports/1/notify/preview?reporter_acct=x"),
+        ("post", "/moderation/mastodon/reports/1/notify"),
+        ("post", "/moderation/mastodon/report_notice/save"),
     ])
     def test_requires_login(self, client, method, path):
         resp = getattr(client, method)(path, follow_redirects=False)
@@ -730,6 +785,8 @@ class TestMastodonSettings:
         html = resp.data.decode()
         assert 'class="tab-pane fade show active" id="mastodon-pane"' in html
         assert 'class="tab-pane fade" id="peertube-pane"' in html
+        assert "data-instance-url=" in html
+        assert "data-max-status-chars=" in html
 
     def test_index_default_is_peertube(self, auth_client):
         html = auth_client.get("/moderation/").data.decode()
@@ -754,13 +811,35 @@ class TestMastodonSettings:
 class TestMastodonReadRoutes:
     def test_test_connection(self, auth_client, masto_client):
         masto_client.verify.return_value = {"acct": "admin", "role": "Owner"}
+        masto_client.max_status_chars.return_value = MAX_STATUS_CHARS
         resp = auth_client.post("/moderation/mastodon/test")
         assert resp.status_code == 200
         assert resp.get_json()["account"]["acct"] == "admin"
 
+    def test_test_connection_stores_max_chars(self, app, auth_client, masto_client):
+        from models import Setting, db
+
+        masto_client.verify.return_value = {"acct": "admin", "role": "Owner"}
+        masto_client.max_status_chars.return_value = 1000
+        try:
+            resp = auth_client.post("/moderation/mastodon/test")
+            assert resp.status_code == 200
+            assert resp.get_json()["max_chars"] == 1000
+            with app.app_context():
+                assert Setting.get("moderation_mastodon_max_chars") == "1000"
+        finally:
+            # This setting is read by other tests (via get_status_limit) --
+            # don't leak the 1000 override into the rest of the session-scoped app.
+            with app.app_context():
+                row = Setting.query.filter_by(key="moderation_mastodon_max_chars").first()
+                if row:
+                    db.session.delete(row)
+                    db.session.commit()
+
     def test_test_connection_success_stores_token_account(self, app, auth_client, masto_client):
         from models import Setting
 
+        masto_client.max_status_chars.return_value = MAX_STATUS_CHARS
         masto_client.verify.return_value = {
             "id": "1", "acct": "admin", "display_name": "Admin", "role": "Owner", "url": "",
         }
@@ -786,8 +865,29 @@ class TestMastodonReadRoutes:
         masto_client.list_reports.return_value = [{"id": "1"}]
         resp = auth_client.get("/moderation/mastodon/reports?resolved=true")
         assert resp.status_code == 200
-        assert resp.get_json() == {"ok": True, "reports": [{"id": "1"}]}
+        assert resp.get_json() == {"ok": True, "reports": [{"id": "1", "reporter_notified_at": None}]}
         masto_client.list_reports.assert_called_once_with(resolved=True)
+
+    def test_reports_list_annotates_reporter_notified_at(self, app, auth_client, masto_client):
+        from models import ModerationReportNotice, db
+
+        with app.app_context():
+            db.session.add(ModerationReportNotice(
+                report_id="1", reporter_account_id="9", reporter_acct="reporter@remote.example",
+                status_id="s1",
+            ))
+            db.session.commit()
+        try:
+            masto_client.list_reports.return_value = [{"id": "1"}, {"id": "2"}]
+            resp = auth_client.get("/moderation/mastodon/reports")
+            assert resp.status_code == 200
+            reports = {r["id"]: r["reporter_notified_at"] for r in resp.get_json()["reports"]}
+            assert reports["1"] is not None
+            assert reports["2"] is None
+        finally:
+            with app.app_context():
+                ModerationReportNotice.query.filter_by(report_id="1").delete()
+                db.session.commit()
 
     def test_upstream_error_is_502_with_safe_message(self, auth_client, masto_client):
         masto_client.list_reports.side_effect = MastodonAPIError("Mastodon API returned HTTP 401: token rejected", 401)

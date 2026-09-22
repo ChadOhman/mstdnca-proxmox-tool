@@ -79,11 +79,13 @@ class TestModeratorAllowed:
         assert b"managed by an administrator" in resp.data
         assert b"/moderation/mastodon/save" not in resp.data
         assert b"/moderation/mastodon/welcome/save" not in resp.data
+        assert b"/moderation/mastodon/report_notice/save" not in resp.data
 
     def test_admin_moderation_page_shows_welcome_config(self, auth_client):
         resp = auth_client.get("/moderation/?tab=mastodon", follow_redirects=False)
         assert resp.status_code == 200
         assert b"/moderation/mastodon/welcome/save" in resp.data
+        assert b"/moderation/mastodon/report_notice/save" in resp.data
 
     def test_moderator_can_reach_watch_and_summary(self, moderator_client):
         resp = moderator_client.get("/moderation/mastodon/watch", follow_redirects=False)
