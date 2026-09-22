@@ -961,3 +961,225 @@ class TestRunMaintenanceFailsClosed:
                 result = run_maintenance("delete_account", "alice")
             assert result["ok"] is False
             mock_ssh.from_credential.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Mastodon status batch actions (Admin::StatusBatchAction via bin/rails runner)
+# ---------------------------------------------------------------------------
+
+
+class TestStatusActionCommands:
+    def _script(self, **overrides):
+        from core.mastodon_maintenance import build_status_action_script
+        kwargs = {
+            "action": "delete",
+            "status_ids": ["1", "2"],
+            "report_id": "9",
+            "actor_account_id": "3",
+        }
+        kwargs.update(overrides)
+        return build_status_action_script(**kwargs)
+
+    def test_script_contains_only_ids_action_and_base64_text(self):
+        script = self._script(status_ids=["10", "20"], report_id="9", actor_account_id="3", text="hello")
+        assert "Account.find(3)" in script
+        assert "Report.find(9)" in script
+        assert "['10', '20']" in script
+        assert "type: 'delete'" in script
+        assert "hello" not in script  # only the base64 blob is embedded
+        import base64
+        b64 = base64.b64encode(b"hello").decode("ascii")
+        assert f"Base64.strict_decode64('{b64}')" in script
+
+    def test_script_default_text_and_send_email(self):
+        script = self._script()
+        assert "send_email_notification: false" in script
+        import base64
+        assert f"Base64.strict_decode64('{base64.b64encode(b'').decode()}')" in script
+
+    def test_script_send_email_true(self):
+        script = self._script(send_email=True)
+        assert "send_email_notification: true" in script
+
+    def test_script_mark_as_sensitive_action(self):
+        script = self._script(action="mark_as_sensitive")
+        assert "type: 'mark_as_sensitive'" in script
+
+    def test_script_intersects_with_report_status_ids(self):
+        script = self._script()
+        assert "report.status_ids.map(&:to_s) & [" in script
+        assert "raise 'none of the selected statuses belong to this report' if ids.empty?" in script
+
+    def test_script_ends_with_ok_marker(self):
+        script = self._script()
+        assert script.rstrip().endswith('puts "OK #{ids.size}"')
+
+    @pytest.mark.parametrize("status_ids", [
+        ["1;rm -rf /"],
+        ["abc"],
+        [],
+        [str(i) for i in range(51)],
+        ["1", "abc"],
+        [1],  # not a string
+    ])
+    def test_hostile_or_invalid_status_ids_rejected(self, status_ids):
+        with pytest.raises(ValueError):
+            self._script(status_ids=status_ids)
+
+    def test_duplicate_status_ids_are_deduped(self):
+        script = self._script(status_ids=["1", "1", "2"])
+        assert script.count("'1'") == 1
+        assert script.count("'2'") == 1
+
+    def test_exactly_max_status_ids_accepted(self):
+        from core.mastodon_maintenance import MAX_STATUS_IDS
+        ids = [str(i) for i in range(1, MAX_STATUS_IDS + 1)]
+        script = self._script(status_ids=ids)
+        assert f"'{MAX_STATUS_IDS}'" in script
+
+    @pytest.mark.parametrize("report_id", ["9;id", "abc", "", None, "-1", "1.5"])
+    def test_hostile_or_invalid_report_id_rejected(self, report_id):
+        with pytest.raises(ValueError):
+            self._script(report_id=report_id)
+
+    @pytest.mark.parametrize("actor_id", ["3;id", "abc", "", None, "-1"])
+    def test_hostile_or_invalid_actor_id_rejected(self, actor_id):
+        with pytest.raises(ValueError):
+            self._script(actor_account_id=actor_id)
+
+    def test_unknown_status_action_rejected(self):
+        with pytest.raises(ValueError):
+            self._script(action="nuke_from_orbit")
+
+    def test_over_long_text_rejected(self):
+        from core.mastodon_maintenance import MAX_ACTION_TEXT
+        with pytest.raises(ValueError):
+            self._script(text="x" * (MAX_ACTION_TEXT + 1))
+
+    def test_max_length_text_accepted(self):
+        from core.mastodon_maintenance import MAX_ACTION_TEXT
+        script = self._script(text="x" * MAX_ACTION_TEXT)
+        assert script  # builds without raising
+
+    @pytest.mark.parametrize("text", [
+        "hello ' + system('id') + '",
+        "line1\nline2",
+        'quote " here',
+        "backtick ` here",
+        "$(id)",
+    ])
+    def test_hostile_text_never_appears_raw_in_script(self, text):
+        script = self._script(text=text)
+        assert text not in script
+
+    def test_build_status_action_command_shape(self):
+        from core.mastodon_maintenance import build_status_action_command
+        cmd = build_status_action_command("puts 1", user="mastodon", app_dir="/home/mastodon/live")
+        assert cmd.startswith("printf '%s' '")
+        assert " | base64 -d | su - mastodon -c '" in cmd
+        assert cmd.endswith(
+            "export PATH=$HOME/.rbenv/bin:$HOME/.rbenv/shims:$PATH; "
+            "cd /home/mastodon/live && RAILS_ENV=production bin/rails runner -'"
+        )
+        import base64
+        b64 = re.search(r"printf '%s' '(\S+)' \| base64 -d", cmd).group(1)
+        assert base64.b64decode(b64).decode() == "puts 1"
+
+    @pytest.mark.parametrize("value", HOSTILE)
+    def test_hostile_user_rejected(self, value):
+        from core.mastodon_maintenance import build_status_action_command
+        with pytest.raises(ValueError):
+            build_status_action_command("puts 1", user=value, app_dir="/home/mastodon/live")
+
+    @pytest.mark.parametrize("value", HOSTILE)
+    def test_hostile_app_dir_rejected(self, value):
+        from core.mastodon_maintenance import build_status_action_command
+        with pytest.raises(ValueError):
+            build_status_action_command("puts 1", user="mastodon", app_dir=value)
+
+
+class TestRunStatusActionFailsClosed:
+    """run_status_action() must reject hostile input before any SSH lookup, and
+    must refuse to run at all without a known actor account.
+    """
+
+    def _settings(self, **overrides):
+        from models import Setting
+        values = {
+            "mastodon_guest_id": "1",
+            "mastodon_user": "mastodon",
+            "mastodon_app_dir": "/home/mastodon/live",
+            "moderation_mastodon_token_account": '{"id": "3", "acct": "admin"}',
+        }
+        values.update(overrides)
+        for key, value in values.items():
+            Setting.set(key, value)
+
+    def test_missing_token_account_never_opens_ssh(self, app):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            self._settings(moderation_mastodon_token_account="")
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_status_action("delete", ["1"], "9")
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()
+
+    def test_malformed_token_account_never_opens_ssh(self, app):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            self._settings(moderation_mastodon_token_account="not-json")
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_status_action("delete", ["1"], "9")
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()
+
+    def test_token_account_missing_id_never_opens_ssh(self, app):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            self._settings(moderation_mastodon_token_account='{"acct": "admin"}')
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_status_action("delete", ["1"], "9")
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()
+
+    @pytest.mark.parametrize("status_ids", [["1;rm -rf /"], ["abc"], []])
+    def test_hostile_status_ids_never_opens_ssh(self, app, status_ids):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            self._settings()
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_status_action("delete", status_ids, "9")
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()
+
+    @pytest.mark.parametrize("report_id", ["9;id", "abc", ""])
+    def test_hostile_report_id_never_opens_ssh(self, app, report_id):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            self._settings()
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_status_action("delete", ["1"], report_id)
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()
+
+    def test_unknown_action_never_opens_ssh(self, app):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            self._settings()
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_status_action("nuke_from_orbit", ["1"], "9")
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()
+
+    @pytest.mark.parametrize("field,value", [
+        ("mastodon_user", "a;id"),
+        ("mastodon_app_dir", "/tmp'; id; #"),
+    ])
+    def test_hostile_settings_never_opens_ssh(self, app, field, value):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            self._settings(**{field: value})
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_status_action("delete", ["1"], "9")
+            assert result["ok"] is False
+            mock_ssh.from_credential.assert_not_called()

@@ -24,10 +24,14 @@ from core.mastodon_admin import (
 from core.mastodon_maintenance import (
     INVALID_INPUT_MESSAGE,
     MAINTENANCE_ACTIONS,
+    MAX_STATUS_IDS,
+    STATUS_ACTIONS,
     MaintenanceBusy,
     build_modify_command,
+    build_status_action_script,
     maintenance_slot,
     run_maintenance,
+    run_status_action,
 )
 from core.moderation_log import KIND_FILTERS, MODERATION_ACTION_PREFIXES, moderation_log_filter
 from models import AuditLog, ModerationAlert, ModerationWatch, Setting, User, db
@@ -753,6 +757,105 @@ def mastodon_report_notify(report_id):
             "status_id": rec.status_id,
         },
     })
+
+
+@bp.route("/mastodon/reports/<int:report_id>/statuses/action", methods=["POST"])
+def mastodon_report_statuses_action(report_id):
+    """Delete or mark-sensitive the reported posts on one report (Admin::StatusBatchAction).
+
+    See ``core/mastodon_maintenance.py`` for why this runs over SSH instead of
+    the REST API. Every input is re-validated (and status ids restricted to
+    those actually on the report) before any SSH attempt, exactly like
+    ``mastodon_account_maintenance`` does for account maintenance.
+    """
+    action = request.form.get("type", "")
+    if action not in STATUS_ACTIONS:
+        return jsonify({"ok": False, "error": "Unknown post action"}), 400
+    status_ids = [s.strip() for s in request.form.getlist("status_ids") if s.strip()]
+    if not status_ids:
+        return jsonify({"ok": False, "error": "Select at least one post"}), 400
+    if len(status_ids) > MAX_STATUS_IDS:
+        return jsonify({"ok": False, "error": f"Too many posts selected (max {MAX_STATUS_IDS})"}), 400
+    text = _form_text("text")
+    send_email = _form_flag("send_email_notification")
+
+    client, err = _get_mastodon_client()
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    try:
+        report = client.get_report(report_id)
+    except MastodonAPIError as exc:
+        return jsonify({"ok": False, "error": exc.message}), 502
+    if report.get("action_taken"):
+        return jsonify({"ok": False, "error": "This report is already resolved; reopen it first"}), 400
+
+    report_status_ids = {s["id"] for s in report.get("statuses") or [] if s.get("id")}
+    status_ids = [sid for sid in status_ids if sid in report_status_ids]
+    if not status_ids:
+        return jsonify({"ok": False, "error": "None of the selected posts belong to this report"}), 400
+
+    target = report.get("target_account") or {}
+    if target.get("is_staff") and not current_user.can_moderate_staff:
+        log_action("mastodon_account_action_refused", "mastodon_account",
+                   resource_name=target.get("acct") or str(target.get("id") or ""),
+                   details={"account_id": str(target.get("id") or ""), "type": f"posts:{action}",
+                            "target_role": target.get("role_name", ""), "report_id": str(report_id)})
+        db.session.commit()
+        return jsonify({"ok": False, "error": STAFF_TARGET_ERROR}), 403
+
+    # A remote target's home instance is the one actually notifying them --
+    # sending our own "you have a new notice from staff" DM makes no sense
+    # (and reuses the same rule mastodon_account_maintenance would apply).
+    if target.get("domain"):
+        send_email = False
+
+    token_account = _get_token_account()
+    if not token_account or not token_account.get("id"):
+        return jsonify({
+            "ok": False,
+            "error": "Run Test Connection first so MCAT knows which Mastodon account performs the action",
+        }), 400
+    if not Setting.get("mastodon_guest_id", ""):
+        return jsonify({"ok": False, "error": "Configure the Mastodon app guest first"}), 400
+
+    # Pre-validate with the same inputs run_status_action() will use, so a bad
+    # input maps to 400 before the maintenance lock or any SSH attempt --
+    # run_status_action() itself swallows this same ValueError into an
+    # ok=False result, which is the wrong status code for a client error.
+    try:
+        build_status_action_script(
+            action, status_ids, str(report_id), token_account["id"], text=text, send_email=send_email
+        )
+    except ValueError as exc:
+        logger.warning("Status action input rejected for report %s action %s: %s", report_id, action, exc)
+        return jsonify({"ok": False, "error": INVALID_INPUT_MESSAGE}), 400
+
+    try:
+        with maintenance_slot():
+            result = run_status_action(action, status_ids, str(report_id), text=text, send_email=send_email)
+    except MaintenanceBusy:
+        return jsonify({"ok": False, "error": "Another server-side action is running"}), 409
+
+    log_action(
+        f"mastodon_report_posts_{action}",
+        "mastodon_report",
+        resource_name=f"report {report_id}",
+        details={
+            "report_id": str(report_id),
+            "status_count": len(status_ids),
+            "acted": result.get("count"),
+            "ok": result["ok"],
+            "target": target.get("acct") or "",
+            "text_len": len(text),
+            "email": send_email,
+        },
+    )
+    db.session.commit()
+
+    if not result["ok"]:
+        return jsonify({"ok": False, "error": result["message"]}), 502
+
+    return jsonify({"ok": True, "message": result["message"], "count": result.get("count")})
 
 
 # -- pending approvals -----------------------------------------------------
