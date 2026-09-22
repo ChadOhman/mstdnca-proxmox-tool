@@ -83,8 +83,7 @@ class ClaudeClient:
             kwargs["tools"] = tools
         if self.model in SERVER_FALLBACK_MODELS:
             kwargs["betas"] = [SERVER_FALLBACK_BETA]
-            # The pinned SDK predates the typed `fallbacks` parameter.
-            kwargs["extra_body"] = {"fallbacks": "default"}
+            kwargs["fallbacks"] = "default"
             return self.client.beta.messages, kwargs
         return self.client.messages, kwargs
 

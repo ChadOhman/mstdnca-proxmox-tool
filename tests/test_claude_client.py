@@ -6,7 +6,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import anthropic
-import httpx
+import httpx2 as httpx
 
 from clients.claude_client import (
     AVAILABLE_MODELS,
@@ -241,7 +241,7 @@ class TestRequestShape:
         client._client.messages.create.assert_not_called()
         kwargs = client._client.beta.messages.create.call_args[1]
         assert kwargs["betas"] == [SERVER_FALLBACK_BETA] == ["server-side-fallback-2026-07-01"]
-        assert kwargs["extra_body"] == {"fallbacks": "default"}
+        assert kwargs["fallbacks"] == "default"
 
     def test_other_models_use_plain_endpoint(self):
         for model in ("claude-sonnet-5", "claude-haiku-4-5"):
@@ -253,7 +253,7 @@ class TestRequestShape:
             kwargs = client._client.messages.create.call_args[1]
             assert kwargs["model"] == model
             assert "betas" not in kwargs
-            assert "extra_body" not in kwargs
+            assert "fallbacks" not in kwargs
 
     def test_no_sampling_thinking_or_tool_choice_params(self):
         """Sampling params / budget_tokens 400 on Sonnet 5 and Opus 5; forced tool_choice 400s on newer models."""
