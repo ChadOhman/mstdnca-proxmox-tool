@@ -1,5 +1,6 @@
 """Moderation blueprint: cross-platform user email verification."""
 
+import ipaddress
 import json
 import logging
 import re
@@ -86,6 +87,7 @@ _ADMIN_ONLY_ENDPOINTS = frozenset({
     "moderation.mastodon_welcome_save",
     "moderation.mastodon_welcome_test",
     "moderation.mastodon_report_notice_save",
+    "moderation.mastodon_account_delete",
 })
 
 # Guards the check-then-set on the manual "run poll now" job (TOCTOU): without
@@ -790,6 +792,102 @@ def mastodon_account_lookup():
     return _mastodon_json(lambda c: {"account": c.lookup_account(acct)})
 
 
+@bp.route("/mastodon/accounts/search")
+def mastodon_account_search():
+    email = (request.args.get("email", "") or "").strip()[:320]
+    ip = (request.args.get("ip", "") or "").strip()[:64]
+    username = (request.args.get("username", "") or "").strip()[:64]
+    display_name = (request.args.get("display_name", "") or "").strip()[:128]
+
+    if not (email or ip or username or display_name):
+        return jsonify({"ok": False, "error": "Provide an email, IP, username or display name"}), 400
+
+    if ip:
+        try:
+            ipaddress.ip_network(ip, strict=False)
+        except ValueError:
+            return jsonify({"ok": False, "error": "invalid IP or CIDR"}), 400
+
+    filters = {}
+    if email:
+        filters["email"] = email
+    if ip:
+        filters["ip"] = ip
+    if username:
+        filters["username"] = username
+    if display_name:
+        filters["display_name"] = display_name
+
+    def _do(c):
+        accounts = c.search_accounts(**filters, limit=25)
+        watched_ids = _watched_account_ids([a.get("id") for a in accounts])
+        for a in accounts:
+            a["watched"] = a.get("id") in watched_ids
+        return {"accounts": accounts}
+
+    return _mastodon_json(
+        _do,
+        audit=("mastodon_account_search", "mastodon_account", None, {"filters": sorted(filters)}),
+    )
+
+
+@bp.route("/mastodon/accounts/<int:account_id>/context")
+def mastodon_account_context(account_id):
+    client, err = _get_mastodon_client()
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    try:
+        target = client.get_admin_account(account_id)
+    except MastodonAPIError as exc:
+        return jsonify({"ok": False, "error": exc.message}), 502
+
+    errors = {}
+
+    try:
+        reports_about = client.reports_for_account(account_id, as_target=True)[:10]
+    except MastodonAPIError as exc:
+        reports_about = None
+        errors["reports_about"] = exc.message
+
+    try:
+        reports_by = client.reports_for_account(account_id, as_target=False)[:10]
+    except MastodonAPIError as exc:
+        reports_by = None
+        errors["reports_by"] = exc.message
+
+    try:
+        recent_statuses = client.account_statuses(account_id, limit=10)
+    except MastodonAPIError as exc:
+        recent_statuses = None
+        errors["recent_statuses"] = exc.message
+
+    if target.get("ip"):
+        try:
+            same_ip = client.accounts_sharing_ip(target["ip"], exclude_id=str(account_id), limit=10)
+        except MastodonAPIError as exc:
+            same_ip = None
+            errors["same_ip"] = exc.message
+        except ValueError:
+            same_ip = []
+    else:
+        same_ip = []
+
+    account_id_str = str(account_id)
+    watched_ids = _watched_account_ids([account_id_str])
+    welcomed_at = _welcomed_at_by_account_id([account_id_str])
+
+    return jsonify({
+        "ok": True,
+        "reports_about": reports_about,
+        "reports_by": reports_by,
+        "recent_statuses": recent_statuses,
+        "same_ip": same_ip,
+        "errors": errors,
+        "watched": account_id_str in watched_ids,
+        "welcomed_at": welcomed_at.get(account_id_str),
+    })
+
+
 @bp.route("/mastodon/accounts/<int:account_id>/action", methods=["POST"])
 def mastodon_account_action(account_id):
     action_type = _form_text("type")
@@ -825,6 +923,41 @@ def mastodon_account_action(account_id):
         details["report_id"] = str(report_id)
     return _mastodon_json(_do, audit=(f"mastodon_account_{action_type}", "mastodon_account",
                                       acct or str(account_id), details))
+
+
+@bp.route("/mastodon/accounts/<int:account_id>/delete", methods=["POST"])
+def mastodon_account_delete(account_id):
+    acct = _form_text("acct")
+    if not acct:
+        return jsonify({"ok": False, "error": "acct is required"}), 400
+    confirm = _form_text("confirm")
+    if confirm != acct:
+        return jsonify({"ok": False, "error": "Type the account handle to confirm"}), 400
+
+    client, err = _get_mastodon_client()
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    try:
+        target = client.get_admin_account(account_id)
+    except MastodonAPIError as exc:
+        return jsonify({"ok": False, "error": exc.message}), 502
+
+    if not target.get("suspended"):
+        return jsonify({"ok": False, "error": "Suspend the account before deleting it"}), 400
+
+    if target.get("is_staff") and not current_user.can_moderate_staff:
+        log_action("mastodon_account_action_refused", "mastodon_account",
+                   resource_name=acct or target.get("acct") or str(account_id),
+                   details={"account_id": str(account_id), "type": "delete",
+                            "target_role": target.get("role_name", "")})
+        db.session.commit()
+        return jsonify({"ok": False, "error": STAFF_TARGET_ERROR}), 403
+
+    return _mastodon_json(
+        lambda c: {"deleted": c.delete_account(account_id)},
+        audit=("mastodon_account_delete", "mastodon_account", acct,
+               {"account_id": str(account_id), "domain": target.get("domain")}),
+    )
 
 
 @bp.route("/mastodon/accounts/<int:account_id>/<lift>", methods=["POST"])

@@ -184,6 +184,7 @@
          data-configured="{{ 'true' if settings.mastodon_api_url and settings.mastodon_api_token else 'false' }}"
          data-welcome-configured="{{ 'true' if welcome_settings is defined and welcome_settings.bot_configured else 'false' }}"
          data-can-moderate-staff="{{ 'true' if can_moderate_staff else 'false' }}"
+         data-can-configure="{{ 'true' if can_configure else 'false' }}"
          data-instance-url="{{ settings.mastodon_api_url }}"
          data-max-status-chars="{{ status_limit if status_limit is defined else 500 }}">
         <div class="row g-4">
@@ -248,14 +249,21 @@
                         <h5 class="mb-0"><i class="bi bi-person-badge"></i> Account Lookup</h5>
                     </div>
                     <div class="card-body">
-                        <form id="masto-lookup-form" class="d-flex gap-2 mb-3">
-                            <label class="visually-hidden" for="masto-lookup-acct">Account handle</label>
+                        <div class="btn-group btn-group-sm mb-2" role="group" aria-label="Lookup mode">
+                            <button type="button" class="btn btn-outline-light active" data-lookup-mode="handle">Handle</button>
+                            <button type="button" class="btn btn-outline-light" data-lookup-mode="email">Email</button>
+                            <button type="button" class="btn btn-outline-light" data-lookup-mode="ip">IP</button>
+                            <button type="button" class="btn btn-outline-light" data-lookup-mode="display_name">Display name</button>
+                        </div>
+                        <form id="masto-lookup-form" class="d-flex gap-2 mb-1">
+                            <label class="visually-hidden" for="masto-lookup-acct">Account lookup value</label>
                             <input type="text" class="form-control font-monospace" id="masto-lookup-acct"
                                    placeholder="username or username@remote.domain" autocomplete="off">
                             <button type="submit" class="btn btn-outline-light">
                                 <i class="bi bi-search"></i> Look up
                             </button>
                         </form>
+                        <div class="form-text mb-3" id="masto-lookup-help"></div>
                         <div id="masto-account-panel" class="small text-muted">
                             Search for a local or remote account to view its moderation state and apply an action.
                         </div>
@@ -710,6 +718,36 @@
     </div>
 </div>
 
+<!-- Mastodon delete account modal -->
+<div class="modal fade" id="mastoDeleteModal" tabindex="-1" aria-modal="true" role="dialog" aria-labelledby="mastoDeleteModalLabel">
+    <div class="modal-dialog">
+        <div class="modal-content bg-dark border-secondary">
+            <form id="masto-delete-form">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title" id="mastoDeleteModalLabel">Delete Account</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Cancel"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-3">
+                        This permanently deletes <strong class="font-monospace" id="masto-delete-acct"></strong>
+                        and reserves the username and email. Type the handle to confirm.
+                    </p>
+                    <input type="hidden" id="masto-delete-account-id">
+                    <div class="mb-3">
+                        <label class="form-label" for="masto-delete-confirm">Confirm handle</label>
+                        <input type="text" class="form-control font-monospace" id="masto-delete-confirm" autocomplete="off">
+                    </div>
+                    <div id="masto-delete-error" class="text-danger small" aria-live="polite"></div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-danger" id="masto-delete-submit" disabled>Delete</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 {% endblock %}
 
 {% block scripts %}
@@ -1039,18 +1077,169 @@
             .finally(() => { submit.disabled = false; });
     });
 
+    function fieldsList(fields) {
+        if (!fields || !fields.length) return '';
+        let html = '<dl class="row small mb-2">';
+        fields.forEach(f => {
+            html += '<dt class="col-4 text-muted fw-normal">' + escHtml(f.name || '') + '</dt>'
+                  + '<dd class="col-8">' + escHtml(f.value || '') + '</dd>';
+        });
+        html += '</dl>';
+        return html;
+    }
+
+    let ctxAccountId = null;  // guards loadContext() from re-fetching on every re-render
+
+    function renderCtxReports(el, rows, error, kind) {
+        if (error) { el.innerHTML = errorBox(error); el.classList.remove('text-muted'); return; }
+        if (!rows || !rows.length) { el.innerHTML = '<span class="text-muted">No reports.</span>'; return; }
+        let html = '<div class="table-responsive"><table class="table table-dark table-sm table-striped mb-0"><thead><tr>'
+            + '<th>#</th><th>Category</th><th>Status</th><th>Created</th><th>' + (kind === 'about' ? 'Reporter' : 'Target')
+            + '</th><th>Comment</th></tr></thead><tbody>';
+        rows.forEach(r => {
+            const counterpart = (kind === 'about' ? r.account : r.target_account) || {};
+            const idLabel = '#' + escHtml(String(r.id));
+            const idCell = instanceUrl
+                ? '<a href="' + escHtml(instanceUrl) + '/admin/reports/' + encodeURIComponent(r.id) + '" target="_blank" rel="noopener">' + idLabel + '</a>'
+                : idLabel;
+            html += '<tr>'
+                + '<td>' + idCell + '</td>'
+                + '<td>' + escHtml(r.category || '') + '</td>'
+                + '<td>' + (r.action_taken ? '<span class="badge bg-success">Resolved</span>' : '<span class="badge bg-warning text-dark">Open</span>') + '</td>'
+                + '<td class="small">' + fmtDate(r.created_at) + '</td>'
+                + '<td class="font-monospace small">' + escHtml(counterpart.acct || '') + '</td>'
+                + '<td class="small">' + escHtml((r.comment || '').slice(0, 140)) + '</td>'
+                + '</tr>';
+        });
+        html += '</tbody></table></div>';
+        el.innerHTML = html;
+        el.classList.remove('text-muted');
+    }
+
+    function renderCtxPosts(el, rows, error) {
+        if (error) { el.innerHTML = errorBox(error); el.classList.remove('text-muted'); return; }
+        if (!rows || !rows.length) { el.innerHTML = '<span class="text-muted">No recent posts.</span>'; return; }
+        let html = '<div class="table-responsive"><table class="table table-dark table-sm table-striped mb-0"><thead><tr>'
+            + '<th>Post</th><th>Visibility</th><th>Created</th></tr></thead><tbody>';
+        rows.forEach(s => {
+            const excerpt = escHtml((s.excerpt || '').slice(0, 140));
+            html += '<tr>'
+                + '<td>' + (s.url ? '<a href="' + escHtml(s.url) + '" target="_blank" rel="noopener">' + excerpt + '</a>' : excerpt) + '</td>'
+                + '<td class="small">' + escHtml(s.visibility || '') + '</td>'
+                + '<td class="small">' + fmtDate(s.created_at) + '</td>'
+                + '</tr>';
+        });
+        html += '</tbody></table></div>';
+        el.innerHTML = html;
+        el.classList.remove('text-muted');
+    }
+
+    function renderCtxSameIp(el, rows, error) {
+        if (error) { el.innerHTML = errorBox(error); el.classList.remove('text-muted'); return; }
+        if (!rows || !rows.length) { el.innerHTML = '<span class="text-muted">No other accounts on the same IP.</span>'; return; }
+        let html = '<div class="table-responsive"><table class="table table-dark table-sm table-striped mb-0"><thead><tr>'
+            + '<th>Handle</th><th>Created</th><th>State</th><th class="text-end">Actions</th></tr></thead><tbody>';
+        rows.forEach(sa => {
+            html += '<tr>'
+                + '<td>' + profileLinks(sa.acct, sa.id) + '</td>'
+                + '<td class="small">' + fmtDate(sa.created_at) + '</td>'
+                + '<td>' + (stateBadges(sa) || '<span class="text-muted">normal</span>') + '</td>'
+                + '<td class="text-end"><button type="button" class="btn btn-sm btn-outline-light" data-view-acct="' + escHtml(sa.acct || '') + '">View</button></td>'
+                + '</tr>';
+        });
+        html += '</tbody></table></div>';
+        el.innerHTML = html;
+        el.classList.remove('text-muted');
+        el.querySelectorAll('[data-view-acct]').forEach(btn => btn.addEventListener('click', () => lookupAccount(btn.dataset.viewAcct)));
+    }
+
+    function loadContext(a) {
+        if (ctxAccountId === a.id) return;
+        ctxAccountId = a.id;
+        const paneAbout = document.getElementById('masto-ctx-pane-about');
+        const paneBy = document.getElementById('masto-ctx-pane-by');
+        const panePosts = document.getElementById('masto-ctx-pane-posts');
+        const paneSameIp = document.getElementById('masto-ctx-pane-sameip');
+        api('/moderation/mastodon/accounts/' + encodeURIComponent(a.id) + '/context')
+            .then(d => {
+                const errors = d.errors || {};
+                renderCtxReports(paneAbout, d.reports_about, errors.reports_about, 'about');
+                renderCtxReports(paneBy, d.reports_by, errors.reports_by, 'by');
+                renderCtxPosts(panePosts, d.recent_statuses, errors.recent_statuses);
+                renderCtxSameIp(paneSameIp, d.same_ip, errors.same_ip);
+            })
+            .catch(err => {
+                [paneAbout, paneBy, panePosts, paneSameIp].forEach(el => {
+                    el.innerHTML = errorBox(err.message);
+                    el.classList.remove('text-muted');
+                });
+            });
+    }
+
     function renderAccount(a) {
-        const rows = [
-            ['Handle', acctLink(a)],
-            ['Display name', escHtml(a.display_name || '')],
-            ['Email', '<span class="font-monospace">' + escHtml(a.email || (a.domain ? 'n/a (remote)' : '')) + '</span>'],
-            ['Last IP', '<span class="font-monospace">' + escHtml(a.ip || '') + '</span>'],
-            ['Created', fmtDate(a.created_at)],
-            ['State', stateBadges(a) || '<span class="text-muted">normal</span>'],
-        ];
-        let html = '<table class="table table-dark table-sm mb-3"><tbody>';
-        rows.forEach(r => { html += '<tr><th class="text-muted fw-normal" style="width:8rem">' + r[0] + '</th><td>' + r[1] + '</td></tr>'; });
-        html += '</tbody></table>';
+        const canConfigure = pane.dataset.canConfigure === 'true';
+        let html = '<div class="d-flex align-items-center gap-2 mb-3 flex-wrap">';
+        if (a.avatar) html += '<img src="' + escHtml(a.avatar) + '" alt="" width="48" height="48" class="rounded">';
+        html += '<div><div>' + profileLinks(a.acct, a.id) + '</div>'
+              + '<div class="text-muted small">' + escHtml(a.display_name || '') + '</div></div>';
+        html += '<div class="ms-auto d-flex flex-wrap gap-1">' + stateBadges(a);
+        if (a.bot) html += ' <span class="badge bg-secondary">Bot</span>';
+        if (a.locked) html += ' <span class="badge bg-secondary">Locked</span>';
+        html += '</div></div>';
+
+        html += '<div class="row">';
+        html += '<div class="col-md-6 mb-3"><h6 class="text-muted">Identity</h6>';
+        if (a.note) html += '<div class="small bg-secondary bg-opacity-10 border border-secondary rounded p-2 mb-2">' + escHtml(a.note) + '</div>';
+        html += fieldsList(a.fields);
+        html += '<table class="table table-dark table-sm mb-0"><tbody>'
+              + '<tr><th class="text-muted fw-normal" style="width:8rem">Created</th><td>' + fmtDate(a.created_at) + '</td></tr>'
+              + '<tr><th class="text-muted fw-normal">Locale</th><td>' + escHtml(a.locale || '') + '</td></tr>';
+        if (a.invite_request) html += '<tr><th class="text-muted fw-normal">Invite request</th><td>' + escHtml(a.invite_request) + '</td></tr>';
+        html += '</tbody></table></div>';
+
+        html += '<div class="col-md-6 mb-3"><h6 class="text-muted">Account facts</h6>';
+        html += '<table class="table table-dark table-sm mb-0"><tbody>';
+        if (a.domain) {
+            html += '<tr><th class="text-muted fw-normal" style="width:8rem">Email</th><td class="font-monospace">n/a (remote)</td></tr>';
+        } else {
+            html += '<tr><th class="text-muted fw-normal" style="width:8rem">Email</th><td class="font-monospace">' + escHtml(a.email || '')
+                  + ' ' + (a.confirmed === false ? '<span class="badge bg-secondary">Unconfirmed</span>' : '<span class="badge bg-success">Confirmed</span>')
+                  + '</td></tr>';
+        }
+        html += '<tr><th class="text-muted fw-normal">Last IP</th><td class="font-monospace">' + escHtml(a.ip || '') + '</td></tr>'
+              + '<tr><th class="text-muted fw-normal">Followers / following</th><td>' + (a.followers_count != null ? a.followers_count : '?')
+                  + ' / ' + (a.following_count != null ? a.following_count : '?') + '</td></tr>'
+              + '<tr><th class="text-muted fw-normal">Posts</th><td>' + (a.statuses_count != null ? a.statuses_count : '?') + '</td></tr>'
+              + '<tr><th class="text-muted fw-normal">Last post</th><td>' + (a.last_status_at ? fmtDate(a.last_status_at) : '<span class="text-muted">never</span>') + '</td></tr>'
+              + '<tr><th class="text-muted fw-normal">Role</th><td>' + escHtml(a.role_name || a.role || '') + '</td></tr>';
+        html += '</tbody></table></div>';
+        html += '</div>';
+
+        html += '<h6 class="text-muted">Login history</h6>';
+        if (a.ips && a.ips.length) {
+            html += '<div class="table-responsive mb-3"><table class="table table-dark table-sm table-striped mb-0">'
+                  + '<thead><tr><th>IP</th><th>Last used</th></tr></thead><tbody>';
+            a.ips.forEach(row => {
+                html += '<tr><td class="font-monospace">' + escHtml(row.ip || '') + '</td><td class="small">' + fmtDate(row.used_at) + '</td></tr>';
+            });
+            html += '</tbody></table></div>';
+        } else {
+            html += '<div class="text-muted small mb-3">No login history</div>';
+        }
+
+        html += '<ul class="nav nav-tabs" id="masto-ctx-tabs" role="tablist">'
+              + '<li class="nav-item" role="presentation"><button class="nav-link active" id="masto-ctx-tab-about" data-bs-toggle="tab" data-bs-target="#masto-ctx-pane-about" type="button" role="tab">Reports about</button></li>'
+              + '<li class="nav-item" role="presentation"><button class="nav-link" id="masto-ctx-tab-by" data-bs-toggle="tab" data-bs-target="#masto-ctx-pane-by" type="button" role="tab">Reports by</button></li>'
+              + '<li class="nav-item" role="presentation"><button class="nav-link" id="masto-ctx-tab-posts" data-bs-toggle="tab" data-bs-target="#masto-ctx-pane-posts" type="button" role="tab">Recent posts</button></li>'
+              + '<li class="nav-item" role="presentation"><button class="nav-link" id="masto-ctx-tab-sameip" data-bs-toggle="tab" data-bs-target="#masto-ctx-pane-sameip" type="button" role="tab">Same IP</button></li>'
+              + '</ul>';
+        html += '<div class="tab-content border border-top-0 border-secondary p-2 mb-3" id="masto-ctx-body">'
+              + '<div class="tab-pane fade show active small text-muted" id="masto-ctx-pane-about" role="tabpanel">Loading…</div>'
+              + '<div class="tab-pane fade small text-muted" id="masto-ctx-pane-by" role="tabpanel">Loading…</div>'
+              + '<div class="tab-pane fade small text-muted" id="masto-ctx-pane-posts" role="tabpanel">Loading…</div>'
+              + '<div class="tab-pane fade small text-muted" id="masto-ctx-pane-sameip" role="tabpanel">Loading…</div>'
+              + '</div>';
+
         html += '<div class="d-flex flex-wrap gap-2">';
         html += '<button type="button" class="btn btn-sm btn-outline-danger" data-act="action"' + staffLock(a) + '>'
               + '<i class="bi bi-hammer"></i> Take action…</button>';
@@ -1063,13 +1252,17 @@
         if (!a.domain && welcomeConfigured) html += '<button type="button" class="btn btn-sm btn-outline-info" data-masto-welcome'
               + ' data-account-id="' + escHtml(String(a.id)) + '" data-acct="' + escHtml(a.acct || '') + '">'
               + '<i class="bi bi-chat-heart"></i> Send welcome</button>';
+        if (a.suspended && canConfigure) html += '<button type="button" class="btn btn-sm btn-outline-danger" data-act="delete">'
+              + '<i class="bi bi-trash"></i> Delete account…</button>';
         html += '</div><div class="mt-2" id="masto-account-error"></div>';
+
         acctPanel.innerHTML = html;
         acctPanel.classList.remove('text-muted');
         acctPanel.querySelectorAll('[data-act]').forEach(btn => btn.addEventListener('click', () => {
             const act = btn.dataset.act;
             if (act === 'action') { openActionModal(a); return; }
             if (act === 'watch') { openWatchModal(a); return; }
+            if (act === 'delete') { openDeleteModal(a); return; }
             confirmDialog('Apply "' + btn.textContent.trim() + '" to ' + (a.acct || a.id) + '?').then(ok => {
                 if (!ok) return;
                 api('/moderation/mastodon/accounts/' + encodeURIComponent(a.id) + '/' + act, formData({ acct: a.acct }))
@@ -1077,16 +1270,70 @@
                     .catch(err => { document.getElementById('masto-account-error').innerHTML = errorBox(err.message); });
             });
         }));
+
+        loadContext(a);
     }
+
+    function lookupAccount(acct) {
+        acctPanel.innerHTML = '<span class="text-muted">Looking up…</span>';
+        return api('/moderation/mastodon/accounts/lookup?acct=' + encodeURIComponent(acct))
+            .then(d => renderAccount(d.account))
+            .catch(err => { acctPanel.innerHTML = errorBox(err.message); });
+    }
+
+    function renderSearchResults(accounts) {
+        if (!accounts.length) {
+            acctPanel.innerHTML = '<span class="text-muted">No accounts matched.</span>';
+            acctPanel.classList.add('text-muted');
+            return;
+        }
+        let html = '<div class="table-responsive"><table class="table table-dark table-striped table-hover mb-0 align-middle small">'
+            + '<thead><tr><th>Handle</th><th>Display name</th><th>Email</th><th>Last IP</th><th>Created</th><th>State</th><th class="text-end">Actions</th></tr></thead><tbody>';
+        accounts.forEach(a => {
+            html += '<tr>'
+                + '<td>' + profileLinks(a.acct, a.id) + '</td>'
+                + '<td>' + escHtml(a.display_name || '') + '</td>'
+                + '<td class="font-monospace">' + escHtml(a.email || (a.domain ? 'n/a (remote)' : '')) + '</td>'
+                + '<td class="font-monospace">' + escHtml(a.ip || '') + '</td>'
+                + '<td class="small">' + fmtDate(a.created_at) + '</td>'
+                + '<td>' + (stateBadges(a) || '<span class="text-muted">normal</span>') + '</td>'
+                + '<td class="text-end"><button type="button" class="btn btn-sm btn-outline-light" data-view-acct="' + escHtml(a.acct || '') + '">View</button></td>'
+                + '</tr>';
+        });
+        html += '</tbody></table></div>';
+        acctPanel.innerHTML = html;
+        acctPanel.classList.remove('text-muted');
+        acctPanel.querySelectorAll('[data-view-acct]').forEach(btn => btn.addEventListener('click', () => lookupAccount(btn.dataset.viewAcct)));
+    }
+
+    // ── lookup mode toggle ───────────────────────────────────────────────────
+    let lookupMode = 'handle';
+    const lookupInput = document.getElementById('masto-lookup-acct');
+    const lookupHelp = document.getElementById('masto-lookup-help');
+    const LOOKUP_PLACEHOLDERS = {
+        handle: 'username or username@remote.domain',
+        email: 'email address (prefix match)',
+        ip: 'IP address or CIDR',
+        display_name: 'display name (prefix match)',
+    };
+    const LOOKUP_HELP = 'Email and display name match the beginning of the value; IP accepts a single address or a CIDR range.';
+    pane.querySelectorAll('[data-lookup-mode]').forEach(btn => btn.addEventListener('click', () => {
+        pane.querySelectorAll('[data-lookup-mode]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        lookupMode = btn.dataset.lookupMode;
+        lookupInput.placeholder = LOOKUP_PLACEHOLDERS[lookupMode] || '';
+        lookupHelp.textContent = lookupMode === 'handle' ? '' : LOOKUP_HELP;
+    }));
 
     document.getElementById('masto-lookup-form').addEventListener('submit', e => {
         e.preventDefault();
         if (!configured) { notConfigured(acctPanel); return; }
-        const acct = document.getElementById('masto-lookup-acct').value.trim();
-        if (!acct) return;
-        acctPanel.innerHTML = '<span class="text-muted">Looking up…</span>';
-        api('/moderation/mastodon/accounts/lookup?acct=' + encodeURIComponent(acct))
-            .then(d => renderAccount(d.account))
+        const value = lookupInput.value.trim();
+        if (!value) return;
+        if (lookupMode === 'handle') { lookupAccount(value); return; }
+        acctPanel.innerHTML = '<span class="text-muted">Searching…</span>';
+        api('/moderation/mastodon/accounts/search?' + lookupMode + '=' + encodeURIComponent(value))
+            .then(d => renderSearchResults(d.accounts || []))
             .catch(err => { acctPanel.innerHTML = errorBox(err.message); });
     });
 
@@ -1449,6 +1696,49 @@
             })
             .catch(err => { errEl.textContent = err.message; })
             .finally(() => { submit.disabled = false; });
+    });
+
+    // ── account delete modal ────────────────────────────────────────────────
+    const deleteModalEl = document.getElementById('mastoDeleteModal');
+    const deleteModal = bootstrap.Modal.getOrCreateInstance(deleteModalEl);
+    const deleteConfirmEl = document.getElementById('masto-delete-confirm');
+    const deleteSubmitBtn = document.getElementById('masto-delete-submit');
+
+    function openDeleteModal(account) {
+        document.getElementById('masto-delete-acct').textContent = '@' + (account.acct || account.id);
+        document.getElementById('masto-delete-account-id').value = account.id;
+        deleteConfirmEl.value = '';
+        document.getElementById('masto-delete-error').textContent = '';
+        deleteSubmitBtn.disabled = true;
+        deleteModalEl.dataset.acct = account.acct || '';
+        deleteModal.show();
+    }
+
+    deleteConfirmEl.addEventListener('input', () => {
+        deleteSubmitBtn.disabled = deleteConfirmEl.value !== (deleteModalEl.dataset.acct || '');
+    });
+
+    document.getElementById('masto-delete-form').addEventListener('submit', e => {
+        e.preventDefault();
+        const errEl = document.getElementById('masto-delete-error');
+        const id = document.getElementById('masto-delete-account-id').value;
+        const acct = deleteModalEl.dataset.acct || '';
+        if (deleteConfirmEl.value !== acct) return;
+        deleteSubmitBtn.disabled = true;
+        errEl.textContent = '';
+        api('/moderation/mastodon/accounts/' + encodeURIComponent(id) + '/delete', formData({
+            acct: acct,
+            confirm: deleteConfirmEl.value,
+        }))
+            .then(() => {
+                deleteModal.hide();
+                ctxAccountId = null;
+                acctPanel.classList.add('text-muted');
+                acctPanel.innerHTML = 'Search for a local or remote account to view its moderation state and apply an action.'
+                    + '<div class="mt-2" id="masto-account-error"><span class="text-success">'
+                    + '<i class="bi bi-check-circle"></i> Account @' + escHtml(acct) + ' deleted.</span></div>';
+            })
+            .catch(err => { errEl.textContent = err.message; deleteSubmitBtn.disabled = false; });
     });
 
     // ── watched accounts ──────────────────────────────────────────────────
