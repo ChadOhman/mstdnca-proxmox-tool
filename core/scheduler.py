@@ -1519,7 +1519,13 @@ def _run_ai_upgrade_analysis(app):
         )
 
         if response:
-            text = response.content[0].text if response.content else ""
+            if response.stop_reason == "refusal":
+                logger.warning("AI upgrade analysis: the model declined the request; keeping the previous analysis.")
+                return
+            # Thinking blocks can precede the answer, so join the text blocks.
+            text = "".join(
+                block.text for block in response.content if getattr(block, "type", None) == "text"
+            )
             Setting.set("ai_upgrade_analysis", text)
             Setting.set("ai_upgrade_analysis_time",
                          __import__("datetime").datetime.now(

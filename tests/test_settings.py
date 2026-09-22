@@ -1176,3 +1176,64 @@ class TestScanIntervalValidation:
         with app.app_context():
             assert Setting.get("scan_interval") == "8"
         self._seed_known_good(app)
+
+
+class TestAIModelSettings:
+    """AI model dropdown: current model ids, and a saved legacy id is preserved."""
+
+    def _restore(self, app):
+        with app.app_context():
+            Setting.set("ai_model", "claude-sonnet-5")
+
+    def test_dropdown_offers_current_models(self, app, auth_client):
+        with app.app_context():
+            Setting.set("ai_model", "claude-sonnet-5")
+        body = auth_client.get("/settings/").get_data(as_text=True)
+        for model_id in ("claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"):
+            assert f'<option value="{model_id}"' in body
+        assert '<option value="claude-sonnet-5" selected>' in body
+        assert "claude-sonnet-4-20250514" not in body
+        assert "(legacy)" not in body
+
+    def test_default_model_is_selected_when_unset(self, app, auth_client):
+        from models import db
+        with app.app_context():
+            Setting.query.filter_by(key="ai_model").delete()
+            db.session.commit()
+        body = auth_client.get("/settings/").get_data(as_text=True)
+        assert '<option value="claude-sonnet-5" selected>' in body
+        self._restore(app)
+
+    def test_legacy_saved_model_stays_selected(self, app, auth_client):
+        with app.app_context():
+            Setting.set("ai_model", "claude-sonnet-4-20250514")
+        try:
+            body = auth_client.get("/settings/").get_data(as_text=True)
+            assert '<option value="claude-sonnet-4-20250514" selected>claude-sonnet-4-20250514 (legacy)' in body
+            assert '<option value="claude-sonnet-5" >' in body
+        finally:
+            self._restore(app)
+
+    def test_saving_keeps_legacy_model(self, app, auth_client):
+        with app.app_context():
+            Setting.set("ai_model", "claude-opus-4-6")
+        try:
+            resp = auth_client.post(
+                "/settings/ai",
+                data={"ai_model": "claude-opus-4-6", "ai_max_tokens": "16000"},
+                follow_redirects=False,
+            )
+            assert resp.status_code == 302
+            with app.app_context():
+                assert Setting.get("ai_model") == "claude-opus-4-6"
+        finally:
+            self._restore(app)
+
+    def test_save_defaults_to_current_model(self, app, auth_client):
+        with app.app_context():
+            Setting.set("ai_model", "claude-haiku-4-5")
+        resp = auth_client.post("/settings/ai", data={}, follow_redirects=False)
+        assert resp.status_code == 302
+        with app.app_context():
+            assert Setting.get("ai_model") == "claude-sonnet-5"
+            assert Setting.get("ai_max_tokens") == "16000"
