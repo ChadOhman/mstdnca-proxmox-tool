@@ -2,12 +2,14 @@
 
 import json
 import logging
+import re
 import threading as _threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
+from sqlalchemy import or_
 
 from auth.audit import log_action
 from core.mastodon_admin import (
@@ -18,7 +20,8 @@ from core.mastodon_admin import (
     MastodonAPIError,
     validate_domain,
 )
-from models import ModerationAlert, ModerationWatch, Setting, db
+from core.moderation_log import KIND_FILTERS, MODERATION_ACTION_PREFIXES, moderation_log_filter
+from models import AuditLog, ModerationAlert, ModerationWatch, Setting, User, db
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +125,13 @@ def _get_moderation_settings():
     }
 
 
-@bp.route("/")
-def index():
+def _page_context():
+    """Context shared by every page rendering ``templates/moderation.html``.
+
+    Centralised so a field added for one tab (e.g. the activity log) can never
+    be silently missing from another -- ``index()`` and ``log()`` both start
+    from this and only add what's specific to their own tab.
+    """
     settings = _get_moderation_settings()
 
     # Prefer the transient in-memory result from the most recent run: it carries
@@ -143,21 +151,145 @@ def index():
         get_welcome_settings,
     )
 
+    return {
+        "settings": settings,
+        "last_result": last_result,
+        "job": _moderation_job,
+        "can_configure": current_user.is_admin,
+        "watch_settings": get_watch_settings(),
+        "welcome_settings": get_welcome_settings(),
+        "report_notice_settings": get_report_notice_settings(),
+        "status_limit": get_status_limit(),
+        "token_account": _get_token_account(),
+        "can_moderate_staff": current_user.can_moderate_staff,
+    }
+
+
+@bp.route("/")
+def index():
+    if request.args.get("tab") == "log":
+        return redirect(url_for("moderation.log"))
+
     active_tab = "mastodon" if request.args.get("tab") == "mastodon" else "peertube"
-    return render_template(
-        "moderation.html",
-        settings=settings,
-        last_result=last_result,
-        job=_moderation_job,
-        active_tab=active_tab,
-        can_configure=current_user.is_admin,
-        watch_settings=get_watch_settings(),
-        welcome_settings=get_welcome_settings(),
-        report_notice_settings=get_report_notice_settings(),
-        status_limit=get_status_limit(),
-        token_account=_get_token_account(),
-        can_moderate_staff=current_user.can_moderate_staff,
+    context = _page_context()
+    context["active_tab"] = active_tab
+    return render_template("moderation.html", **context)
+
+
+# ---------------------------------------------------------------------------
+# Activity log: a moderator-facing view over the AuditLog rows that MCAT's
+# moderation surface already writes (see core/moderation_log.py for exactly
+# which rows qualify). Unlike the Security page's audit tab, this is scoped
+# to can_moderate rather than can_manage_users.
+# ---------------------------------------------------------------------------
+
+# Detail keys that must never be rendered, even though ``details`` JSON is
+# otherwise app-controlled (never user-supplied) -- belt-and-suspenders so a
+# future call site that starts stashing something sensitive in ``details``
+# doesn't silently leak it onto a page every moderator can see.
+_SENSITIVE_DETAIL_KEYS = frozenset({"password", "token", "email"})
+
+_TRAILING_DIGITS_RE = re.compile(r"(\d+)\s*$")
+
+
+def _humanize_action(action):
+    """``mastodon_account_suspend`` -> ``account suspend``."""
+    for prefix in MODERATION_ACTION_PREFIXES:
+        if action.startswith(prefix):
+            return action[len(prefix):].replace("_", " ")
+    return action.replace("_", " ")
+
+
+def _resource_admin_link(row, mastodon_api_url):
+    """Return a link into the Mastodon web admin for a report/account row, or None."""
+    if not mastodon_api_url:
+        return None
+    details = row.details if isinstance(row.details, dict) else {}
+    if row.resource_type == "mastodon_report":
+        report_id = details.get("report_id")
+        if not report_id and row.resource_name:
+            m = _TRAILING_DIGITS_RE.search(row.resource_name)
+            if m:
+                report_id = m.group(1)
+        if report_id:
+            return f"{mastodon_api_url}/admin/reports/{report_id}"
+    elif row.resource_type == "mastodon_account":
+        account_id = details.get("account_id")
+        if account_id:
+            return f"{mastodon_api_url}/admin/accounts/{account_id}"
+    return None
+
+
+def _moderation_log_query(q=None, actor=None, kind=None):
+    """Return a SQLAlchemy query over moderation-related AuditLog rows, newest first."""
+    query = AuditLog.query.filter(moderation_log_filter())
+
+    if kind in KIND_FILTERS:
+        patterns = KIND_FILTERS[kind]
+        query = query.filter(or_(*(AuditLog.action.like(p) for p in patterns)))
+
+    if q:
+        q = q.strip()[:100]
+        if q:
+            like = f"%{q}%"
+            query = query.filter(or_(AuditLog.resource_name.ilike(like), AuditLog.action.ilike(like)))
+
+    if actor:
+        actor = actor.strip()
+        if actor.lower() == "system":
+            query = query.filter(AuditLog.user_id.is_(None))
+        elif actor:
+            query = query.join(User, AuditLog.user_id == User.id).filter(User.username == actor)
+
+    return query.order_by(AuditLog.timestamp.desc())
+
+
+@bp.route("/log")
+def log():
+    page = request.args.get("page", 1, type=int) or 1
+    if page < 1:
+        page = 1
+    q = (request.args.get("q", "") or "").strip()[:100]
+    actor = (request.args.get("actor", "") or "").strip()
+    kind = (request.args.get("kind", "") or "").strip()
+    if kind not in KIND_FILTERS:
+        kind = ""
+
+    log_pagination = _moderation_log_query(q=q or None, actor=actor or None, kind=kind or None).paginate(
+        page=page, per_page=50, error_out=False
     )
+
+    row_details = []
+    for row in log_pagination.items:
+        details = row.details if isinstance(row.details, dict) else {}
+        badges = {k: v for k, v in details.items() if v is not None and k not in _SENSITIVE_DETAIL_KEYS}
+        row_details.append({
+            "badges": badges,
+            "label": _humanize_action(row.action),
+            "link": _resource_admin_link(row, Setting.get("moderation_mastodon_api_url", "")),
+        })
+
+    actor_rows = (
+        db.session.query(User.username)
+        .join(AuditLog, AuditLog.user_id == User.id)
+        .filter(moderation_log_filter())
+        .distinct()
+        .order_by(User.username)
+        .limit(50)
+        .all()
+    )
+    log_actors = ["system"] + [u for (u,) in actor_rows]
+
+    context = _page_context()
+    context.update(
+        active_tab="log",
+        log_pagination=log_pagination,
+        log_filters={"q": q, "actor": actor, "kind": kind},
+        log_actors=log_actors,
+        row_details=row_details,
+        show_ip=current_user.is_admin,
+    )
+    return render_template("moderation.html", **context)
 
 
 @bp.route("/save", methods=["POST"])
@@ -1130,6 +1262,13 @@ def mastodon_watch_save():
         flash(f"Poll interval {error}", "error")
         return redirect(url_for("moderation.index", tab="mastodon"))
 
+    log_retention_days, error = parse_interval(
+        "moderation_log_retention_days", request.form.get("log_retention_days", "365")
+    )
+    if error:
+        flash(f"Activity log retention {error}", "error")
+        return redirect(url_for("moderation.index", tab="mastodon"))
+
     def _clamp(name, default, low, high):
         raw = request.form.get(name, str(default))
         try:
@@ -1150,6 +1289,7 @@ def mastodon_watch_save():
     Setting.set("moderation_watch_silent_login_days", str(silent_login_days))
     Setting.set("moderation_watch_silent_min_age_days", str(silent_min_age_days))
     Setting.set("moderation_watch_silent_scan_window_days", str(silent_scan_window_days))
+    Setting.set("moderation_log_retention_days", str(log_retention_days))
 
     log_action("moderation_watch_config_save", "moderation")
     db.session.commit()

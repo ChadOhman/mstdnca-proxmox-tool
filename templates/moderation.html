@@ -6,9 +6,9 @@
 
 <ul class="nav nav-pills mb-4" role="tablist">
     <li class="nav-item" role="presentation">
-        <button class="nav-link{% if active_tab != 'mastodon' %} active{% endif %}" id="peertube-tab" data-bs-toggle="pill"
+        <button class="nav-link{% if active_tab not in ('mastodon', 'log') %} active{% endif %}" id="peertube-tab" data-bs-toggle="pill"
                 data-bs-target="#peertube-pane" type="button" role="tab"
-                aria-controls="peertube-pane" aria-selected="{{ 'false' if active_tab == 'mastodon' else 'true' }}">
+                aria-controls="peertube-pane" aria-selected="{{ 'true' if active_tab not in ('mastodon', 'log') else 'false' }}">
             <i class="bi bi-play-btn"></i> PeerTube
         </button>
     </li>
@@ -19,11 +19,18 @@
             <i class="bi bi-mastodon"></i> Mastodon
         </button>
     </li>
+    <li class="nav-item" role="presentation">
+        <a class="nav-link{% if active_tab == 'log' %} active{% endif %}" id="log-tab"
+           href="{{ url_for('moderation.log') }}" role="tab"
+           aria-controls="log-pane" aria-selected="{{ 'true' if active_tab == 'log' else 'false' }}">
+            <i class="bi bi-journal-text"></i> Activity log
+        </a>
+    </li>
 </ul>
 
 <div class="tab-content">
     <!-- PeerTube Moderation -->
-    <div class="tab-pane fade{% if active_tab != 'mastodon' %} show active{% endif %}" id="peertube-pane" role="tabpanel" aria-labelledby="peertube-tab">
+    <div class="tab-pane fade{% if active_tab not in ('mastodon', 'log') %} show active{% endif %}" id="peertube-pane" role="tabpanel" aria-labelledby="peertube-tab">
         <div class="row g-4">
             <!-- Configuration -->
             <div class="col-lg-6">
@@ -408,6 +415,12 @@
                                    value="{{ watch_settings.silent_scan_window_days }}" min="7" max="365">
                             <div class="form-text">How far back the silent-login scan looks for candidate accounts.</div>
                         </div>
+                        <div class="col-md-4">
+                            <label class="form-label" for="watch_log_retention_days">Activity log retention (days)</label>
+                            <input type="number" class="form-control" id="watch_log_retention_days" name="log_retention_days"
+                                   value="{{ watch_settings.log_retention_days }}" min="30" max="3650">
+                            <div class="form-text">How long moderation activity log entries are kept before nightly purge.</div>
+                        </div>
                     </div>
                     <button type="submit" class="btn btn-primary mt-3">
                         <i class="bi bi-check-lg"></i> Save Watch Settings
@@ -553,6 +566,17 @@
                 <div id="masto-domains-body" class="small text-muted">Not loaded.</div>
             </div>
         </div>
+    </div>
+
+    <!-- Activity log -->
+    <div class="tab-pane fade{% if active_tab == 'log' %} show active{% endif %}" id="log-pane" role="tabpanel" aria-labelledby="log-tab">
+        {% if log_pagination is defined %}
+            {% include "moderation_log.html" %}
+        {% else %}
+            <div class="text-muted small">
+                Loading&hellip; <a href="{{ url_for('moderation.log') }}">view the activity log</a>
+            </div>
+        {% endif %}
     </div>
 </div>
 

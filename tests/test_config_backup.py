@@ -438,6 +438,30 @@ class TestImportAuthCriticalBlocklist:
         with app.app_context():
             assert Setting.get("moderation_watch_poll_minutes") == "5"
 
+    def test_moderation_log_retention_days_out_of_range_is_skipped(self, app, auth_client):
+        """moderation_log_retention_days (bounds 30-3650) must be bounds-checked
+        on import like every other interval setting, not trusted verbatim."""
+        with app.app_context():
+            before = Setting.get("moderation_log_retention_days")
+        doc = {
+            "version": 1, "hosts": [], "tags": [], "guests": [], "roles": [],
+            "settings": {"moderation_log_retention_days": "1"},  # below the 30-day floor
+        }
+        resp = self._upload(auth_client, doc)
+        assert resp.status_code == 200
+        with app.app_context():
+            assert Setting.get("moderation_log_retention_days") == before
+
+    def test_moderation_log_retention_days_valid_value_is_imported(self, app, auth_client):
+        doc = {
+            "version": 1, "hosts": [], "tags": [], "guests": [], "roles": [],
+            "settings": {"moderation_log_retention_days": "180"},
+        }
+        resp = self._upload(auth_client, doc)
+        assert resp.status_code == 200
+        with app.app_context():
+            assert Setting.get("moderation_log_retention_days") == "180"
+
 
 class TestImportRolesOptIn:
     """GHSA-8mgh-j8r7-7rf2 finding 2: role permissions must not change unless

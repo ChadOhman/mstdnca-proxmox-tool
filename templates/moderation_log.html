@@ -1,0 +1,119 @@
+{# Moderation activity log pane -- only rendered by routes.moderation.log(),
+   which supplies log_pagination, log_filters, log_actors, row_details, show_ip. #}
+<div class="card bg-dark">
+    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <h5 class="mb-0"><i class="bi bi-journal-text"></i> Moderation Activity Log</h5>
+        <small class="text-muted">50 per page</small>
+    </div>
+    <div class="card-body">
+        <div class="btn-group btn-group-sm flex-wrap mb-3" role="group" aria-label="Filter by kind">
+            {% set kind_labels = [
+                ('', 'All'), ('accounts', 'Accounts'), ('reports', 'Reports'),
+                ('watch', 'Watch & welcome'), ('domains', 'Domain blocks'),
+                ('peertube', 'PeerTube'), ('config', 'Config'),
+            ] %}
+            {% for value, label in kind_labels %}
+            <a class="btn btn-outline-info{% if log_filters.kind == value %} active{% endif %}"
+               href="{{ url_for('moderation.log', kind=value, q=log_filters.q, actor=log_filters.actor) }}">{{ label }}</a>
+            {% endfor %}
+        </div>
+
+        <form method="get" action="{{ url_for('moderation.log') }}" class="mb-3">
+            <input type="hidden" name="kind" value="{{ log_filters.kind }}">
+            <div class="d-flex flex-wrap gap-3 align-items-end">
+                <div>
+                    <label class="form-label small mb-1" for="log-q-input">Search</label>
+                    <input type="text" class="form-control form-control-sm" id="log-q-input" name="q"
+                           value="{{ log_filters.q }}" placeholder="Action or resource name" maxlength="100">
+                </div>
+                <div>
+                    <label class="form-label small mb-1" for="log-actor-select">Actor</label>
+                    <select class="form-select form-select-sm" id="log-actor-select" name="actor">
+                        <option value=""{{ ' selected' if not log_filters.actor }}>All actors</option>
+                        {% for a in log_actors %}
+                        <option value="{{ a }}"{{ ' selected' if log_filters.actor == a }}>{{ a }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <button type="submit" class="btn btn-sm btn-primary">Apply</button>
+                    <a href="{{ url_for('moderation.log') }}" class="btn btn-sm btn-outline-secondary">Clear</a>
+                </div>
+            </div>
+        </form>
+
+        {% if log_pagination and log_pagination.items %}
+        <div class="table-responsive">
+            <table class="table table-dark table-sm table-hover mb-0" aria-label="Moderation activity log">
+                <thead>
+                    <tr>
+                        <th scope="col">When</th>
+                        <th scope="col">Actor</th>
+                        <th scope="col">Action</th>
+                        <th scope="col">Resource</th>
+                        <th scope="col">Details</th>
+                        {% if show_ip %}<th scope="col">IP</th>{% endif %}
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in log_pagination.items %}
+                    {% set rd = row_details[loop.index0] %}
+                    <tr>
+                        <td><small class="text-muted">{{ row.timestamp | local_dt('%Y-%m-%d %H:%M') }}</small></td>
+                        <td><small>{{ (row.user.display_name or row.user.username) if row.user else 'system' }}</small></td>
+                        <td><small title="{{ row.action }}">{{ rd.label }}</small></td>
+                        <td>
+                            <small>
+                            {% if rd.link %}
+                            <a href="{{ rd.link }}" target="_blank" rel="noopener noreferrer" class="text-info text-decoration-none">{{ row.resource_name or row.resource_type }}</a>
+                            {% else %}
+                            {{ row.resource_name or row.resource_type }}
+                            {% endif %}
+                            </small>
+                        </td>
+                        <td>
+                            {% for k, v in rd.badges.items() %}
+                            <span class="badge bg-secondary bg-opacity-25 text-light border border-secondary me-1">{{ k }}: {{ v }}</span>
+                            {% endfor %}
+                        </td>
+                        {% if show_ip %}<td><small class="text-muted">{{ row.ip_address or '' }}</small></td>{% endif %}
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% if log_pagination.pages > 1 %}
+        <div class="d-flex justify-content-center py-3">
+            <nav>
+                <ul class="pagination pagination-sm mb-0">
+                    {% if log_pagination.has_prev %}
+                    <li class="page-item">
+                        <a class="page-link bg-dark text-light border-secondary"
+                           href="{{ url_for('moderation.log', page=log_pagination.prev_num, q=log_filters.q, actor=log_filters.actor, kind=log_filters.kind) }}">&laquo;</a>
+                    </li>
+                    {% endif %}
+                    {% for p in log_pagination.iter_pages(left_edge=1, right_edge=1, left_current=2, right_current=2) %}
+                        {% if p %}
+                        <li class="page-item {% if p == log_pagination.page %}active{% endif %}">
+                            <a class="page-link bg-dark border-secondary {% if p == log_pagination.page %}text-white{% else %}text-light{% endif %}"
+                               href="{{ url_for('moderation.log', page=p, q=log_filters.q, actor=log_filters.actor, kind=log_filters.kind) }}">{{ p }}</a>
+                        </li>
+                        {% else %}
+                        <li class="page-item disabled"><span class="page-link bg-dark text-muted border-secondary">&hellip;</span></li>
+                        {% endif %}
+                    {% endfor %}
+                    {% if log_pagination.has_next %}
+                    <li class="page-item">
+                        <a class="page-link bg-dark text-light border-secondary"
+                           href="{{ url_for('moderation.log', page=log_pagination.next_num, q=log_filters.q, actor=log_filters.actor, kind=log_filters.kind) }}">&raquo;</a>
+                    </li>
+                    {% endif %}
+                </ul>
+            </nav>
+        </div>
+        {% endif %}
+        {% else %}
+        <div class="text-center text-muted py-4">No moderation activity recorded yet.</div>
+        {% endif %}
+    </div>
+</div>

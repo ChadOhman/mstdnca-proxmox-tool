@@ -813,12 +813,36 @@ def _make_model_with_comparable_timestamp(delete_return=0):
     return mock_model
 
 
+def _make_auditlog_stub(delete_return=0):
+    """A stand-in for the AuditLog model whose .action/.resource_type/.timestamp
+    are real SQLAlchemy column expressions (via ``sqlalchemy.column``), not plain
+    MagicMock attributes.
+
+    ``_purge_old_audit_logs`` now builds its moderation/general split via
+    ``core.moderation_log.moderation_log_filter()``, which calls real
+    ``sqlalchemy.or_()``/``not_()`` on ``AuditLog.action`` and
+    ``AuditLog.resource_type``. Those raise ``ArgumentError`` when given plain
+    MagicMock objects (they don't quack like SQL clause elements), so a fully
+    generic MagicMock model -- fine for the single-column ``.timestamp <
+    cutoff`` filters used elsewhere in this file -- doesn't work here. The
+    ``.query``/``.delete()`` chain itself stays mocked; no real DB is touched.
+    """
+    from sqlalchemy import column
+
+    stub = MagicMock()
+    stub.action = column("action")
+    stub.resource_type = column("resource_type")
+    stub.timestamp = column("timestamp")
+    stub.query.filter.return_value.delete.return_value = delete_return
+    return stub
+
+
 class TestPurgeOldAuditLogs:
     def test_delete_is_called_and_session_committed(self):
         from core.scheduler import _purge_old_audit_logs
 
         app = _make_app()
-        mock_audit_log = _make_model_with_comparable_timestamp(delete_return=5)
+        mock_audit_log = _make_auditlog_stub(delete_return=5)
         mock_db = MagicMock()
 
         mocks = {
@@ -833,7 +857,7 @@ class TestPurgeOldAuditLogs:
         from core.scheduler import _purge_old_audit_logs
 
         app = _make_app()
-        mock_audit_log = _make_model_with_comparable_timestamp(delete_return=0)
+        mock_audit_log = _make_auditlog_stub(delete_return=0)
         mock_db = MagicMock()
 
         mocks = {
@@ -842,6 +866,27 @@ class TestPurgeOldAuditLogs:
         with _SysModulesPatch(mocks):
             _purge_old_audit_logs(app)
 
+        mock_db.session.commit.assert_called_once()
+
+    def test_splits_moderation_and_general_rows_with_separate_cutoffs(self):
+        """The purge now issues two deletes: moderation-tagged rows against the
+        configurable moderation_log_retention_days cutoff, and everything else
+        against the fixed 90-day cutoff. Both must run and both must commit."""
+        from core.scheduler import _purge_old_audit_logs
+
+        app = _make_app()
+        mock_audit_log = _make_auditlog_stub(delete_return=3)
+        mock_db = MagicMock()
+        mock_setting = MagicMock()
+        mock_setting.get.return_value = "180"
+
+        mocks = {
+            "models": MagicMock(db=mock_db, AuditLog=mock_audit_log, Setting=mock_setting),
+        }
+        with _SysModulesPatch(mocks):
+            _purge_old_audit_logs(app)
+
+        assert mock_audit_log.query.filter.call_count == 2
         mock_db.session.commit.assert_called_once()
 
 
@@ -2188,6 +2233,10 @@ class TestIntervalValidation:
         from core.scheduler import parse_interval
         assert parse_interval("scan_interval", "12") == (12, None)
         assert parse_interval("scan_interval", " 6 ") == (6, None)
+
+    def test_moderation_log_retention_days_bounds_registered(self):
+        from core.scheduler import INTERVAL_BOUNDS
+        assert INTERVAL_BOUNDS["moderation_log_retention_days"] == (30, 3650, 365)
 
     @pytest.mark.parametrize("bad", ["0", "-1", "6h", "", None, "99999", "1.5"])
     def test_parse_interval_rejects_bad_values(self, bad):

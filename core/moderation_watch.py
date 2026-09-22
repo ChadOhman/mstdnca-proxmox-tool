@@ -79,6 +79,7 @@ def _parse_int(raw, default, low=None, high=None):
 
 def get_watch_settings():
     """Read and clamp all moderation-watch settings into a plain dict."""
+    from core.scheduler import interval_setting
     from models import Setting
 
     return {
@@ -113,6 +114,7 @@ def get_watch_settings():
             ),
             90, low=1,
         ),
+        "log_retention_days": interval_setting("moderation_log_retention_days"),
     }
 
 
