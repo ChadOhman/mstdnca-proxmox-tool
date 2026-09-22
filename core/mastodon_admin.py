@@ -88,9 +88,16 @@ _LINK_NEXT_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
 # Maximum characters of a reported status kept in the summary sent to the UI.
 _STATUS_EXCERPT_LEN = 300
 
-# Mastodon's hard status-length cap. The welcome bot posts a single direct
-# message, so this doubles as the budget ``render_welcome`` enforces.
+# Mastodon's default hard status-length cap, used until a live instance value
+# is known (see ``_MastodonClientBase.max_status_chars``) and as the fallback
+# when the instance doesn't tell us. The welcome bot and report-notice DMs
+# both post a single direct message, so this doubles as their default budget.
 MAX_STATUS_CHARS = 500
+# Sane bounds ``max_status_chars`` clamps a live instance's answer to, so a
+# misbehaving or misconfigured instance can't hand us a budget of 0 (every
+# template fails) or something absurd (no protection against a giant DM).
+MIN_STATUS_CHARS = 100
+MAX_STATUS_CHARS_CEILING = 25000
 # Template variables ``render_welcome``/``validate_welcome_template`` accept.
 WELCOME_TEMPLATE_VARS = ("username", "display_name", "acct")
 DEFAULT_WELCOME_TEMPLATE = (
@@ -99,6 +106,13 @@ DEFAULT_WELCOME_TEMPLATE = (
     "also follow a hashtag to track a topic. Check out the About page for "
     "our house rules, and consider adding a bio and an avatar so people know "
     "you're a real person."
+)
+# Template variables ``render_report_notice``/``validate_report_notice_template`` accept.
+REPORT_NOTICE_TEMPLATE_VARS = ("username", "display_name", "acct", "report_id")
+DEFAULT_REPORT_NOTICE_TEMPLATE = (
+    "Thanks for report #{report_id}. Moderators reviewed it and took the action "
+    "they felt was appropriate. We don't share details of actions taken on other "
+    "accounts, so please keep reporting anything that concerns you."
 )
 
 
@@ -166,6 +180,35 @@ def strip_html(text):
         return ""
     text = _TAG_RE.sub(" ", text)
     return " ".join(unescape(text).split())
+
+
+def _extract_v2_max_chars(data):
+    """Pull ``configuration.statuses.max_characters`` out of a v2 instance payload.
+
+    Returns ``None`` (never raises) if the payload isn't shaped as expected.
+    """
+    if not isinstance(data, dict):
+        return None
+    configuration = data.get("configuration")
+    if not isinstance(configuration, dict):
+        return None
+    statuses = configuration.get("statuses")
+    if not isinstance(statuses, dict):
+        return None
+    try:
+        return int(statuses.get("max_characters"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_v1_max_chars(data):
+    """Pull ``max_toot_chars`` out of a v1 instance payload. Returns ``None`` (never raises)."""
+    if not isinstance(data, dict):
+        return None
+    try:
+        return int(data.get("max_toot_chars"))
+    except (TypeError, ValueError):
+        return None
 
 
 class _MastodonClientBase:
@@ -264,6 +307,45 @@ class _MastodonClientBase:
         for page in self._iter_pages(path, params=params, max_pages=max_pages):
             items.extend(page)
         return items
+
+    # ------------------------------------------------------------------ instance metadata
+
+    def max_status_chars(self) -> int:
+        """Ask the live instance how long a status may be, clamped to a sane range.
+
+        Tries ``GET /api/v2/instance`` (``configuration.statuses.max_characters``)
+        first; if that 404s or doesn't carry a usable number, falls back to
+        ``GET /api/v1/instance`` (``max_toot_chars``). A bad or missing payload
+        from either endpoint never raises -- it's treated the same as "this
+        instance didn't tell us" and yields :data:`MAX_STATUS_CHARS`. This only
+        raises :class:`MastodonAPIError` when *both* requests fail for a reason
+        other than 404, so callers can still tell a genuine connectivity/auth
+        problem apart from an instance that simply doesn't expose the field.
+        """
+        value = None
+        v2_error = None
+        try:
+            data, _ = self._request("GET", "/api/v2/instance")
+            value = _extract_v2_max_chars(data)
+        except MastodonAPIError as exc:
+            v2_error = exc
+
+        if value is None:
+            v1_error = None
+            try:
+                data, _ = self._request("GET", "/api/v1/instance")
+                value = _extract_v1_max_chars(data)
+            except MastodonAPIError as exc:
+                v1_error = exc
+
+            if value is None:
+                v2_hard_fail = v2_error is not None and v2_error.http_status != 404
+                v1_hard_fail = v1_error is not None and v1_error.http_status != 404
+                if v2_hard_fail and v1_hard_fail:
+                    raise v1_error
+                return MAX_STATUS_CHARS
+
+        return max(MIN_STATUS_CHARS, min(MAX_STATUS_CHARS_CEILING, value))
 
     # ------------------------------------------------------------------ rate limiting
 
@@ -488,48 +570,152 @@ class _SafeDict(dict):
         return "{" + key + "}"
 
 
-def render_welcome(template, account):
-    """Render a welcome-message template for ``account`` and prefix the mention.
+def render_body(template, variables):
+    """Render ``template`` against ``variables``, leaving unknown ``{key}`` placeholders literal.
+
+    Shared by every templated-DM feature (welcome messages, report notices):
+    just the ``str.format_map`` + strip, with no ``@mention`` prefix or
+    length enforcement -- see :func:`compose_direct` for that.
+    """
+    return template.format_map(_SafeDict(variables)).strip()
+
+
+def _account_vars(account):
+    """Extract the ``{username, display_name, acct}`` template vars from an account dict.
 
     ``account`` is one of the account dicts carried by
-    ``moderation_watch._discover_new_accounts`` (has ``username``,
-    ``display_name``, ``acct``). Raises ``ValueError`` if the rendered
-    message would exceed Mastodon's status length limit.
+    ``moderation_watch._discover_new_accounts`` (or a report's reporter
+    account): has ``username`` and, usually, ``display_name``/``acct``.
+    Both fall back to ``username`` when absent or empty.
     """
     username = account["username"]
     display_name = account.get("display_name") or username
     acct = account.get("acct") or username
-    rendered = template.format_map(_SafeDict(username=username, display_name=display_name, acct=acct))
-    text = f"@{account['username']} " + rendered.strip()
-    if len(text) > MAX_STATUS_CHARS:
-        raise ValueError(f"Welcome message would be {len(text)} characters; Mastodon allows {MAX_STATUS_CHARS}")
+    return {"username": username, "display_name": display_name, "acct": acct}
+
+
+def compose_direct(mention, body, *, label, max_chars=MAX_STATUS_CHARS):
+    """Prefix ``body`` with ``@mention`` and enforce the status-length budget.
+
+    Raises ``ValueError`` (message safe to show the user) if the composed
+    text would exceed ``max_chars``.
+    """
+    text = f"@{mention} {body}"
+    if len(text) > max_chars:
+        raise ValueError(f"{label} would be {len(text)} characters; this instance allows {max_chars}")
     return text
 
 
-def validate_welcome_template(template):
+def render_welcome(template, account, max_chars=MAX_STATUS_CHARS):
+    """Render a welcome-message template for ``account`` and prefix the mention.
+
+    Raises ``ValueError`` if the rendered message would exceed the status
+    length budget (``max_chars``, the live instance's limit when known --
+    see ``moderation_watch.get_status_limit`` -- else Mastodon's default).
+    """
+    variables = _account_vars(account)
+    body = render_body(template, variables)
+    return compose_direct(variables["username"], body, label="Welcome message", max_chars=max_chars)
+
+
+def validate_welcome_template(template, max_chars=MAX_STATUS_CHARS):
     """Return an error message for a bad welcome template, or ``None`` if it's usable.
 
     Renders against a worst-case sample account (30-char username/display
     name) so a template that only goes over budget for long names is still
     caught before it's saved.
     """
-    if not template or not template.strip():
-        return "Welcome message template cannot be empty"
     sample = {
         "username": "a" * 30,
         "display_name": "a" * 30,
         "acct": "a" * 30,
     }
+    return _validate_mention_template(
+        template,
+        lambda t: render_welcome(t, sample, max_chars=max_chars),
+        empty_msg="Welcome message template cannot be empty",
+        placeholder_msg=(
+            "Welcome message template has an invalid placeholder "
+            "(only {username}, {display_name} and {acct} are supported)"
+        ),
+    )
+
+
+def render_report_notice_body(template, account, report_id):
+    """Render a report-notice template for ``account``/``report_id``. No ``@mention`` prefix.
+
+    ``account`` is the reporter's account dict (has ``username`` and,
+    usually, ``display_name``/``acct``); ``report_id`` is substituted as-is
+    (stringified).
+    """
+    variables = _account_vars(account)
+    variables["report_id"] = str(report_id)
+    return render_body(template, variables)
+
+
+def report_notice_mention(account):
+    """The ``@``-mention a report notice should be addressed to (the reporter's ``acct``).
+
+    Using ``acct`` rather than ``username`` matters here: the reporter may be
+    on a different instance, and only ``acct`` (``user@domain``) reaches them.
+    """
+    return "@" + (account.get("acct") or account.get("username") or "")
+
+
+def render_report_notice(template, account, report_id, max_chars=MAX_STATUS_CHARS):
+    """Render a full report-notice DM (``@mention`` + body), enforcing the status-length budget.
+
+    Mentions ``account["acct"]`` directly (not the ``username``-falls-back-to
+    logic ``_account_vars`` applies to the body) so a remote reporter is
+    actually reachable -- mentioning by local ``username`` alone would resolve
+    to the wrong (or no) account off-instance.
+    """
+    body = render_report_notice_body(template, account, report_id)
+    return compose_direct(account["acct"], body, label="Report notice", max_chars=max_chars)
+
+
+def _validate_mention_template(template, render, *, placeholder_msg, empty_msg="Template cannot be empty"):
+    """Shared validation plumbing for ``validate_welcome_template``/``validate_report_notice_template``.
+
+    ``render(template)`` is called against a worst-case sample; its
+    ``ValueError`` (over budget) is passed through as the error text, an
+    unresolvable placeholder (``KeyError``/``IndexError``, e.g. a positional
+    ``{0}``) is reported as ``placeholder_msg``, and anything else means the
+    template is fine (``None``).
+    """
+    if not template or not template.strip():
+        return empty_msg
     try:
-        render_welcome(template, sample)
+        render(template)
     except ValueError as exc:
         return str(exc)
     except (KeyError, IndexError):
-        return (
-            "Welcome message template has an invalid placeholder "
-            "(only {username}, {display_name} and {acct} are supported)"
-        )
+        return placeholder_msg
     return None
+
+
+def validate_report_notice_template(template, max_chars=MAX_STATUS_CHARS):
+    """Return an error message for a bad report-notice template, or ``None`` if it's usable.
+
+    Renders against a worst-case sample: 30-char username/display name, a
+    71-char ``acct`` (so a long remote handle is accounted for), and a
+    20-digit report id.
+    """
+    sample = {
+        "username": "a" * 30,
+        "display_name": "a" * 30,
+        "acct": ("a" * 30) + "@" + ("b" * 40),
+    }
+    report_id = "1" * 20
+    return _validate_mention_template(
+        template,
+        lambda t: render_report_notice(t, sample, report_id, max_chars=max_chars),
+        empty_msg="Report notice template cannot be empty",
+        placeholder_msg=(
+            "Report notice template has an invalid placeholder "
+            "(only {username}, {display_name}, {acct} and {report_id} are supported)"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------- summaries

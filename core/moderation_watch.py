@@ -42,6 +42,14 @@ SILENT_SCAN_MIN_HOURS = 24
 # bootstrap-adjacent bug) can't turn into a wall of bot posts in one run.
 MAX_WELCOMES_PER_RUN = 20
 WELCOME_RENDER_ERROR = "Welcome message template is invalid or too long; fix it under Welcome message settings"
+REPORT_NOTICE_RENDER_ERROR = "Report notice template is invalid or too long; fix it under Reporter notice settings"
+
+# Settings the live-instance status-character-limit check reads/writes. Refreshed
+# at most once every 24h (see ``run_watch_poll``) so it costs one extra Admin API
+# call per day, not per poll.
+STATUS_LIMIT_SETTING = "moderation_mastodon_max_chars"
+STATUS_LIMIT_CHECKED_SETTING = "moderation_mastodon_max_chars_checked_at"
+STATUS_LIMIT_REFRESH_HOURS = 24
 
 # User-facing settings and their string defaults (see routes/settings.py for
 # the form that edits these). Job-only bookkeeping keys (cursor, last-run
@@ -122,6 +130,50 @@ def get_welcome_settings():
         "template": Setting.get("moderation_welcome_template", DEFAULT_WELCOME_TEMPLATE),
         "bot_configured": bool(Setting.get("moderation_bot_token", "")),
     }
+
+
+def get_status_limit():
+    """Return the cached live-instance status character limit, clamped to a sane range.
+
+    Backed by :data:`STATUS_LIMIT_SETTING`, written by :func:`refresh_status_limit`.
+    Falls back to ``core.mastodon_admin.MAX_STATUS_CHARS`` (Mastodon's historical
+    default) when the setting has never been populated or is unparseable.
+    """
+    from core.mastodon_admin import MAX_STATUS_CHARS, MAX_STATUS_CHARS_CEILING, MIN_STATUS_CHARS
+    from models import Setting
+
+    return _parse_int(
+        Setting.get(STATUS_LIMIT_SETTING, str(MAX_STATUS_CHARS)),
+        MAX_STATUS_CHARS,
+        low=MIN_STATUS_CHARS,
+        high=MAX_STATUS_CHARS_CEILING,
+    )
+
+
+def refresh_status_limit(client):
+    """Ask ``client`` for the live instance's status character limit and cache it.
+
+    Stores both :data:`STATUS_LIMIT_SETTING` (the value) and
+    :data:`STATUS_LIMIT_CHECKED_SETTING` (when we last asked) and returns the
+    value. On a :class:`~core.mastodon_admin.MastodonAPIError` (genuine
+    connectivity/auth failure -- ``client.max_status_chars()`` itself never
+    raises for a merely-missing field), logs a warning and returns the
+    previously cached value without touching either setting, so a transient
+    failure doesn't erase a good prior reading or reset the "last checked"
+    clock (the next poll will simply try again).
+    """
+    from core.mastodon_admin import MastodonAPIError
+    from models import Setting
+
+    try:
+        value = client.max_status_chars()
+    except MastodonAPIError:
+        logger.warning("Could not refresh the Mastodon status character limit", exc_info=True)
+        return get_status_limit()
+
+    Setting.set(STATUS_LIMIT_SETTING, str(value))
+    Setting.set(STATUS_LIMIT_CHECKED_SETTING, datetime.now(timezone.utc).isoformat())
+    return value
 
 
 def build_bot_client():
@@ -236,6 +288,23 @@ def welcome_record(account_id):
     return ModerationWelcome.query.filter_by(mastodon_account_id=str(account_id)).first()
 
 
+def get_report_notice_settings():
+    """Read the report-notice settings into a plain dict."""
+    from core.mastodon_admin import DEFAULT_REPORT_NOTICE_TEMPLATE
+    from models import Setting
+
+    return {
+        "template": Setting.get("moderation_report_notice_template", DEFAULT_REPORT_NOTICE_TEMPLATE),
+    }
+
+
+def report_notice_record(report_id):
+    """Return the :class:`ModerationReportNotice` row for ``report_id``, or ``None``."""
+    from models import ModerationReportNotice
+
+    return ModerationReportNotice.query.filter_by(report_id=str(report_id)).first()
+
+
 def send_welcome(bot_client, account, *, sent_by_user_id=None, force=False, template=None):
     """Send a welcome DM to ``account`` via ``bot_client``. Returns ``(record, error)``.
 
@@ -262,7 +331,7 @@ def send_welcome(bot_client, account, *, sent_by_user_id=None, force=False, temp
     template = template or Setting.get("moderation_welcome_template", DEFAULT_WELCOME_TEMPLATE)
 
     try:
-        text = render_welcome(template, account)
+        text = render_welcome(template, account, max_chars=get_status_limit())
     except (ValueError, KeyError, IndexError):
         # Our own render error (over budget) or a malformed template: keep the
         # exception text in the log, hand the caller a fixed message.
@@ -296,6 +365,100 @@ def send_welcome(bot_client, account, *, sent_by_user_id=None, force=False, temp
         "mastodon_account",
         resource_name=acct,
         details={"account_id": account_id, "status_id": status_id, "automatic": sent_by_user_id is None},
+        audience="moderators",
+    )
+    db.session.commit()
+    return record, None
+
+
+def send_report_notice(bot_client, report_id, reporter, *, text=None, sent_by_user_id=None, force=False):
+    """Send a "thanks for reporting" DM to a report's reporter. Returns ``(record, error)``.
+
+    Mirrors :func:`send_welcome`: refuses (``(None, "already notified")``) when
+    a :class:`ModerationReportNotice` row already exists for ``report_id`` and
+    ``force`` is not set. ``text``, when given, is a moderator's own edited
+    message -- used verbatim (just prefixed with the reporter's ``@mention``)
+    instead of rendering the configured template, and a too-long edit is
+    reported with its own fixed-format message rather than the template
+    renderer's exception text. ``reporter`` is the reporting account's dict
+    (has ``id``/``acct``, possibly on a remote instance); the mention always
+    uses ``acct`` so a remote reporter is actually reachable.
+    """
+    from core.mastodon_admin import (
+        DEFAULT_REPORT_NOTICE_TEMPLATE,
+        MastodonAPIError,
+        compose_direct,
+        render_report_notice_body,
+    )
+    from models import ModerationReportNotice, Setting, db
+
+    report_id = str(report_id)
+    reporter_account_id = str(reporter.get("id")) if reporter.get("id") is not None else None
+    reporter_acct = reporter.get("acct", "")
+    mention = reporter["acct"]
+
+    existing = report_notice_record(report_id)
+    if existing and not force:
+        return None, "already notified"
+
+    limit = get_status_limit()
+
+    if text is not None:
+        body = text.strip()
+        full = f"@{mention} {body}"
+        if len(full) > limit:
+            return None, f"Message would be {len(full)} characters; this instance allows {limit}"
+    else:
+        template = Setting.get("moderation_report_notice_template", DEFAULT_REPORT_NOTICE_TEMPLATE)
+        try:
+            body = render_report_notice_body(template, reporter, report_id)
+            full = compose_direct(mention, body, label="Report notice", max_chars=limit)
+        except (ValueError, KeyError, IndexError):
+            # Our own render error (over budget) or a malformed template: keep the
+            # exception text in the log, hand the caller a fixed message.
+            logger.warning("Report notice could not be rendered for report %s", report_id, exc_info=True)
+            return None, REPORT_NOTICE_RENDER_ERROR
+
+    idempotency_key = f"report-notice-{report_id}"
+    if force:
+        idempotency_key = f"{idempotency_key}-r{int(time.time())}"
+
+    try:
+        status = bot_client.post_direct(full, idempotency_key=idempotency_key)
+    except MastodonAPIError as exc:
+        db.session.rollback()
+        return None, exc.message
+
+    status_id = status.get("id")
+    if existing:
+        existing.sent_at = datetime.now(timezone.utc)
+        existing.sent_by_user_id = sent_by_user_id
+        existing.status_id = status_id
+        existing.reporter_account_id = reporter_account_id
+        existing.reporter_acct = reporter_acct
+        record = existing
+    else:
+        record = ModerationReportNotice(
+            report_id=report_id,
+            reporter_account_id=reporter_account_id,
+            reporter_acct=reporter_acct,
+            sent_by_user_id=sent_by_user_id,
+            status_id=status_id,
+        )
+        db.session.add(record)
+
+    log_action(
+        "mastodon_report_notice_send",
+        "mastodon_report",
+        resource_name=f"report {report_id}",
+        details={
+            "report_id": report_id,
+            "reporter_account_id": reporter_account_id,
+            "reporter_acct": reporter_acct,
+            "status_id": status_id,
+            "remote": "@" in reporter_acct,
+            "forced": force,
+        },
         audience="moderators",
     )
     db.session.commit()
@@ -525,6 +688,29 @@ def _scan_silent_logins(client, now, result, settings):
     Setting.set("moderation_watch_silent_last_scan_at", now.isoformat())
 
 
+def _maybe_refresh_status_limit(client, now, result):
+    """Refresh the cached live-instance status-length limit if it's stale.
+
+    At most once every :data:`STATUS_LIMIT_REFRESH_HOURS` hours, and only
+    when there's rate-limit budget to spare -- this is a "nice to have"
+    background check, never worth spending the rest of the poll's budget on.
+    Wrapped so it can never raise or otherwise fail the run: a broken
+    response here should never stop watches, signups or the silent-login
+    scan from running.
+    """
+    from models import Setting
+
+    try:
+        checked_raw = Setting.get(STATUS_LIMIT_CHECKED_SETTING)
+        checked_at = parse_iso(checked_raw) if checked_raw else None
+        stale = checked_at is None or (now - checked_at) >= timedelta(hours=STATUS_LIMIT_REFRESH_HOURS)
+        if not stale or not client.budget_ok(RATE_RESERVE):
+            return
+        result["status_limit"] = refresh_status_limit(client)
+    except Exception:
+        logger.exception("Failed to refresh the Mastodon status character limit")
+
+
 def run_watch_poll(client, *, bot_client=None, now=None, sleep=time.sleep, log=None):
     """Run one poll cycle: prune, check watches, discover signups, scan for silent logins.
 
@@ -556,6 +742,7 @@ def run_watch_poll(client, *, bot_client=None, now=None, sleep=time.sleep, log=N
         "errors": [],
         "rate_limit": None,
         "welcomed": 0,
+        "status_limit": None,
     }
 
     def _note_error(step, exc):
@@ -566,6 +753,8 @@ def run_watch_poll(client, *, bot_client=None, now=None, sleep=time.sleep, log=N
             result["backoff_until"] = (now + timedelta(seconds=retry_after)).isoformat()
             return True
         return False
+
+    _maybe_refresh_status_limit(client, now, result)
 
     aborted = False
 
@@ -623,6 +812,7 @@ def run_watch_poll(client, *, bot_client=None, now=None, sleep=time.sleep, log=N
         "errors": result["errors"],
         "rate_limit": result["rate_limit"],
         "welcomed": result.get("welcomed", 0),
+        "status_limit": result.get("status_limit"),
     }
     Setting.set("moderation_watch_last_run_at", now.isoformat())
     Setting.set("moderation_watch_last_run_result", json.dumps(persisted))

@@ -21,11 +21,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.mastodon_admin import (
+    DEFAULT_REPORT_NOTICE_TEMPLATE,
     DEFAULT_WELCOME_TEMPLATE,
     MAX_STATUS_CHARS,
     MastodonAPIError,
     MastodonBotClient,
+    render_report_notice,
+    render_report_notice_body,
     render_welcome,
+    validate_report_notice_template,
     validate_welcome_template,
 )
 
@@ -42,6 +46,9 @@ _WELCOME_SETTINGS_KEYS = [
     "moderation_welcome_template",
     "moderation_bot_token",
     "moderation_mastodon_api_url",
+    "moderation_mastodon_max_chars",
+    "moderation_mastodon_max_chars_checked_at",
+    "moderation_report_notice_template",
 ]
 
 
@@ -77,13 +84,14 @@ def _clean_welcome_state(app):
     """Reset every welcome/watch Setting and delete every relevant row after each test."""
     yield
     with app.app_context():
-        from models import ModerationAlert, ModerationWatch, ModerationWelcome, Setting, db
+        from models import ModerationAlert, ModerationReportNotice, ModerationWatch, ModerationWelcome, Setting, db
 
         for key in _WELCOME_SETTINGS_KEYS:
             row = Setting.query.filter_by(key=key).first()
             if row:
                 db.session.delete(row)
         ModerationWelcome.query.delete()
+        ModerationReportNotice.query.delete()
         ModerationAlert.query.delete()
         ModerationWatch.query.delete()
         db.session.commit()
@@ -102,12 +110,24 @@ def _account(account_id, *, username="newbie", display_name="Newbie", acct=None,
     }
 
 
+def _reporter(reporter_id, *, username="reporter", display_name=None, acct=None):
+    return {
+        "id": reporter_id,
+        "username": username,
+        "display_name": display_name or username.capitalize(),
+        "acct": acct or f"{username}@example.social",
+    }
+
+
 def _client(list_local_accounts=None):
     client = MagicMock()
     client.budget_ok.return_value = True
     client.rate_limit = None
     client.list_local_accounts.return_value = [] if list_local_accounts is None else list_local_accounts
     client.account_statuses.return_value = []
+    # A bare MagicMock() return value isn't JSON-serializable, and run_watch_poll
+    # always persists its result -- give the status-limit refresh step something real.
+    client.max_status_chars.return_value = 500
     return client
 
 
@@ -176,6 +196,79 @@ class TestValidateWelcomeTemplate:
     def test_default_template_validates(self):
         assert validate_welcome_template(DEFAULT_WELCOME_TEMPLATE) is None
         assert len(DEFAULT_WELCOME_TEMPLATE) <= MAX_STATUS_CHARS
+
+
+# ---------------------------------------------------------------------------
+# render_report_notice / validate_report_notice_template
+# ---------------------------------------------------------------------------
+
+
+class TestRenderReportNotice:
+    def test_substitutes_all_four_variables(self):
+        template = "Hi {username} aka {display_name} ({acct}), re report #{report_id}"
+        reporter = {"username": "bob", "display_name": "Bob B", "acct": "bob@example.social"}
+
+        result = render_report_notice(template, reporter, 42)
+
+        assert result == "@bob@example.social Hi bob aka Bob B (bob@example.social), re report #42"
+
+    def test_remote_acct_used_in_the_mention(self):
+        template = "Thanks for #{report_id}"
+        reporter = {"username": "carol", "display_name": "Carol", "acct": "carol@remote.example"}
+
+        result = render_report_notice(template, reporter, 7)
+
+        assert result.startswith("@carol@remote.example ")
+
+    def test_body_helper_has_no_mention(self):
+        template = "Hi {username}, re #{report_id}"
+        reporter = {"username": "dan", "display_name": "Dan", "acct": "dan@example.social"}
+
+        body = render_report_notice_body(template, reporter, 3)
+
+        assert body == "Hi dan, re #3"
+        assert "@" not in body
+
+    def test_raises_over_limit_with_report_notice_label(self):
+        template = "x" * 600
+        reporter = {"username": "eve", "display_name": "Eve", "acct": "eve@example.social"}
+
+        with pytest.raises(ValueError, match="Report notice"):
+            render_report_notice(template, reporter, 1)
+
+    def test_max_chars_override_accepts_a_long_body(self):
+        template = "y" * 1500 + " #{report_id}"
+        reporter = {"username": "fay", "display_name": "Fay", "acct": "fay@example.social"}
+
+        result = render_report_notice(template, reporter, 9, max_chars=5000)
+
+        assert len(result) < 5000
+
+
+class TestValidateReportNoticeTemplate:
+    def test_empty_is_an_error(self):
+        assert validate_report_notice_template("") is not None
+        assert validate_report_notice_template("   ") is not None
+
+    def test_unbalanced_brace_is_an_error(self):
+        assert validate_report_notice_template("Hi {username") is not None
+        assert validate_report_notice_template("Hi { there") is not None
+
+    def test_positional_field_is_an_error(self):
+        assert validate_report_notice_template("Hi {0}, thanks") is not None
+
+    def test_over_length_is_an_error(self):
+        assert validate_report_notice_template("x" * 600) is not None
+
+    def test_default_template_validates(self):
+        assert validate_report_notice_template(DEFAULT_REPORT_NOTICE_TEMPLATE) is None
+        assert len(DEFAULT_REPORT_NOTICE_TEMPLATE) <= 270
+
+    def test_max_chars_is_honoured(self):
+        template = "x" * 200 + " #{report_id}"
+
+        assert validate_report_notice_template(template) is None
+        assert validate_report_notice_template(template, max_chars=120) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +427,155 @@ class TestSendWelcome:
 
             assert err == WELCOME_RENDER_ERROR  # fixed text: never the exception message
             bot.post_direct.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# send_report_notice
+# ---------------------------------------------------------------------------
+
+
+class TestSendReportNotice:
+    def test_creates_record_and_audits(self, app):
+        import core.moderation_watch as mw
+
+        with app.app_context():
+            bot = _bot_client(post_status_id="3001")
+            reporter = _reporter("r1")
+
+            record, err = mw.send_report_notice(bot, "101", reporter)
+
+            assert err is None
+            assert record is not None
+            assert record.report_id == "101"
+            assert record.reporter_account_id == "r1"
+            assert record.reporter_acct == reporter["acct"]
+            assert record.status_id == "3001"
+            assert record.sent_by_user_id is None
+            bot.post_direct.assert_called_once()
+            _, kwargs = bot.post_direct.call_args
+            assert kwargs["idempotency_key"] == "report-notice-101"
+
+            mw.log_action.assert_called_once()
+            args, kwargs = mw.log_action.call_args
+            assert args[0] == "mastodon_report_notice_send"
+            assert kwargs.get("audience") == "moderators"
+            assert kwargs["details"]["report_id"] == "101"
+            assert kwargs["details"]["reporter_acct"] == reporter["acct"]
+            assert kwargs["details"]["forced"] is False
+
+    def test_second_call_already_notified_no_post(self, app):
+        from core.moderation_watch import send_report_notice
+        from models import ModerationReportNotice
+
+        with app.app_context():
+            bot = _bot_client()
+            reporter = _reporter("r2")
+
+            first, first_err = send_report_notice(bot, "102", reporter)
+            assert first_err is None
+
+            second, second_err = send_report_notice(bot, "102", reporter)
+
+            assert second is None
+            assert second_err == "already notified"
+            assert bot.post_direct.call_count == 1
+            assert ModerationReportNotice.query.filter_by(report_id="102").count() == 1
+
+    def test_force_reposts_with_new_idempotency_key_and_updates_record(self, app):
+        from core.moderation_watch import send_report_notice
+
+        with app.app_context():
+            bot = _bot_client(post_status_id="3001")
+            reporter = _reporter("r3")
+
+            first, _ = send_report_notice(bot, "103", reporter)
+            _, first_kwargs = bot.post_direct.call_args
+            first_key = first_kwargs["idempotency_key"]
+
+            bot.post_direct.return_value = {
+                "id": "3002", "url": "u", "created_at": "", "excerpt": "", "sensitive": False,
+                "media_count": 0, "visibility": "direct", "account_acct": None,
+            }
+            second, err = send_report_notice(bot, "103", reporter, force=True)
+
+            assert err is None
+            assert bot.post_direct.call_count == 2
+            _, second_kwargs = bot.post_direct.call_args
+            assert second_kwargs["idempotency_key"] != first_key
+            assert second.id == first.id
+            assert second.status_id == "3002"
+
+    def test_edited_text_used_verbatim_with_mention_prefixed(self, app):
+        from core.moderation_watch import send_report_notice
+
+        with app.app_context():
+            bot = _bot_client()
+            reporter = _reporter("r4", acct="r4@remote.example")
+
+            record, err = send_report_notice(bot, "104", reporter, text="Custom thank you message.")
+
+            assert err is None
+            args, _ = bot.post_direct.call_args
+            assert args[0] == "@r4@remote.example Custom thank you message."
+
+    def test_over_length_edited_text_posts_nothing_and_error_mentions_limit(self, app):
+        from core.moderation_watch import send_report_notice
+
+        with app.app_context():
+            bot = _bot_client()
+            reporter = _reporter("r5")
+
+            record, err = send_report_notice(bot, "105", reporter, text="x" * 600)
+
+            assert record is None
+            assert "Message would be" in err
+            assert str(MAX_STATUS_CHARS) in err
+            bot.post_direct.assert_not_called()
+
+    def test_api_error_leaves_no_row(self, app):
+        from core.moderation_watch import send_report_notice
+        from models import ModerationReportNotice
+
+        with app.app_context():
+            bot = _bot_client()
+            bot.post_direct.side_effect = MastodonAPIError("Text can't be blank")
+            reporter = _reporter("r6")
+
+            record, err = send_report_notice(bot, "106", reporter)
+
+            assert record is None
+            assert err == "Text can't be blank"
+            assert ModerationReportNotice.query.filter_by(report_id="106").count() == 0
+
+    def test_rendering_error_never_posts(self, app):
+        from core.moderation_watch import REPORT_NOTICE_RENDER_ERROR, send_report_notice
+        from models import Setting
+
+        with app.app_context():
+            Setting.set("moderation_report_notice_template", "x" * 600)
+            bot = _bot_client()
+            reporter = _reporter("r7")
+
+            record, err = send_report_notice(bot, "107", reporter)
+
+            assert record is None
+            assert err == REPORT_NOTICE_RENDER_ERROR  # fixed text: never the exception message
+            bot.post_direct.assert_not_called()
+
+    def test_stored_limit_of_5000_lets_a_long_text_through(self, app):
+        from core.moderation_watch import send_report_notice
+        from models import Setting
+
+        with app.app_context():
+            Setting.set("moderation_mastodon_max_chars", "5000")
+            bot = _bot_client()
+            reporter = _reporter("r8")
+
+            record, err = send_report_notice(bot, "108", reporter, text="y" * 1500)
+
+            assert err is None
+            assert record is not None
+            bot.post_direct.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
