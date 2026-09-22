@@ -44,6 +44,41 @@ ACCOUNT_LIFT_ACTIONS = ("enable", "unsilence", "unsuspend", "unsensitive")
 # Valid ``severity`` values for domain blocks.
 DOMAIN_BLOCK_SEVERITIES = ("silence", "suspend", "noop")
 
+# Mastodon UserRole::Flags: bit 16 is invite_users, the only permission the default
+# "everyone" role carries. Any other bit means the role is staff. Must match the
+# deployed Mastodon's app/models/user_role.rb; a wrong bit fails safe (over-refusal).
+_ROLE_INVITE_USERS_BIT = 1 << 16
+_LEGACY_STAFF_ROLE_NAMES = frozenset({"admin", "owner", "moderator"})
+
+
+def is_staff_role(role) -> bool:
+    """Decide whether an admin account's ``role`` field marks it as staff.
+
+    ``role`` can be the legacy plain-string role name (older Mastodon admin
+    API responses / synthetic test data) or the modern ``UserRole`` object
+    with ``name``/``permissions``. Falls back to a name check when
+    ``permissions`` is absent or unparseable. Anything unrecognized returns
+    False so we never refuse a target we can't positively identify as staff
+    -- but the permission bit is chosen to fail safe (over-refusal) when it
+    doesn't match reality.
+    """
+    if not role:
+        return False
+    if isinstance(role, str):
+        return role.strip().lower() in _LEGACY_STAFF_ROLE_NAMES
+    if isinstance(role, dict):
+        permissions = role.get("permissions")
+        if permissions is not None:
+            try:
+                perms = int(str(permissions))
+            except (TypeError, ValueError):
+                perms = None
+            if perms is not None:
+                return bool(perms & ~_ROLE_INVITE_USERS_BIT)
+        name = str(role.get("name") or "").strip()
+        return bool(name) and name.lower() not in ("", "user")
+    return False
+
 # RFC 1123-ish hostname: labels of alnum/hyphen joined by dots. Rejects
 # anything with a scheme, path, port, whitespace or shell/URL metacharacters.
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$")
@@ -261,9 +296,11 @@ class MastodonAdminClient(_MastodonClientBase):
         self._request("GET", "/api/v1/admin/reports", params={"limit": 1})
         role = me.get("role") or {}
         return {
+            "id": me.get("id"),
             "acct": me.get("acct", ""),
             "display_name": me.get("display_name", ""),
             "role": role.get("name", "") if isinstance(role, dict) else "",
+            "url": me.get("url", ""),
         }
 
     # ------------------------------------------------------------------ reports
@@ -516,6 +553,7 @@ def summarize_admin_account(adm):
     """Reduce an ``Admin::Account`` entity to what the UI shows."""
     adm = adm or {}
     role = adm.get("role") or {}
+    role_name = role.get("name", "") if isinstance(role, dict) else str(role or "")
     out = _account_public(adm.get("account"))
     out.update({
         "id": adm.get("id") or out["id"],
@@ -531,7 +569,9 @@ def summarize_admin_account(adm):
         "silenced": bool(adm.get("silenced")),
         "suspended": bool(adm.get("suspended")),
         "sensitized": bool(adm.get("sensitized")),
-        "role": role.get("name", "") if isinstance(role, dict) else str(role or ""),
+        "role": role_name,
+        "role_name": role_name,
+        "is_staff": is_staff_role(role),
         "invite_request": adm.get("invite_request") or "",
     })
     if not out["acct"]:

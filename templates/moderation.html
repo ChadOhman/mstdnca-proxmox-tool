@@ -175,7 +175,8 @@
     <!-- Mastodon Moderation -->
     <div class="tab-pane fade{% if active_tab == 'mastodon' %} show active{% endif %}" id="mastodon-pane" role="tabpanel" aria-labelledby="mastodon-tab"
          data-configured="{{ 'true' if settings.mastodon_api_url and settings.mastodon_api_token else 'false' }}"
-         data-welcome-configured="{{ 'true' if welcome_settings is defined and welcome_settings.bot_configured else 'false' }}">
+         data-welcome-configured="{{ 'true' if welcome_settings is defined and welcome_settings.bot_configured else 'false' }}"
+         data-can-moderate-staff="{{ 'true' if can_moderate_staff else 'false' }}">
         <div class="row g-4">
             <!-- Configuration -->
             <div class="col-lg-5">
@@ -201,6 +202,16 @@
                                     Token from an application created under <em>Preferences &rarr; Development</em> while
                                     signed in as an admin, with scopes <code>read:accounts admin:read admin:write</code>.
                                     Leave blank to keep the existing token.
+                                </div>
+                                <div id="masto-token-account" class="form-text">
+                                  {% if token_account is defined and token_account %}
+                                    Linked account: <a href="{{ token_account.url }}" target="_blank" rel="noopener" class="font-monospace">@{{ token_account.acct }}</a>
+                                    {% if token_account.display_name %}({{ token_account.display_name }}){% endif %}
+                                    {% if token_account.role %}<span class="badge bg-primary ms-1">{{ token_account.role }}</span>{% endif %}
+                                    <span class="text-muted">· verified {{ token_account.checked_at_dt|local_dt("%Y-%m-%d %H:%M") if token_account.checked_at_dt else token_account.checked_at }}</span>
+                                  {% else %}
+                                    Linked account: <span class="text-muted">unknown — run Test Connection</span>
+                                  {% endif %}
                                 </div>
                             </div>
                             <button type="submit" class="btn btn-primary">
@@ -640,6 +651,11 @@
     if (!pane) return;
     const configured = pane.dataset.configured === 'true';
     const welcomeConfigured = pane.dataset.welcomeConfigured === 'true';
+    const canModerateStaff = pane.dataset.canModerateStaff === 'true';
+    const STAFF_LOCK_MSG = 'This account holds a Mastodon staff role; your role may not act on it';
+    function staffLock(a) {
+        return (a && a.is_staff && !canModerateStaff) ? ' disabled title="' + escHtml(STAFF_LOCK_MSG) + '"' : '';
+    }
     const loaded = { reports: false, pending: false, domains: false, watches: false, alerts: false, new_accounts: false };
 
     // ── helpers ───────────────────────────────────────────────────────────
@@ -723,6 +739,8 @@
                 testOut.innerHTML = '<span class="text-success"><i class="bi bi-check-circle"></i> Connected as '
                     + '<strong class="font-monospace">' + escHtml(a.acct) + '</strong>'
                     + (a.role ? ' (' + escHtml(a.role) + ')' : '') + '. Admin scope OK.</span>';
+                const tokenAcctEl = document.getElementById('masto-token-account');
+                if (tokenAcctEl) tokenAcctEl.innerHTML = 'Linked account: <a href="' + escHtml(a.url || '#') + '" target="_blank" rel="noopener" class="font-monospace">@' + escHtml(a.acct) + '</a>' + (a.display_name ? ' (' + escHtml(a.display_name) + ')' : '') + (a.role ? ' <span class="badge bg-primary ms-1">' + escHtml(a.role) + '</span>' : '') + ' <span class="text-muted">· verified just now</span>';
             })
             .catch(e => { testOut.innerHTML = errorBox(e.message); })
             .finally(() => { testBtn.disabled = false; });
@@ -858,7 +876,7 @@
         rows.forEach(r => { html += '<tr><th class="text-muted fw-normal" style="width:8rem">' + r[0] + '</th><td>' + r[1] + '</td></tr>'; });
         html += '</tbody></table>';
         html += '<div class="d-flex flex-wrap gap-2">';
-        html += '<button type="button" class="btn btn-sm btn-outline-danger" data-act="action">'
+        html += '<button type="button" class="btn btn-sm btn-outline-danger" data-act="action"' + staffLock(a) + '>'
               + '<i class="bi bi-hammer"></i> Take action…</button>';
         if (a.suspended) html += '<button type="button" class="btn btn-sm btn-outline-success" data-act="unsuspend">Unsuspend</button>';
         if (a.silenced) html += '<button type="button" class="btn btn-sm btn-outline-success" data-act="unsilence">Remove limit</button>';
@@ -941,7 +959,7 @@
                 + '<td class="text-end text-nowrap">'
                 + (resolved
                     ? '<button type="button" class="btn btn-sm btn-outline-secondary" data-report-act="reopen">Reopen</button>'
-                    : '<button type="button" class="btn btn-sm btn-outline-danger me-1" data-report-act="action">Act on account…</button>'
+                    : '<button type="button" class="btn btn-sm btn-outline-danger me-1" data-report-act="action"' + staffLock(t) + '>Act on account…</button>'
                       + '<button type="button" class="btn btn-sm btn-outline-success" data-report-act="resolve">Resolve</button>')
                 + '</td></tr>';
         });

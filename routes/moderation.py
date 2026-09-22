@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 # Upper bound on free-text fields (reasons, comments) forwarded to Mastodon.
 _MAX_TEXT_LEN = 2000
 
+# Shown when a moderator without can_moderate_staff tries to act on an
+# account holding a Mastodon staff role.
+STAFF_TARGET_ERROR = "This account holds a Mastodon staff role; your MCAT role may not act on it"
+
 bp = Blueprint("moderation", __name__)
 
 # Cap the in-memory log so a very chatty/long-running check can't grow this
@@ -143,6 +147,8 @@ def index():
         can_configure=current_user.is_admin,
         watch_settings=get_watch_settings(),
         welcome_settings=get_welcome_settings(),
+        token_account=_get_token_account(),
+        can_moderate_staff=current_user.can_moderate_staff,
     )
 
 
@@ -388,12 +394,24 @@ def mastodon_save():
     if api_url and not (api_url.startswith("https://") or api_url.startswith("http://")):
         flash("Mastodon API URL must start with https://", "error")
         return redirect(url_for("moderation.index", tab="mastodon"))
+
+    previous_api_url = Setting.get("moderation_mastodon_api_url", "")
     Setting.set("moderation_mastodon_api_url", api_url)
 
     # Only update the token if a new one was provided (not the placeholder)
     new_token = request.form.get("mastodon_api_token", "").strip()
     if new_token:
         Setting.set("moderation_mastodon_api_token", encrypt(new_token))
+        try:
+            account = MastodonAdminClient(api_url, new_token).verify()
+            _store_token_account(account)
+        except MastodonAPIError as exc:
+            Setting.set("moderation_mastodon_token_account", "")
+            flash(f"Token saved but could not be verified: {exc.message}", "warning")
+    elif api_url != previous_api_url:
+        # The token stayed the same but the URL changed -- the previously
+        # verified identity may no longer apply.
+        Setting.set("moderation_mastodon_token_account", "")
 
     log_action("moderation_mastodon_config_save", "moderation")
     db.session.commit()
@@ -401,9 +419,37 @@ def mastodon_save():
     return redirect(url_for("moderation.index", tab="mastodon"))
 
 
+def _store_token_account(account):
+    """Persist the verified token identity, tagged with when it was checked."""
+    checked_at = datetime.now(timezone.utc).isoformat()
+    Setting.set("moderation_mastodon_token_account", json.dumps({**account, "checked_at": checked_at}))
+    return checked_at
+
+
+def _get_token_account():
+    """Return the stored token-identity dict, or None if unset/unparseable."""
+    raw = Setting.get("moderation_mastodon_token_account", "")
+    if not raw:
+        return None
+    try:
+        account = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(account, dict):
+        return None
+    # Parsed copy for the template's local_dt filter; the ISO string stays for JSON consumers.
+    account["checked_at_dt"] = _parse_iso(account.get("checked_at"))
+    return account
+
+
 @bp.route("/mastodon/test", methods=["POST"])
 def mastodon_test():
-    return _mastodon_json(lambda c: {"account": c.verify()})
+    def _do(c):
+        account = c.verify()
+        checked_at = _store_token_account(account)
+        return {"account": account, "checked_at": checked_at}
+
+    return _mastodon_json(_do)
 
 
 # -- reports ---------------------------------------------------------------
@@ -494,6 +540,22 @@ def mastodon_account_action(account_id):
     acct = _form_text("acct")
     report_id = request.form.get("report_id", type=int)
     notify = _form_flag("send_email_notification")
+
+    client, err = _get_mastodon_client()
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    try:
+        target = client.get_admin_account(account_id)
+    except MastodonAPIError as exc:
+        return jsonify({"ok": False, "error": exc.message}), 502
+    if target.get("is_staff") and not current_user.can_moderate_staff:
+        log_action("mastodon_account_action_refused", "mastodon_account",
+                   resource_name=acct or target.get("acct") or str(account_id),
+                   details={"account_id": str(account_id), "type": action_type,
+                            "target_role": target.get("role_name", ""),
+                            **({"report_id": str(report_id)} if report_id else {})})
+        db.session.commit()
+        return jsonify({"ok": False, "error": STAFF_TARGET_ERROR}), 403
 
     def _do(c):
         c.account_action(account_id, action_type, text=text, report_id=report_id, send_email_notification=notify)
