@@ -451,6 +451,14 @@ def run_unpoller_upgrade(log_callback=None):
     if not latest:
         _log("ERROR: No target version available.")
         return False, log_lines
+    # Use-time check: the stored version becomes a download URL on the guest,
+    # so refuse anything that is not a release tag even if an older release
+    # stored it unvalidated.
+    try:
+        _validate_release_tag(latest, "unpoller target version")
+    except ValueError:
+        _log("ERROR: Stored target version is not a valid release tag; re-run the release check.")
+        return False, log_lines
 
     _log(f"Upgrading unpoller from v{current} to v{latest} on {guest.name}...")
 

@@ -355,7 +355,7 @@ def run_peertube_install(log_callback=None):
     hostname = parsed.hostname
     if not hostname:
         return False, f"Could not parse hostname from Instance URL: {peertube_url}"
-    if not _HOSTNAME_RE.match(hostname):
+    if not _HOSTNAME_RE.fullmatch(hostname):
         return False, f"Instance URL hostname is not a valid hostname: {hostname!r}"
 
     try:

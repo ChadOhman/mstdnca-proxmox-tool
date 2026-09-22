@@ -203,7 +203,7 @@ def _remediate_ruby(ssh, user, app_dir, log):
     # The file lives on the remote host and its contents are interpolated into
     # `su - <user> -c '...'` below, so anything but a plain version string is a
     # privilege-escalation vector out of the mastodon account.
-    if not _RUBY_VERSION_RE.match(required):
+    if not _RUBY_VERSION_RE.fullmatch(required):
         log(f"ERROR: {app_dir}/.ruby-version does not contain a plain version "
             f"string ({required[:60]!r}) — refusing to use it in a shell command")
         return False
@@ -408,7 +408,7 @@ def check_mastodon_release():
     """
     try:
         repo = Setting.get("mastodon_repo", DEFAULT_MASTODON_REPO) or DEFAULT_MASTODON_REPO
-        if not _REPO_RE.match(repo):
+        if not _REPO_RE.fullmatch(repo):
             logger.error("Invalid mastodon_repo format: %r — expected 'owner/repo'", repo)
             return False, "", ""
 
@@ -477,6 +477,37 @@ def _git_stash_pop(ssh, user, app_dir, log, prefix=""):
         log(f"WARNING: {prefix}git stash pop failed (exit {code}) — local changes are "
             f"still on the stash (recover with 'git stash pop' in {app_dir})")
         return False
+    return True
+
+
+def _resolve_stash_conflicts(ssh, user, app_dir, log):
+    """After a failed `git stash pop`, keep the local version of every conflicted
+    file and drop the stash entry. Returns True if conflicts were found and
+    resolved, False if there were none (the pop failed for another reason).
+
+    File names come from the repository on the guest, which the `mastodon`
+    service account can write to, and they are interpolated into a root
+    `su -c`. They are read NUL-separated (git does not escape quotes or spaces
+    in paths) and shell-quoted twice: once for the shell `su -c` spawns, then
+    the whole inner command for the shell that runs `su` (GHSA-hx66-9rjm-v8mx).
+    """
+    unmerged_out, _, _ = ssh.execute_sudo(
+        f"su - {user} -c 'cd {app_dir} && git diff --name-only --diff-filter=U -z'", timeout=15
+    )
+    if not unmerged_out.strip("\x00 \t\r\n"):
+        return False
+
+    conflicted = list(dict.fromkeys(
+        f.strip("\r\n") for f in unmerged_out.split("\x00") if f.strip("\r\n")
+    ))
+    log(f"WARNING: stash pop conflict in: {', '.join(shlex.quote(f) for f in conflicted)} "
+        "— auto-resolving (keeping local version)")
+    for fname in conflicted:
+        for git_cmd in ("git checkout --theirs --", "git add --"):
+            inner = f"cd {app_dir} && {git_cmd} {shlex.quote(fname)}"
+            ssh.execute_sudo(f"su - {user} -c {shlex.quote(inner)}", timeout=15)
+    ssh.execute_sudo(f"su - {user} -c 'cd {app_dir} && git stash drop'", timeout=15)
+    log("  Stash conflicts resolved.")
     return True
 
 
@@ -1347,28 +1378,8 @@ def run_mastodon_upgrade(log_callback=None, skip_protection=False):
                 log(stdout or stderr or "(no output)")
                 stash_pending = code != 0
             if code != 0:
-                # Check whether stash pop left unmerged files (conflict).
-                # If so, auto-resolve in favour of the stashed (local) version and drop the entry.
-                unmerged_out, _, _ = ssh.execute_sudo(
-                    f"su - {user} -c 'cd {app_dir} && git ls-files --unmerged'", timeout=15
-                )
-                if unmerged_out.strip():
-                    conflicted = list(dict.fromkeys(
-                        line.split()[-1] for line in unmerged_out.strip().splitlines()
-                    ))
-                    log(f"WARNING: stash pop conflict in: {', '.join(conflicted)} — auto-resolving (keeping local version)")
-                    for fname in conflicted:
-                        ssh.execute_sudo(
-                            f"su - {user} -c 'cd {app_dir} && git checkout --theirs -- {fname}'", timeout=15
-                        )
-                        ssh.execute_sudo(
-                            f"su - {user} -c 'cd {app_dir} && git add {fname}'", timeout=15
-                        )
-                    ssh.execute_sudo(
-                        f"su - {user} -c 'cd {app_dir} && git stash drop'", timeout=15
-                    )
+                if _resolve_stash_conflicts(ssh, user, app_dir, log):
                     stash_pending = False
-                    log("  Stash conflicts resolved.")
                 else:
                     log("WARNING: git stash pop returned non-zero (may be no stash to pop)")
 

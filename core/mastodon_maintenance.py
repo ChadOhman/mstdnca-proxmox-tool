@@ -104,7 +104,7 @@ def build_modify_command(username, action, *, email=None, confirm=False, user, a
     if spec is None:
         raise ValueError(f"Unknown maintenance action: {action!r}")
 
-    if not username or not _USERNAME_RE.match(username):
+    if not username or not _USERNAME_RE.fullmatch(username):
         raise ValueError(f"Invalid username: {username!r}")
 
     _validate_shell_param(user, "Mastodon user")
@@ -281,7 +281,7 @@ def build_status_action_script(action, status_ids, report_id, actor_account_id, 
     deduped = []
     seen = set()
     for sid in status_ids:
-        if not isinstance(sid, str) or not _DIGITS_RE.match(sid):
+        if not isinstance(sid, str) or not _DIGITS_RE.fullmatch(sid):
             raise ValueError(f"Invalid status id: {sid!r}")
         if sid not in seen:
             seen.add(sid)
@@ -289,9 +289,9 @@ def build_status_action_script(action, status_ids, report_id, actor_account_id, 
     if len(deduped) > MAX_STATUS_IDS:
         raise ValueError(f"Too many statuses selected (max {MAX_STATUS_IDS})")
 
-    if report_id is None or not _DIGITS_RE.match(str(report_id)):
+    if report_id is None or not _DIGITS_RE.fullmatch(str(report_id)):
         raise ValueError(f"Invalid report id: {report_id!r}")
-    if actor_account_id is None or not _DIGITS_RE.match(str(actor_account_id)):
+    if actor_account_id is None or not _DIGITS_RE.fullmatch(str(actor_account_id)):
         raise ValueError(f"Invalid actor account id: {actor_account_id!r}")
 
     text = text or ""

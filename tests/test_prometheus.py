@@ -442,7 +442,12 @@ class TestPrometheusQueryClient:
         with app.app_context():
             from models import Setting
             Setting.set("unpoller_metric_prefix", "myprefix")
-            assert client._unpoller_prefix() == "myprefix"
+            try:
+                assert client._unpoller_prefix() == "myprefix"
+            finally:
+                # Shared session-scoped DB: restore the default for test_unpoller's
+                # TestUnpollerGetConfig, which runs later in some file orders.
+                Setting.set("unpoller_metric_prefix", "unpoller")
 
     @patch("clients.prometheus_query.requests.get")
     def test_check_unpoller_available_true(self, mock_get, app):

@@ -768,7 +768,13 @@ def _check_app_update(app):
             req = urllib.request.Request(url, headers={"User-Agent": "MCAT", **github_auth_headers()})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
-                latest = data.get("tag_name", "").lstrip("v")
+                tag = data.get("tag_name", "")
+                if tag:
+                    # Stored, shown on the dashboard and sent to Discord: keep the
+                    # same shape check as the other release feeds.
+                    from apps.utils import _validate_release_tag
+                    _validate_release_tag(tag, "MCAT release tag")  # ValueError -> logged below
+                latest = tag.lstrip("v")
                 if latest:
                     Setting.set("latest_app_version", latest)
                     Setting.set("latest_app_check", datetime.now(tz=timezone.utc).isoformat())
@@ -1184,9 +1190,20 @@ def _check_prometheus_release(app):
             req = urllib.request.Request(url, headers={"User-Agent": "mstdnca-proxmox-tool"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
-                latest = data.get("tag_name", "").lstrip("v")
-                if not latest:
+                tag = data.get("tag_name", "")
+                if not tag:
                     return
+
+            # The stored value is read back by run_prometheus_upgrade to build a
+            # download URL and an extraction path on the guest: validate the
+            # upstream tag before it is persisted (GHSA-hx66-9rjm-v8mx).
+            from apps.utils import _validate_release_tag
+            try:
+                _validate_release_tag(tag, "Prometheus release tag")
+            except ValueError as e:
+                logger.error("Rejected Prometheus release tag: %s", e)
+                return
+            latest = tag.lstrip("v")
 
             Setting.set("prometheus_latest_version", latest)
             current = Setting.get("prometheus_current_version", "")
@@ -1229,9 +1246,19 @@ def _check_unpoller_release(app):
             req = urllib.request.Request(url, headers={"User-Agent": "mstdnca-proxmox-tool"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
-                latest = data.get("tag_name", "").lstrip("v")
-                if not latest:
+                tag = data.get("tag_name", "")
+                if not tag:
                     return
+
+            # Same reason as the Prometheus check: run_unpoller_upgrade reads this
+            # back and interpolates it into a download URL (GHSA-hx66-9rjm-v8mx).
+            from apps.utils import _validate_release_tag
+            try:
+                _validate_release_tag(tag, "unpoller release tag")
+            except ValueError as e:
+                logger.error("Rejected unpoller release tag: %s", e)
+                return
+            latest = tag.lstrip("v")
 
             Setting.set("unpoller_latest_version", latest)
             current = Setting.get("unpoller_current_version", "")

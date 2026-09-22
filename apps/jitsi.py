@@ -315,7 +315,7 @@ def run_jitsi_preflight(log_callback=None):
     hostname = config.get("hostname", "")
     if hostname:
         check("Hostname configured", True)
-        if _HOSTNAME_RE.match(hostname):
+        if _HOSTNAME_RE.fullmatch(hostname):
             check("Hostname format valid", True)
         else:
             check("Hostname format valid", False, f"'{hostname}' is not a valid FQDN")
@@ -334,7 +334,7 @@ def run_jitsi_preflight(log_callback=None):
     if cert_type == "letsencrypt":
         email = config.get("letsencrypt_email", "")
         if email:
-            if _EMAIL_RE.match(email):
+            if _EMAIL_RE.fullmatch(email):
                 check("Let's Encrypt email configured", True)
             else:
                 check("Let's Encrypt email configured", False, f"'{email}' is not a valid email")
@@ -1078,7 +1078,7 @@ def run_cloudflare_configure(log_callback=None):
     if cf_mode == "hybrid":
         if not public_ip:
             return False, "Public IP is required for hybrid mode"
-        if not _IP_RE.match(public_ip):
+        if not _IP_RE.fullmatch(public_ip):
             return False, f"Public IP '{public_ip}' is not a valid IPv4 address"
 
     if not config["guest_id"]:
@@ -1710,7 +1710,7 @@ def _configure_jvb_nat_harvester(ssh, guest_ip, public_ip, log):
         log("  [SKIP] No public IP configured — NAT harvester not set")
         return 0
 
-    if not _IP_RE.match(public_ip):
+    if not _IP_RE.fullmatch(public_ip):
         log(f"  WARNING: Public IP '{public_ip}' is not a valid IPv4 address — skipping")
         return 1
 
@@ -2113,7 +2113,7 @@ def sd_add_user(username, password):
 
     Returns (success, message).
     """
-    if not username or not _SD_USERNAME_RE.match(username):
+    if not username or not _SD_USERNAME_RE.fullmatch(username):
         return False, "Invalid username (alphanumeric, dots, hyphens, underscores only; max 64 chars)"
     if not password or len(password) < 8:
         return False, "Password must be at least 8 characters"
@@ -2158,7 +2158,7 @@ def sd_remove_user(username):
 
     Returns (success, message).
     """
-    if not username or not _SD_USERNAME_RE.match(username):
+    if not username or not _SD_USERNAME_RE.fullmatch(username):
         return False, "Invalid username"
 
     config = _get_jitsi_config()

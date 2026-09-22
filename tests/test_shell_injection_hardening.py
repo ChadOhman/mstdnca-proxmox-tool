@@ -1183,3 +1183,144 @@ class TestRunStatusActionFailsClosed:
                 result = run_status_action("delete", ["1"], "9")
             assert result["ok"] is False
             mock_ssh.from_credential.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Mastodon stash-pop conflict resolution: file names from the guest's repo
+# reach a root `su -c` and must be quoted at both shell levels
+# ---------------------------------------------------------------------------
+
+
+def _inner_command(su_cmd):
+    """Return the command `su -c` would hand to the user's shell."""
+    parts = shlex.split(su_cmd)
+    assert parts[:2] == ["su", "-"] and parts[3] == "-c", su_cmd
+    return parts[4]
+
+
+class TestStashConflictResolution:
+    @pytest.mark.parametrize("fname", [
+        "a'; id; #",
+        "config/with space.yml",
+        'quote"double.rb',
+        "dollar$(id).rb",
+        "back`id`tick",
+        "new\nline.rb",
+    ])
+    def test_hostile_conflicted_name_is_quoted_at_both_levels(self, fname):
+        from apps.mastodon import _resolve_stash_conflicts
+        fake = _FakeSSH(responses=[("--diff-filter=U -z", (f"{fname}\x00", "", 0))])
+        logs = []
+        assert _resolve_stash_conflicts(fake, "mastodon", "/home/mastodon/live", logs.append) is True
+
+        git_cmds = [c for c in fake.calls if "git checkout --theirs" in c or "git add" in c]
+        assert len(git_cmds) == 2
+        for cmd in git_cmds:
+            # Outer shell: the whole -c argument is one token.
+            inner = _inner_command(cmd)
+            # Inner shell: the file name is one token, exactly as read from git.
+            assert shlex.split(inner)[-1] == fname
+            assert shlex.split(inner)[-2] == "--"
+            # And the raw name never appears unquoted in the outer command.
+            assert f"-- {fname}'" not in cmd
+        assert any("git stash drop" in c for c in fake.calls)
+
+    def test_uses_nul_separated_listing_not_ls_files(self):
+        from apps.mastodon import _resolve_stash_conflicts
+        fake = _FakeSSH(responses=[("--diff-filter=U -z", ("a.rb\x00b.rb\x00a.rb\x00", "", 0))])
+        assert _resolve_stash_conflicts(fake, "mastodon", "/home/mastodon/live", lambda m: None) is True
+        assert not any("ls-files --unmerged" in c for c in fake.calls)
+        adds = [c for c in fake.calls if "git add" in c]
+        assert [shlex.split(_inner_command(c))[-1] for c in adds] == ["a.rb", "b.rb"]
+
+    def test_no_conflicts_returns_false_without_touching_the_repo(self):
+        from apps.mastodon import _resolve_stash_conflicts
+        fake = _FakeSSH(responses=[("--diff-filter=U -z", ("", "", 0))])
+        assert _resolve_stash_conflicts(fake, "mastodon", "/home/mastodon/live", lambda m: None) is False
+        assert len(fake.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Stored release versions are re-validated at use time by the upgrade entry
+# points, so a value persisted by an older release cannot reach a download URL
+# ---------------------------------------------------------------------------
+
+
+class TestStoredVersionUseTimeValidation:
+    @pytest.mark.parametrize("value", HOSTILE_TAGS)
+    def test_prometheus_upgrade_rejects_stored_version(self, app, value):
+        from apps.prometheus_app import run_prometheus_upgrade
+        with app.app_context():
+            guest = _make_guest(app, 9821, "prom-ver")
+            Setting.set("prometheus_guest_id", str(guest.id))
+            Setting.set("prometheus_latest_version", value)
+            Setting.set("prometheus_current_version", "2.0.0")
+            db.session.commit()
+            try:
+                with patch("apps.prometheus_app.SSHClient") as mock_ssh, \
+                     patch("apps.prometheus_app._snapshot_guest") as mock_snap:
+                    ok, logs = run_prometheus_upgrade()
+            finally:
+                for key in ("prometheus_guest_id", "prometheus_latest_version", "prometheus_current_version"):
+                    Setting.set(key, "")
+                db.session.commit()
+        assert ok is False
+        assert any("not a valid release tag" in line for line in logs)
+        mock_snap.assert_not_called()
+        mock_ssh.from_credential.assert_not_called()
+
+    @pytest.mark.parametrize("value", HOSTILE_TAGS)
+    def test_unpoller_upgrade_rejects_stored_version(self, app, value):
+        from apps.unpoller import run_unpoller_upgrade
+        with app.app_context():
+            guest = _make_guest(app, 9822, "unpoller-ver")
+            Setting.set("prometheus_guest_id", str(guest.id))
+            Setting.set("unpoller_latest_version", value)
+            Setting.set("unpoller_current_version", "2.0.0")
+            db.session.commit()
+            try:
+                with patch("apps.unpoller.SSHClient") as mock_ssh, \
+                     patch("apps.unpoller._snapshot_guest") as mock_snap:
+                    ok, logs = run_unpoller_upgrade()
+            finally:
+                for key in ("prometheus_guest_id", "unpoller_latest_version", "unpoller_current_version"):
+                    Setting.set(key, "")
+                db.session.commit()
+        assert ok is False
+        assert any("not a valid release tag" in line for line in logs)
+        mock_snap.assert_not_called()
+        mock_ssh.from_credential.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Anchored validators use fullmatch: `$` alone still matches before a trailing
+# newline, which re.match would have accepted
+# ---------------------------------------------------------------------------
+
+
+class TestValidatorsRejectTrailingNewline:
+    @pytest.mark.parametrize("func_name, good", [
+        ("_validate_shell_param", "mastodon"),
+        ("_validate_hostname", "meet.example.com"),
+        ("_validate_ipv4", "10.0.0.5"),
+        ("_validate_email", "admin@example.com"),
+        ("_validate_http_url", "https://example.com"),
+        ("_validate_abs_path", "/home/mastodon/live"),
+        ("_validate_username", "mastodon"),
+        ("_validate_db_name", "mastodon_production"),
+        ("_validate_git_branch", "main"),
+        ("_validate_git_repo", "mastodon/mastodon"),
+        ("_validate_release_tag", "v1.2.3"),
+        ("_validate_safe_filename", "rec.mp4"),
+    ])
+    def test_trailing_newline_rejected(self, func_name, good):
+        import apps.utils as utils
+        func = getattr(utils, func_name)
+        func(good, "x")
+        with pytest.raises(ValueError):
+            func(good + "\n", "x")
+
+    def test_pg_db_name_rejects_trailing_newline(self):
+        from core.pg_identifiers import validate_pg_db_name
+        assert validate_pg_db_name("app_db")
+        assert not validate_pg_db_name("app_db\n")

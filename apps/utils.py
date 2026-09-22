@@ -191,7 +191,7 @@ def _validate_shell_param(value, label):
     """Raise ValueError if a config value contains shell-unsafe characters."""
     if not value:
         raise ValueError(f"{label} is empty")
-    if not _SHELL_SAFE_RE.match(value):
+    if not _SHELL_SAFE_RE.fullmatch(value):
         raise ValueError(f"{label} contains unsafe characters: {value!r}")
 
 
@@ -219,7 +219,7 @@ def _validate_hostname(value, label):
     """Validate a hostname/FQDN."""
     if not value:
         raise ValueError(f"{label} is empty")
-    if len(value) > 253 or not _HOSTNAME_RE.match(value):
+    if len(value) > 253 or not _HOSTNAME_RE.fullmatch(value):
         raise ValueError(f"{label} is not a valid hostname: {value!r}")
 
 
@@ -227,7 +227,7 @@ def _validate_ipv4(value, label):
     """Validate an IPv4 literal."""
     if not value:
         raise ValueError(f"{label} is empty")
-    if not _IP_RE.match(value):
+    if not _IP_RE.fullmatch(value):
         raise ValueError(f"{label} is not a valid IPv4 address: {value!r}")
 
 
@@ -240,7 +240,7 @@ def _validate_email(value, label):
     """
     if not value:
         raise ValueError(f"{label} is empty")
-    if len(value) > 254 or not _EMAIL_RE.match(value):
+    if len(value) > 254 or not _EMAIL_RE.fullmatch(value):
         raise ValueError(f"{label} is not a valid email address: {value!r}")
 
 
@@ -248,7 +248,7 @@ def _validate_http_url(value, label):
     """Validate an http(s) URL of the form scheme://host[:port][/path]."""
     if not value:
         raise ValueError(f"{label} is empty")
-    if len(value) > 2048 or not _HTTP_URL_RE.match(value):
+    if len(value) > 2048 or not _HTTP_URL_RE.fullmatch(value):
         raise ValueError(
             f"{label} must be an http(s) URL such as https://example.com "
             f"(no quotes, spaces, '%', or '\\'): {value!r}"
@@ -265,7 +265,7 @@ def _validate_abs_path(value, label):
         raise ValueError(f"{label} is empty")
     if value == "/":
         raise ValueError(f"{label} must not be the filesystem root")
-    if not _ABS_PATH_RE.match(value):
+    if not _ABS_PATH_RE.fullmatch(value):
         raise ValueError(f"{label} must be an absolute path without spaces or shell characters: {value!r}")
     if ".." in value.split("/"):
         raise ValueError(f"{label} must not contain '..': {value!r}")
@@ -275,7 +275,7 @@ def _validate_username(value, label):
     """Validate a Unix account name."""
     if not value:
         raise ValueError(f"{label} is empty")
-    if not _USERNAME_RE.match(value):
+    if not _USERNAME_RE.fullmatch(value):
         raise ValueError(f"{label} is not a valid user name: {value!r}")
 
 
@@ -283,7 +283,7 @@ def _validate_db_name(value, label):
     """Validate a PostgreSQL database name."""
     if not value:
         raise ValueError(f"{label} is empty")
-    if not _DB_NAME_RE.match(value):
+    if not _DB_NAME_RE.fullmatch(value):
         raise ValueError(f"{label} is not a valid database name: {value!r}")
 
 
@@ -291,7 +291,7 @@ def _validate_git_branch(value, label):
     """Validate a git branch/ref name."""
     if not value:
         raise ValueError(f"{label} is empty")
-    if not _GIT_BRANCH_RE.match(value) or ".." in value:
+    if not _GIT_BRANCH_RE.fullmatch(value) or ".." in value:
         raise ValueError(f"{label} is not a valid git branch name: {value!r}")
 
 
@@ -299,7 +299,7 @@ def _validate_git_repo(value, label):
     """Validate a GitHub ``owner/repo`` slug."""
     if not value:
         raise ValueError(f"{label} is empty")
-    if not _GIT_REPO_RE.match(value) or ".." in value:
+    if not _GIT_REPO_RE.fullmatch(value) or ".." in value:
         raise ValueError(f"{label} must be of the form owner/repo: {value!r}")
 
 
@@ -312,7 +312,7 @@ def _validate_release_tag(value, label="Release tag"):
     """
     if not value:
         raise ValueError(f"{label} is empty")
-    if len(value) > 64 or not _RELEASE_TAG_RE.match(value):
+    if len(value) > 64 or not _RELEASE_TAG_RE.fullmatch(value):
         raise ValueError(f"{label} is not a valid version: {value!r}")
 
 
@@ -330,7 +330,7 @@ def _validate_safe_filename(value, label, allow_subdir=False):
     if len(parts) > (2 if allow_subdir else 1):
         raise ValueError(f"{label} contains too many path components: {value!r}")
     for part in parts:
-        if not _SAFE_FILENAME_RE.match(part) or part in (".", ".."):
+        if not _SAFE_FILENAME_RE.fullmatch(part) or part in (".", ".."):
             raise ValueError(f"{label} is not a valid file name: {value!r}")
 
 
