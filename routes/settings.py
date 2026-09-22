@@ -21,6 +21,9 @@ from flask_login import current_user, login_required
 
 from auth.audit import log_action
 from auth.credential_store import decrypt, encrypt
+from clients.claude_client import DEFAULT_MAX_TOKENS as DEFAULT_AI_MAX_TOKENS
+from clients.claude_client import DEFAULT_MODEL as DEFAULT_AI_MODEL
+from clients.claude_client import model_options as ai_model_options
 from config import BASE_DIR, DATA_DIR
 from core.app_update_auth import github_auth_headers, github_token_env
 from core.errors import describe_exception
@@ -102,8 +105,9 @@ def _get_settings_dict():
         "unpoller_site_name": Setting.get("unpoller_site_name", "default"),
         "ai_enabled": Setting.get("ai_enabled", "false"),
         "ai_api_key": Setting.get("ai_api_key", ""),
-        "ai_model": Setting.get("ai_model", "claude-sonnet-4-20250514"),
-        "ai_max_tokens": Setting.get("ai_max_tokens", "4096"),
+        "ai_model": Setting.get("ai_model", DEFAULT_AI_MODEL),
+        "ai_model_options": ai_model_options(Setting.get("ai_model", DEFAULT_AI_MODEL)),
+        "ai_max_tokens": Setting.get("ai_max_tokens", str(DEFAULT_AI_MAX_TOKENS)),
         "ai_daily_request_limit": Setting.get("ai_daily_request_limit", "100"),
         "app_auto_update": Setting.get("app_auto_update", "false"),
         "app_update_branch": Setting.get("app_update_branch", ""),
@@ -1046,8 +1050,8 @@ def backup_database():
 def save_ai():
     enabled = "ai_enabled" in request.form
     api_key = request.form.get("ai_api_key", "").strip()
-    model = request.form.get("ai_model", "claude-sonnet-4-20250514").strip()
-    max_tokens = request.form.get("ai_max_tokens", "4096").strip()
+    model = request.form.get("ai_model", DEFAULT_AI_MODEL).strip()
+    max_tokens = request.form.get("ai_max_tokens", str(DEFAULT_AI_MAX_TOKENS)).strip()
     daily_limit = request.form.get("ai_daily_request_limit", "100").strip()
 
     Setting.set("ai_enabled", "true" if enabled else "false")
@@ -1071,7 +1075,7 @@ def test_ai():
     save_ai()
 
     encrypted_key = Setting.get("ai_api_key", "")
-    model = Setting.get("ai_model", "claude-sonnet-4-20250514")
+    model = Setting.get("ai_model", DEFAULT_AI_MODEL)
 
     if not encrypted_key:
         flash("API key is required.", "error")

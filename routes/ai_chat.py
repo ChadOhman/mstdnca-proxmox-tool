@@ -134,6 +134,8 @@ def chat():
             # issue a duplicate action and a duplicate audit entry.
             tool_results_by_id = {}
             round_text = ""
+            round_content = None
+            refused = False
 
             try:
                 for event in client.stream_chat(messages, system_prompt=system_prompt,
@@ -151,9 +153,13 @@ def chat():
                         tool_results_by_id[event["id"]] = result
                         yield f"data: {json.dumps({'type': 'tool_result', 'name': event['name'], 'result': result})}\n\n"
 
+                    elif event["type"] == "refusal":
+                        refused = True
+
                     elif event["type"] == "done":
                         total_usage["input_tokens"] += event.get("usage", {}).get("input_tokens", 0)
                         total_usage["output_tokens"] += event.get("usage", {}).get("output_tokens", 0)
+                        round_content = event.get("content")
 
                     elif event["type"] == "error":
                         yield f"data: {json.dumps(event)}\n\n"
@@ -168,21 +174,33 @@ def chat():
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
+            if refused:
+                # The model's safety classifiers declined (after any configured
+                # fallback also declined). Any partial output from this round is
+                # incomplete, so don't persist it; earlier rounds still count.
+                message = "The AI assistant declined this request."
+                yield f"data: {json.dumps({'type': 'error', 'message': message})}\n\n"
+                break
+
             full_text += round_text
 
             # If there were tool calls, append assistant + tool results and loop
             if tool_calls_in_round:
-                # Build the assistant message content blocks
-                assistant_content = []
-                if round_text:
-                    assistant_content.append({"type": "text", "text": round_text})
-                for tc in tool_calls_in_round:
-                    assistant_content.append({
-                        "type": "tool_use",
-                        "id": tc["id"],
-                        "name": tc["name"],
-                        "input": tc["input"],
-                    })
+                # Send the assistant turn back exactly as the API returned it —
+                # thinking blocks included — so the tool round continues the same
+                # turn. Rebuild it only if the client didn't supply the blocks.
+                assistant_content = round_content
+                if not assistant_content:
+                    assistant_content = []
+                    if round_text:
+                        assistant_content.append({"type": "text", "text": round_text})
+                    for tc in tool_calls_in_round:
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["name"],
+                            "input": tc["input"],
+                        })
                 messages.append({"role": "assistant", "content": assistant_content})
 
                 # Add tool results — reuse the cached result from the single

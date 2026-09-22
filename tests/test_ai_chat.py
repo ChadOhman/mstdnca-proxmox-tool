@@ -337,3 +337,79 @@ class TestToolExecutedOncePerRequest:
             assert after - before == 1
         finally:
             self._cleanup(app, guest_id, service_id)
+
+
+# ---------------------------------------------------------------------------
+# Thinking-block replay and refusals (Sonnet 5 / Opus 5 think by default)
+# ---------------------------------------------------------------------------
+
+_THINKING_BLOCK = {"type": "thinking", "thinking": "", "signature": "test-only-signature"}
+
+
+class _RecordingStreamClient:
+    """Fake client: round 1 thinks then calls list_guests; round 2 answers. Records each request."""
+
+    def __init__(self):
+        self.requests = []
+
+    def stream_chat(self, messages, system_prompt=None, tools=None):
+        self.requests.append([dict(m) for m in messages])
+        if len(self.requests) == 1:
+            tool_use = {"type": "tool_use", "id": "toolu_replay_1", "name": "list_guests", "input": {}}
+            yield {"type": "text", "content": "Looking."}
+            yield dict(tool_use)
+            yield {"type": "done", "usage": {"input_tokens": 5, "output_tokens": 5}, "stop_reason": "tool_use",
+                   "content": [_THINKING_BLOCK, {"type": "text", "text": "Looking."}, tool_use]}
+        else:
+            yield {"type": "text", "content": " All good."}
+            yield {"type": "done", "usage": {"input_tokens": 3, "output_tokens": 3}, "stop_reason": "end_turn",
+                   "content": [{"type": "text", "text": " All good."}]}
+
+
+class _RefusingStreamClient:
+    """Fake client whose only round is declined mid-stream after partial output and a tool call."""
+
+    def stream_chat(self, messages, system_prompt=None, tools=None):
+        yield {"type": "text", "content": "Partial answer"}
+        yield {"type": "refusal", "category": "cyber"}
+        yield {"type": "done", "usage": {"input_tokens": 4, "output_tokens": 2}, "stop_reason": "refusal",
+               "content": [{"type": "text", "text": "Partial answer"}]}
+
+
+class TestThinkingReplayAndRefusal:
+
+    def test_assistant_turn_replayed_with_thinking_blocks(self, auth_client, app):
+        _enable_ai(app)
+        fake = _RecordingStreamClient()
+        with patch("clients.claude_client.get_claude_client", return_value=fake), \
+                patch("core.ai_tools.execute_tool", return_value="[]"):
+            resp = auth_client.post("/ai/chat", json={"message": "how are the guests?"}, headers=_ORIGIN)
+            resp.get_data(as_text=True)
+
+        assert resp.status_code == 200
+        assert len(fake.requests) == 2
+        assistant_turn, tool_results = fake.requests[1][-2], fake.requests[1][-1]
+        assert assistant_turn["role"] == "assistant"
+        # Sent back verbatim — thinking block first, signature intact.
+        assert assistant_turn["content"] == [
+            _THINKING_BLOCK,
+            {"type": "text", "text": "Looking."},
+            {"type": "tool_use", "id": "toolu_replay_1", "name": "list_guests", "input": {}},
+        ]
+        assert tool_results["content"][0]["tool_use_id"] == "toolu_replay_1"
+
+    def test_refusal_reports_error_and_discards_partial_output(self, auth_client, app):
+        _enable_ai(app)
+        with patch("clients.claude_client.get_claude_client", return_value=_RefusingStreamClient()), \
+                patch("core.ai_tools.execute_tool") as mock_execute:
+            resp = auth_client.post("/ai/chat", json={"message": "refusal-test prompt"}, headers=_ORIGIN)
+            body = resp.get_data(as_text=True)
+
+        assert resp.status_code == 200
+        assert "declined this request" in body
+        assert body.rstrip().endswith('data: {"type": "done"}')
+        mock_execute.assert_not_called()
+        with app.app_context():
+            session = AIChatSession.query.filter_by(title="refusal-test prompt").first()
+            roles = [m.role for m in AIChatMessage.query.filter_by(session_id=session.id)]
+            assert roles == ["user"]
