@@ -287,6 +287,76 @@ class TestGuestViewPermissionAndModeratorRole:
             assert not role.can_moderate
 
 
+class TestModerateStaffPermissionBackfill:
+    def test_legacy_admin_tier_roles_get_can_moderate_staff(self, legacy_db):
+        """Upgrading must grant the new permission to super_admin and admin."""
+        app = _boot(legacy_db)
+
+        for role_name in ("super_admin", "admin"):
+            assert _role_perms(app, role_name)["can_moderate_staff"], (
+                f"{role_name} did not get can_moderate_staff on upgrade"
+            )
+
+    def test_legacy_non_admin_roles_are_untouched(self, legacy_db):
+        app = _boot(legacy_db)
+
+        for role_name in ("operator", "viewer"):
+            assert not _role_perms(app, role_name)["can_moderate_staff"]
+
+    def test_legacy_custom_admin_tier_role_gets_can_moderate_staff(self, legacy_db):
+        """A custom legacy role at the admin tier (level >= 3) must be backfilled too."""
+        conn = sqlite3.connect(legacy_db)
+        try:
+            conn.execute(
+                "INSERT INTO roles (name, display_name, level, is_builtin) VALUES (?, ?, ?, ?)",
+                ("custom_admin", "Custom Admin", 3, 0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        app = _boot(legacy_db)
+        assert _role_perms(app, "custom_admin")["can_moderate_staff"]
+
+    def test_legacy_custom_sub_admin_tier_role_is_untouched(self, legacy_db):
+        """A custom legacy role below the admin tier (level < 3) must not be backfilled."""
+        conn = sqlite3.connect(legacy_db)
+        try:
+            conn.execute(
+                "INSERT INTO roles (name, display_name, level, is_builtin) VALUES (?, ?, ?, ?)",
+                ("custom_ops", "Custom Ops", 2, 0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        app = _boot(legacy_db)
+        assert not _role_perms(app, "custom_ops")["can_moderate_staff"]
+
+    def test_inserted_moderator_role_does_not_get_can_moderate_staff(self, legacy_db):
+        """The moderator role inserted by _migrate_moderator_role() stays False."""
+        from models import Role
+
+        app = _boot(legacy_db)
+        with app.app_context():
+            role = Role.query.filter_by(name="moderator").first()
+            assert role is not None
+            assert not role.can_moderate_staff
+
+    def test_backfill_is_one_time(self, legacy_db):
+        """An admin who removes the permission from a builtin role keeps it removed."""
+        from models import Role, db
+
+        app = _boot(legacy_db)
+        with app.app_context():
+            role = Role.query.filter_by(name="admin").first()
+            role.can_moderate_staff = False
+            db.session.commit()
+
+        app2 = _boot(legacy_db)
+        assert not _role_perms(app2, "admin")["can_moderate_staff"]
+
+
 class TestFreshDatabaseRoleSeeding:
     def test_fresh_database_seeds_five_roles_including_moderator(self, app):
         from models import Role
@@ -331,3 +401,29 @@ class TestFreshDatabaseRoleSeeding:
             assert viewer_user.can_view_guests
             assert not moderator_user.can_view_guests
             assert super_admin_user.can_view_guests
+
+    def test_can_moderate_staff_property_by_role(self, app):
+        from models import Role, User, db
+
+        with app.app_context():
+            def _make_user(username, role_name):
+                role = Role.query.filter_by(name=role_name).first()
+                user = User.query.filter_by(username=username).first()
+                if user is None:
+                    user = User(username=username, display_name=username, role_id=role.id)
+                    user.set_password("test-only-" + username)
+                    db.session.add(user)
+                    db.session.commit()
+                return user
+
+            admin_user = _make_user("_staff_perm_check_admin", "admin")
+            operator_user = _make_user("_staff_perm_check_operator", "operator")
+            viewer_user = _make_user("_staff_perm_check_viewer", "viewer")
+            moderator_user = _make_user("_staff_perm_check_moderator", "moderator")
+            super_admin_user = _make_user("_staff_perm_check_super_admin", "super_admin")
+
+            assert admin_user.can_moderate_staff
+            assert not operator_user.can_moderate_staff
+            assert not viewer_user.can_moderate_staff
+            assert not moderator_user.can_moderate_staff
+            assert super_admin_user.can_moderate_staff

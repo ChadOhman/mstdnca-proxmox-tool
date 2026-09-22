@@ -12,6 +12,7 @@ from core.mastodon_admin import (
     MastodonAdminClient,
     MastodonAPIError,
     RateLimitState,
+    is_staff_role,
     parse_iso,
     strip_html,
     summarize_account_activity,
@@ -20,6 +21,7 @@ from core.mastodon_admin import (
     summarize_status,
     validate_domain,
 )
+from routes.moderation import STAFF_TARGET_ERROR
 
 API = "https://masto.example"
 
@@ -97,6 +99,38 @@ class TestHelpers:
         assert out["id"] == "5"
         out_local = summarize_admin_account({"id": "6", "username": "l", "domain": None})
         assert out_local["acct"] == "l"
+
+    def test_summarize_admin_account_exposes_role_name_and_is_staff(self):
+        out = summarize_admin_account({
+            "id": "5", "username": "u", "domain": None,
+            "role": {"name": "Moderator", "permissions": "16"},
+        })
+        assert out["role"] == "Moderator"
+        assert out["role_name"] == "Moderator"
+        assert out["is_staff"] is True
+
+        out2 = summarize_admin_account({
+            "id": "6", "username": "l", "domain": None,
+            "role": {"name": "user", "permissions": "0"},
+        })
+        assert out2["role_name"] == "user"
+        assert out2["is_staff"] is False
+
+    @pytest.mark.parametrize("role,expected", [
+        (None, False),
+        ("", False),
+        ("user", False),
+        ("User", False),
+        ("admin", True),
+        ("Moderator", True),
+        ({"name": "", "permissions": "65536"}, False),
+        ({"name": "Verified", "permissions": "0"}, False),
+        ({"name": "Moderator", "permissions": "16"}, True),
+        ({"name": "Owner"}, True),
+        ({"name": "user"}, False),
+    ])
+    def test_is_staff_role(self, role, expected):
+        assert is_staff_role(role) is expected
 
     def test_parse_iso_handles_z_suffix(self):
         dt = parse_iso("2026-09-01T12:30:00Z")
@@ -345,11 +379,17 @@ class TestClientOperations:
     @patch("core.mastodon_admin.urllib.request.urlopen")
     def test_verify_probes_admin_scope(self, mock_urlopen):
         mock_urlopen.side_effect = [
-            _resp({"acct": "admin", "display_name": "A", "role": {"name": "Owner"}}),
+            _resp({
+                "id": "1", "acct": "admin", "display_name": "A", "role": {"name": "Owner"},
+                "url": "https://masto.example/@admin",
+            }),
             _resp([]),
         ]
         out = MastodonAdminClient(API, "t").verify()
-        assert out == {"acct": "admin", "display_name": "A", "role": "Owner"}
+        assert out == {
+            "id": "1", "acct": "admin", "display_name": "A", "role": "Owner",
+            "url": "https://masto.example/@admin",
+        }
         urls = [c[0][0].full_url for c in mock_urlopen.call_args_list]
         assert urls[0].endswith("/api/v1/accounts/verify_credentials")
         assert "/api/v1/admin/reports" in urls[1]
@@ -592,10 +632,15 @@ class TestMastodonSettings:
         from auth.credential_store import decrypt
         from models import Setting
 
-        resp = auth_client.post("/moderation/mastodon/save", data={
-            "mastodon_api_url": "https://masto.example/",
-            "mastodon_api_token": "test-only-masto-token",
-        }, follow_redirects=False)
+        with patch("routes.moderation.MastodonAdminClient") as mock_cls:
+            mock_cls.return_value.verify.return_value = {
+                "id": "1", "acct": "admin", "display_name": "A", "role": "Owner",
+                "url": "https://masto.example/@admin",
+            }
+            resp = auth_client.post("/moderation/mastodon/save", data={
+                "mastodon_api_url": "https://masto.example/",
+                "mastodon_api_token": "test-only-masto-token",
+            }, follow_redirects=False)
         assert resp.status_code == 302
         assert "tab=mastodon" in resp.headers["Location"]
         with app.app_context():
@@ -608,14 +653,65 @@ class TestMastodonSettings:
     def test_save_keeps_token_when_blank(self, app, auth_client):
         from models import Setting
 
-        auth_client.post("/moderation/mastodon/save", data={
-            "mastodon_api_url": "https://masto.example", "mastodon_api_token": "test-only-keep",
-        })
+        with patch("routes.moderation.MastodonAdminClient") as mock_cls:
+            mock_cls.return_value.verify.return_value = {
+                "id": "1", "acct": "admin", "display_name": "A", "role": "Owner", "url": "",
+            }
+            auth_client.post("/moderation/mastodon/save", data={
+                "mastodon_api_url": "https://masto.example", "mastodon_api_token": "test-only-keep",
+            })
         with app.app_context():
             before = Setting.get("moderation_mastodon_api_token")
         auth_client.post("/moderation/mastodon/save", data={"mastodon_api_url": "https://masto.example"})
         with app.app_context():
             assert Setting.get("moderation_mastodon_api_token") == before
+
+    def test_save_new_token_stores_verified_account(self, app, auth_client):
+        from models import Setting
+
+        with patch("routes.moderation.MastodonAdminClient") as mock_cls:
+            mock_cls.return_value.verify.return_value = {
+                "id": "1", "acct": "admin", "display_name": "Admin", "role": "Owner",
+                "url": "https://masto.example/@admin",
+            }
+            auth_client.post("/moderation/mastodon/save", data={
+                "mastodon_api_url": "https://masto.example",
+                "mastodon_api_token": "test-only-new-token",
+            })
+        with app.app_context():
+            stored = json.loads(Setting.get("moderation_mastodon_token_account", ""))
+        assert stored["acct"] == "admin"
+        assert stored["role"] == "Owner"
+        assert "checked_at" in stored
+
+    def test_save_new_token_that_fails_verify_clears_account_and_warns(self, app, auth_client):
+        from models import Setting
+
+        with app.app_context():
+            Setting.set("moderation_mastodon_token_account", json.dumps({"acct": "stale"}))
+
+        with patch("routes.moderation.MastodonAdminClient") as mock_cls:
+            mock_cls.return_value.verify.side_effect = MastodonAPIError(
+                "Mastodon API returned HTTP 401: token rejected", 401,
+            )
+            resp = auth_client.post("/moderation/mastodon/save", data={
+                "mastodon_api_url": "https://masto.example",
+                "mastodon_api_token": "test-only-bad-token",
+            }, follow_redirects=True)
+        assert b"could not be verified" in resp.data
+        with app.app_context():
+            assert Setting.get("moderation_mastodon_token_account", "") == ""
+
+    def test_save_url_change_with_kept_token_clears_stored_account(self, app, auth_client):
+        from models import Setting
+
+        with app.app_context():
+            Setting.set("moderation_mastodon_api_url", "https://old.example")
+            Setting.set("moderation_mastodon_token_account", json.dumps({"acct": "admin"}))
+
+        auth_client.post("/moderation/mastodon/save", data={"mastodon_api_url": "https://new.example"})
+        with app.app_context():
+            assert Setting.get("moderation_mastodon_token_account", "") == ""
 
     def test_save_rejects_non_http_url(self, app, auth_client):
         from models import Setting
@@ -661,6 +757,30 @@ class TestMastodonReadRoutes:
         resp = auth_client.post("/moderation/mastodon/test")
         assert resp.status_code == 200
         assert resp.get_json()["account"]["acct"] == "admin"
+
+    def test_test_connection_success_stores_token_account(self, app, auth_client, masto_client):
+        from models import Setting
+
+        masto_client.verify.return_value = {
+            "id": "1", "acct": "admin", "display_name": "Admin", "role": "Owner", "url": "",
+        }
+        resp = auth_client.post("/moderation/mastodon/test")
+        assert resp.status_code == 200
+        assert "checked_at" in resp.get_json()
+        with app.app_context():
+            stored = json.loads(Setting.get("moderation_mastodon_token_account", ""))
+        assert stored["acct"] == "admin"
+
+    def test_test_connection_failure_does_not_store_token_account(self, app, auth_client, masto_client):
+        from models import Setting
+
+        with app.app_context():
+            Setting.set("moderation_mastodon_token_account", "")
+        masto_client.verify.side_effect = MastodonAPIError("Mastodon API returned HTTP 401: token rejected", 401)
+        resp = auth_client.post("/moderation/mastodon/test")
+        assert resp.status_code == 502
+        with app.app_context():
+            assert Setting.get("moderation_mastodon_token_account", "") == ""
 
     def test_reports_list(self, auth_client, masto_client):
         masto_client.list_reports.return_value = [{"id": "1"}]
@@ -755,6 +875,42 @@ class TestMastodonMutationRoutes:
         auth_client.post("/moderation/mastodon/accounts/5/action", data={"type": "silence", "text": "x" * 5000})
         assert len(masto_client.account_action.call_args[1]["text"]) == 2000
 
+    def test_account_action_refuses_staff_target_for_moderator(self, app, moderator_client, masto_client):
+        masto_client.get_admin_account.return_value = {
+            "id": "5", "acct": "staffer", "is_staff": True, "role_name": "Moderator",
+        }
+        resp = moderator_client.post("/moderation/mastodon/accounts/5/action", data={"type": "suspend"})
+        assert resp.status_code == 403
+        assert resp.get_json() == {"ok": False, "error": STAFF_TARGET_ERROR}
+        masto_client.account_action.assert_not_called()
+        entry = _last_audit(app, "mastodon_account_action_refused")
+        assert entry is not None
+        assert entry.resource_name == "staffer"
+        assert entry.details["target_role"] == "Moderator"
+        assert entry.details["type"] == "suspend"
+
+    def test_account_action_allows_staff_target_for_admin(self, auth_client, masto_client):
+        masto_client.get_admin_account.return_value = {
+            "id": "5", "acct": "staffer", "is_staff": True, "role_name": "Moderator", "suspended": True,
+        }
+        resp = auth_client.post("/moderation/mastodon/accounts/5/action", data={"type": "suspend"})
+        assert resp.status_code == 200
+        masto_client.account_action.assert_called_once()
+
+    def test_account_action_allows_non_staff_target_for_moderator(self, moderator_client, masto_client):
+        masto_client.get_admin_account.return_value = {"id": "5", "acct": "regular", "is_staff": False}
+        resp = moderator_client.post("/moderation/mastodon/accounts/5/action", data={"type": "silence"})
+        assert resp.status_code == 200
+        masto_client.account_action.assert_called_once()
+
+    def test_account_action_get_admin_account_error_is_502(self, moderator_client, masto_client):
+        masto_client.get_admin_account.side_effect = MastodonAPIError(
+            "Mastodon API returned HTTP 404: not found", 404,
+        )
+        resp = moderator_client.post("/moderation/mastodon/accounts/5/action", data={"type": "silence"})
+        assert resp.status_code == 502
+        masto_client.account_action.assert_not_called()
+
     def test_lift_unknown_is_404(self, auth_client, masto_client):
         resp = auth_client.post("/moderation/mastodon/accounts/5/obliterate")
         assert resp.status_code == 404
@@ -766,6 +922,13 @@ class TestMastodonMutationRoutes:
         assert resp.status_code == 200
         masto_client.lift_account_action.assert_called_once_with(5, "unsuspend")
         assert _last_audit(app, "mastodon_account_unsuspend").resource_name == "bad"
+
+    def test_lift_on_staff_target_not_guarded_for_moderator(self, moderator_client, masto_client):
+        """The staff guard only applies to /action; lifting a prior action is unguarded."""
+        masto_client.get_admin_account.return_value = {"id": "5", "acct": "staffer", "is_staff": True}
+        resp = moderator_client.post("/moderation/mastodon/accounts/5/unsuspend", data={"acct": "staffer"})
+        assert resp.status_code == 200
+        masto_client.lift_account_action.assert_called_once_with(5, "unsuspend")
 
     def test_domain_block_create_validates_domain(self, auth_client, masto_client):
         resp = auth_client.post("/moderation/mastodon/domain_blocks", data={"domain": "https://spam.example"})
@@ -886,3 +1049,28 @@ class TestPeerTubeUserAgent:
         mock_urlopen.return_value = _resp({})
         ban_peertube_user("https://pt.example", "t", 5)
         assert mock_urlopen.call_args[0][0].get_header("User-agent") == "mstdnca-proxmox-tool"
+
+
+# ---------------------------------------------------------------------------
+# Template attribute for the "Act on Mastodon staff accounts" permission.
+# ---------------------------------------------------------------------------
+# Kept last in the file/module: templates/moderation.html is being edited
+# concurrently by another agent in this branch, so this test's outcome
+# depends on work happening outside this change. If it fails ONLY because
+# data-can-moderate-staff is missing from the rendered page, that is a
+# template gap to report, not something to fix here.
+
+
+class TestIndexCanModerateStaffAttribute:
+    # Two separate tests rather than one using both auth_client and
+    # moderator_client: both fixtures keep their test_client() "with" block
+    # open for the fixture's lifetime, and interleaving requests between two
+    # simultaneously-open clients of the same Flask app trips Werkzeug's
+    # request-context-stack assertion (unrelated to the feature under test).
+    def test_admin_sees_true(self, auth_client):
+        admin_html = auth_client.get("/moderation/?tab=mastodon").data.decode()
+        assert 'data-can-moderate-staff="true"' in admin_html
+
+    def test_moderator_sees_false(self, moderator_client):
+        moderator_html = moderator_client.get("/moderation/?tab=mastodon").data.decode()
+        assert 'data-can-moderate-staff="false"' in moderator_html

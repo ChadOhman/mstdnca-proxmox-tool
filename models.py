@@ -68,6 +68,7 @@ class Role(db.Model):
         "can_moderate",
         "can_use_ai",
         "can_view_guests",
+        "can_moderate_staff",
     ]
 
     PERMISSION_LABELS = {
@@ -89,6 +90,7 @@ class Role(db.Model):
         "can_moderate": "Moderate Applications",
         "can_use_ai": "Use AI Assistant",
         "can_view_guests": "View Guests & Update History",
+        "can_moderate_staff": "Act on Mastodon staff accounts",
     }
 
     BASE_TIER_LEVELS = {"viewer": 1, "operator": 2, "admin": 3}
@@ -119,6 +121,7 @@ class Role(db.Model):
     can_moderate = db.Column(db.Boolean, default=False)
     can_use_ai = db.Column(db.Boolean, default=False)
     can_view_guests = db.Column(db.Boolean, default=False)
+    can_moderate_staff = db.Column(db.Boolean, default=False)
 
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -140,35 +143,35 @@ DEFAULT_ROLES = [
      "can_view_hosts": True, "can_manage_hosts": True, "can_manage_guests": True,
      "can_restart_unifi": True, "can_view_audit_log": True, "can_view_services": True, "can_edit_services": True,
      "can_view_unifi": True, "can_view_ipmi": True, "can_manage_ipmi": True,
-     "can_moderate": True, "can_use_ai": True, "can_view_guests": True},
+     "can_moderate": True, "can_use_ai": True, "can_view_guests": True, "can_moderate_staff": True},
     {"name": "admin", "display_name": "Admin", "level": 3, "is_builtin": True,
      "can_ssh": True, "can_update": True, "can_manage_users": True,
      "can_manage_settings": False, "can_manage_credentials": False,
      "can_view_hosts": True, "can_manage_hosts": True, "can_manage_guests": True,
      "can_restart_unifi": True, "can_view_audit_log": True, "can_view_services": True, "can_edit_services": True,
      "can_view_unifi": True, "can_view_ipmi": True, "can_manage_ipmi": True,
-     "can_moderate": True, "can_use_ai": True, "can_view_guests": True},
+     "can_moderate": True, "can_use_ai": True, "can_view_guests": True, "can_moderate_staff": True},
     {"name": "operator", "display_name": "Operator", "level": 2, "is_builtin": True,
      "can_ssh": True, "can_update": True, "can_manage_users": False,
      "can_manage_settings": False, "can_manage_credentials": False,
      "can_view_hosts": True, "can_manage_hosts": False, "can_manage_guests": False,
      "can_restart_unifi": False, "can_view_audit_log": False, "can_view_services": False, "can_edit_services": False,
      "can_view_unifi": False, "can_view_ipmi": True, "can_manage_ipmi": False,
-     "can_moderate": False, "can_use_ai": False, "can_view_guests": True},
+     "can_moderate": False, "can_use_ai": False, "can_view_guests": True, "can_moderate_staff": False},
     {"name": "viewer", "display_name": "Viewer", "level": 1, "is_builtin": True,
      "can_ssh": False, "can_update": False, "can_manage_users": False,
      "can_manage_settings": False, "can_manage_credentials": False,
      "can_view_hosts": False, "can_manage_hosts": False, "can_manage_guests": False,
      "can_restart_unifi": False, "can_view_audit_log": False, "can_view_services": False, "can_edit_services": False,
      "can_view_unifi": False, "can_view_ipmi": False, "can_manage_ipmi": False,
-     "can_moderate": False, "can_use_ai": False, "can_view_guests": True},
+     "can_moderate": False, "can_use_ai": False, "can_view_guests": True, "can_moderate_staff": False},
     {"name": "moderator", "display_name": "Moderator", "level": 2, "is_builtin": True,
      "can_ssh": False, "can_update": False, "can_manage_users": False,
      "can_manage_settings": False, "can_manage_credentials": False,
      "can_view_hosts": False, "can_manage_hosts": False, "can_manage_guests": False,
      "can_restart_unifi": False, "can_view_audit_log": False, "can_view_services": False, "can_edit_services": False,
      "can_view_unifi": False, "can_view_ipmi": False, "can_manage_ipmi": False,
-     "can_moderate": True, "can_use_ai": False, "can_view_guests": False},
+     "can_moderate": True, "can_use_ai": False, "can_view_guests": False, "can_moderate_staff": False},
 ]
 
 
@@ -347,6 +350,12 @@ class User(UserMixin, db.Model):
         if self.is_super_admin:
             return True
         return self.role_obj.can_view_guests if self.role_obj else False
+
+    @property
+    def can_moderate_staff(self):
+        if self.is_super_admin:
+            return True
+        return self.role_obj.can_moderate_staff if self.role_obj else False
 
     @property
     def role_display(self):

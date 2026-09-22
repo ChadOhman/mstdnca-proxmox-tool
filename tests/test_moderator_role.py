@@ -141,3 +141,11 @@ class TestModeratorRoleDefinition:
         for key, value in moderator.items():
             if key.startswith("can_") and key != "can_moderate":
                 assert value is False, f"moderator role should not grant {key}"
+
+    def test_can_moderate_staff_is_admin_tier_only(self):
+        by_name = {r["name"]: r for r in DEFAULT_ROLES}
+        assert by_name["super_admin"]["can_moderate_staff"] is True
+        assert by_name["admin"]["can_moderate_staff"] is True
+        assert by_name["operator"]["can_moderate_staff"] is False
+        assert by_name["viewer"]["can_moderate_staff"] is False
+        assert by_name["moderator"]["can_moderate_staff"] is False
