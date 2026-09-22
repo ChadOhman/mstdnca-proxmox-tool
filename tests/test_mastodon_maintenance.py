@@ -224,6 +224,120 @@ class TestRunMaintenanceFailure:
         assert result["message"] == "network or I/O error"
 
 
+def _token_account_settings(account_id="3", acct="admin"):
+    import json
+    Setting.set("moderation_mastodon_token_account", json.dumps({"id": account_id, "acct": acct}))
+
+
+class TestRunStatusAction:
+    def test_delete_success_parses_count_and_mentions_report(self, app):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            guest = _guest(9980, "mastodon-status-del")
+            _settings(mastodon_guest_id=str(guest.id))
+            _token_account_settings()
+            fake = _FakeSSH(stdout="OK 2\n", code=0)
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                mock_ssh.from_credential.return_value = fake
+                result = run_status_action("delete", ["10", "20"], "9")
+
+        assert result["ok"] is True
+        assert result["count"] == 2
+        assert "report #9" in result["message"]
+        assert "Delete" in result["message"]
+        mock_ssh.from_credential.assert_called_once()
+        assert "Account.find" not in fake.calls[0]  # the *shell* command, not the script
+        assert "bin/rails runner -" in fake.calls[0]
+
+    def test_mark_as_sensitive_success(self, app):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            guest = _guest(9981, "mastodon-status-sens")
+            _settings(mastodon_guest_id=str(guest.id))
+            _token_account_settings()
+            fake = _FakeSSH(stdout="OK 1\n", code=0)
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                mock_ssh.from_credential.return_value = fake
+                result = run_status_action("mark_as_sensitive", ["10"], "9")
+
+        assert result["ok"] is True
+        assert result["count"] == 1
+        assert "Mark as sensitive" in result["message"]
+
+    def test_ruby_exception_on_stderr_is_surfaced(self, app):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            guest = _guest(9982, "mastodon-status-err")
+            _settings(mastodon_guest_id=str(guest.id))
+            _token_account_settings()
+            fake = _FakeSSH(stdout="", stderr="RuntimeError: none of the selected statuses belong to this report\n",
+                            code=1)
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                mock_ssh.from_credential.return_value = fake
+                result = run_status_action("delete", ["10"], "9")
+
+        assert result["ok"] is False
+        assert result["count"] == 0
+        assert result["message"] == "RuntimeError: none of the selected statuses belong to this report"
+
+    def test_non_zero_exit_without_output_falls_back_to_exit_code_message(self, app):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            guest = _guest(9983, "mastodon-status-noout")
+            _settings(mastodon_guest_id=str(guest.id))
+            _token_account_settings()
+            fake = _FakeSSH(stdout="", stderr="", code=1)
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                mock_ssh.from_credential.return_value = fake
+                result = run_status_action("delete", ["10"], "9")
+
+        assert result["ok"] is False
+        assert result["message"] == "rails runner exited with code 1"
+
+    def test_zero_exit_without_ok_marker_is_failure(self, app):
+        """A rails runner deprecation warning on stdout without the OK marker must not be
+        misread as success.
+        """
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            guest = _guest(9984, "mastodon-status-noOK")
+            _settings(mastodon_guest_id=str(guest.id))
+            _token_account_settings()
+            fake = _FakeSSH(stdout="some warning\n", stderr="", code=0)
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                mock_ssh.from_credential.return_value = fake
+                result = run_status_action("delete", ["10"], "9")
+
+        assert result["ok"] is False
+        assert result["count"] == 0
+
+    def test_missing_guest_configuration(self, app):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            _settings(mastodon_guest_id="")
+            _token_account_settings()
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                result = run_status_action("delete", ["10"], "9")
+
+        assert result["ok"] is False
+        assert result["message"] == "Mastodon app guest is not configured"
+        mock_ssh.from_credential.assert_not_called()
+
+    def test_ssh_exception_never_leaks_raw_text(self, app):
+        from core.mastodon_maintenance import run_status_action
+        with app.app_context():
+            guest = _guest(9985, "mastodon-status-sshfail")
+            _settings(mastodon_guest_id=str(guest.id))
+            _token_account_settings()
+            with patch("core.mastodon_maintenance.SSHClient") as mock_ssh:
+                mock_ssh.from_credential.side_effect = OSError("connection reset by internal-host-10.2.3.4")
+                result = run_status_action("delete", ["10"], "9")
+
+        assert result["ok"] is False
+        assert "internal-host" not in result["message"]
+        assert result["message"] == "network or I/O error"
+
+
 class TestMaintenanceSlot:
     def test_slot_is_reentrant_free_after_release(self):
         from core.mastodon_maintenance import maintenance_slot
@@ -482,3 +596,270 @@ class TestMaintenanceRoute:
             )
         assert resp.status_code == 409
         assert resp.get_json() == {"ok": False, "error": "Another maintenance action is running"}
+
+
+# ---------------------------------------------------------------------------
+# Route: POST /moderation/mastodon/reports/<id>/statuses/action
+# ---------------------------------------------------------------------------
+
+_REPORT_ACTION_VIEWER_PASSWORD = "test-only-ReportActionsViewerPass123!"
+
+
+@pytest.fixture()
+def viewer_client(app):
+    """A test client logged in as a low-privilege (viewer, no can_moderate) user."""
+    with app.app_context():
+        role = Role.query.filter_by(name="viewer").first()
+        user = User.query.filter_by(username="_report_action_viewer").first()
+        if user is None:
+            user = User(username="_report_action_viewer", display_name="Report Action Viewer", role_id=role.id)
+            user.set_password(_REPORT_ACTION_VIEWER_PASSWORD)
+            db.session.add(user)
+            db.session.commit()
+    with app.test_client() as c:
+        c.post(
+            "/login",
+            data={"username": "_report_action_viewer", "password": _REPORT_ACTION_VIEWER_PASSWORD},
+            follow_redirects=False,
+        )
+        yield c
+
+
+def _report(report_id=9, status_ids=("10", "20"), action_taken=False, target=None):
+    return {
+        "id": report_id,
+        "action_taken": action_taken,
+        "statuses": [{"id": sid} for sid in status_ids],
+        "target_account": target if target is not None else {
+            "id": "5", "acct": "alice", "username": "aliceuser", "domain": None, "is_staff": False,
+        },
+    }
+
+
+@pytest.fixture()
+def report_maintenance_settings(app):
+    """Configure the token-account identity and app guest that run_status_action()
+    needs before it will even reach the maintenance lock, cleaning both settings
+    up afterward so they don't leak into other tests sharing the session-scoped app.
+    """
+    with app.app_context():
+        _token_account_settings()
+        Setting.set("mastodon_guest_id", "1")
+    yield
+    with app.app_context():
+        Setting.set("moderation_mastodon_token_account", "")
+        Setting.set("mastodon_guest_id", "")
+
+
+class TestReportStatusesActionRoute:
+    def test_unauthenticated_is_redirected_to_login(self, client, masto_client):
+        resp = client.post(
+            "/moderation/mastodon/reports/9/statuses/action",
+            data={"type": "delete", "status_ids": ["10"]},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        assert "/login" in resp.headers.get("Location", "")
+
+    def test_viewer_is_redirected(self, viewer_client, masto_client):
+        resp = viewer_client.post(
+            "/moderation/mastodon/reports/9/statuses/action",
+            data={"type": "delete", "status_ids": ["10"]},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        masto_client.get_report.assert_not_called()
+
+    def test_moderator_allowed_without_maintenance_flag(self, moderator_client, masto_client,
+                                                          report_maintenance_settings):
+        masto_client.get_report.return_value = _report()
+        with patch("routes.moderation.run_status_action") as mock_run:
+            mock_run.return_value = {
+                "ok": True, "message": "Delete applied to 2 post(s)", "count": 2, "output": "OK 2",
+            }
+            resp = moderator_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["10", "20"]},
+            )
+        assert resp.status_code == 200
+        assert resp.get_json() == {"ok": True, "message": "Delete applied to 2 post(s)", "count": 2}
+
+    def test_unknown_type_is_400(self, auth_client, masto_client):
+        resp = auth_client.post(
+            "/moderation/mastodon/reports/9/statuses/action",
+            data={"type": "nuke_from_orbit", "status_ids": ["10"]},
+        )
+        assert resp.status_code == 400
+        masto_client.get_report.assert_not_called()
+
+    def test_no_ids_is_400(self, auth_client, masto_client):
+        resp = auth_client.post(
+            "/moderation/mastodon/reports/9/statuses/action",
+            data={"type": "delete"},
+        )
+        assert resp.status_code == 400
+        masto_client.get_report.assert_not_called()
+
+    def test_ids_not_on_report_is_400_and_run_not_called(self, auth_client, masto_client):
+        masto_client.get_report.return_value = _report(status_ids=("10", "20"))
+        with patch("routes.moderation.run_status_action") as mock_run:
+            resp = auth_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["999"]},
+            )
+        assert resp.status_code == 400
+        assert "None of the selected posts" in resp.get_json()["error"]
+        mock_run.assert_not_called()
+
+    def test_resolved_report_is_400(self, auth_client, masto_client):
+        masto_client.get_report.return_value = _report(action_taken=True)
+        with patch("routes.moderation.run_status_action") as mock_run:
+            resp = auth_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["10"]},
+            )
+        assert resp.status_code == 400
+        assert "already resolved" in resp.get_json()["error"]
+        mock_run.assert_not_called()
+
+    def test_staff_target_refused_for_moderator(self, app, moderator_client, masto_client):
+        masto_client.get_report.return_value = _report(target={
+            "id": "5", "acct": "staffer", "username": "staffer", "domain": None,
+            "is_staff": True, "role_name": "Moderator",
+        })
+        with patch("routes.moderation.run_status_action") as mock_run:
+            resp = moderator_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["10"]},
+            )
+        assert resp.status_code == 403
+        assert resp.get_json() == {"ok": False, "error": STAFF_TARGET_ERROR}
+        mock_run.assert_not_called()
+
+        entry = _last_audit(app, "mastodon_account_action_refused")
+        assert entry is not None
+        assert entry.resource_name == "staffer"
+        assert entry.details["type"] == "posts:delete"
+
+    def test_staff_target_ok_for_admin(self, auth_client, masto_client, report_maintenance_settings):
+        masto_client.get_report.return_value = _report(target={
+            "id": "5", "acct": "staffer", "username": "staffer", "domain": None,
+            "is_staff": True, "role_name": "Moderator",
+        })
+        with patch("routes.moderation.run_status_action") as mock_run:
+            mock_run.return_value = {
+                "ok": True, "message": "Delete applied to 1 post(s)", "count": 1, "output": "OK 1",
+            }
+            resp = auth_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["10"]},
+            )
+        assert resp.status_code == 200
+        mock_run.assert_called_once()
+
+    def test_remote_target_forces_send_email_false(self, auth_client, masto_client, report_maintenance_settings):
+        masto_client.get_report.return_value = _report(target={
+            "id": "5", "acct": "alice@remote.example", "username": "alice", "domain": "remote.example",
+            "is_staff": False,
+        })
+        with patch("routes.moderation.run_status_action") as mock_run:
+            mock_run.return_value = {"ok": True, "message": "ok", "count": 2, "output": "OK 2"}
+            resp = auth_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["10", "20"], "send_email_notification": "1"},
+            )
+        assert resp.status_code == 200
+        mock_run.assert_called_once_with("delete", ["10", "20"], "9", text="", send_email=False)
+
+    def test_missing_token_account_is_400(self, app, auth_client, masto_client):
+        masto_client.get_report.return_value = _report()
+        with app.app_context():
+            Setting.set("moderation_mastodon_token_account", "")
+            Setting.set("mastodon_guest_id", "1")
+        with patch("routes.moderation.run_status_action") as mock_run:
+            resp = auth_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["10"]},
+            )
+        assert resp.status_code == 400
+        assert "Test Connection" in resp.get_json()["error"]
+        mock_run.assert_not_called()
+
+    def test_missing_guest_is_400(self, app, auth_client, masto_client):
+        masto_client.get_report.return_value = _report()
+        with app.app_context():
+            _token_account_settings()
+            Setting.set("mastodon_guest_id", "")
+        with patch("routes.moderation.run_status_action") as mock_run:
+            resp = auth_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["10"]},
+            )
+        assert resp.status_code == 400
+        assert "Configure the Mastodon app guest" in resp.get_json()["error"]
+        mock_run.assert_not_called()
+        with app.app_context():
+            Setting.set("moderation_mastodon_token_account", "")
+
+    def test_busy_is_409(self, auth_client, masto_client, report_maintenance_settings):
+        from core.mastodon_maintenance import MaintenanceBusy
+
+        masto_client.get_report.return_value = _report()
+        with patch("routes.moderation.maintenance_slot") as mock_slot:
+            mock_slot.side_effect = MaintenanceBusy("busy")
+            resp = auth_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["10"]},
+            )
+        assert resp.status_code == 409
+        assert resp.get_json() == {"ok": False, "error": "Another server-side action is running"}
+
+    def test_ok_result_audits_without_text_content(self, app, auth_client, masto_client,
+                                                     report_maintenance_settings):
+        masto_client.get_report.return_value = _report()
+        with patch("routes.moderation.run_status_action") as mock_run:
+            mock_run.return_value = {
+                "ok": True, "message": "Delete applied to 2 post(s)", "count": 2, "output": "OK 2",
+            }
+            resp = auth_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["10", "20"], "text": "spam content here"},
+            )
+        assert resp.status_code == 200
+        assert resp.get_json() == {"ok": True, "message": "Delete applied to 2 post(s)", "count": 2}
+
+        entry = _last_audit(app, "mastodon_report_posts_delete")
+        assert entry is not None
+        assert entry.resource_name == "report 9"
+        assert entry.details == {
+            "report_id": "9", "status_count": 2, "acted": 2, "ok": True,
+            "target": "alice", "text_len": len("spam content here"), "email": False,
+        }
+        assert "spam content here" not in str(entry.details)
+
+    def test_ok_false_result_is_502(self, auth_client, masto_client, report_maintenance_settings):
+        masto_client.get_report.return_value = _report()
+        with patch("routes.moderation.run_status_action") as mock_run:
+            mock_run.return_value = {"ok": False, "message": "RuntimeError: boom", "count": 0, "output": ""}
+            resp = auth_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "delete", "status_ids": ["10"]},
+            )
+        assert resp.status_code == 502
+        assert resp.get_json() == {"ok": False, "error": "RuntimeError: boom"}
+
+    def test_mark_as_sensitive_audits_correct_action(self, app, auth_client, masto_client,
+                                                       report_maintenance_settings):
+        masto_client.get_report.return_value = _report()
+        with patch("routes.moderation.run_status_action") as mock_run:
+            mock_run.return_value = {
+                "ok": True, "message": "Mark as sensitive applied to 2 post(s)", "count": 2, "output": "OK 2",
+            }
+            resp = auth_client.post(
+                "/moderation/mastodon/reports/9/statuses/action",
+                data={"type": "mark_as_sensitive", "status_ids": ["10", "20"]},
+            )
+        assert resp.status_code == 200
+        entry = _last_audit(app, "mastodon_report_posts_mark_as_sensitive")
+        assert entry is not None
+        assert entry.details["ok"] is True

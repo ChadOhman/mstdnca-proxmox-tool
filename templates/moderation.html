@@ -790,6 +790,60 @@
     </div>
 </div>
 
+<!-- Mastodon act on posts modal -->
+<div class="modal fade" id="mastoPostsModal" tabindex="-1" aria-modal="true" role="dialog" aria-labelledby="mastoPostsModalLabel">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content bg-dark border-secondary">
+            <form id="masto-posts-form">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title" id="mastoPostsModalLabel">Act on reported posts</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Cancel"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-2">
+                        Report #<span id="masto-posts-report-id"></span> &middot;
+                        <span id="masto-posts-target-link" class="font-monospace"></span>
+                    </p>
+                    <div id="masto-posts-list" class="mb-3" style="max-height:16rem;overflow-y:auto"></div>
+                    <div class="mb-3">
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input" type="radio" name="masto-posts-type" id="masto-posts-type-delete" value="delete" checked>
+                            <label class="form-check-label" for="masto-posts-type-delete">Delete</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input" type="radio" name="masto-posts-type" id="masto-posts-type-sensitive" value="mark_as_sensitive">
+                            <label class="form-check-label" for="masto-posts-type-sensitive">Mark as sensitive</label>
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label" for="masto-posts-text">Note</label>
+                        <textarea class="form-control" id="masto-posts-text" rows="3" maxlength="2000"></textarea>
+                        <div class="form-text">Shown to the author in the strike record; emailed only to local accounts.</div>
+                    </div>
+                    <div class="form-check form-switch mb-2">
+                        <input class="form-check-input" type="checkbox" id="masto-posts-email">
+                        <label class="form-check-label" for="masto-posts-email">Email the author</label>
+                    </div>
+                    <div id="masto-posts-email-hint" class="form-text text-warning mb-2" style="display:none"></div>
+                    <div class="form-text mb-2">
+                        Runs Mastodon's own report action on the server (10–30 s). Deleting also resolves the report.
+                    </div>
+                    <div id="masto-posts-busy" class="text-muted small mb-2" style="display:none">
+                        <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>
+                        Running the report action on the Mastodon guest (10–30 s)…
+                    </div>
+                    <div id="masto-posts-result" class="mb-2" style="display:none"></div>
+                    <div id="masto-posts-error" class="text-danger small" aria-live="polite"></div>
+                </div>
+                <div class="modal-footer border-secondary">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-danger" id="masto-posts-submit" disabled>Run</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 {% endblock %}
 
 {% block scripts %}
@@ -852,6 +906,12 @@
     function maintLock(a) {
         if (a && a.is_staff && !canModerateStaff) return staffLock(a);
         if (!canMaintain) return ' disabled title="' + escHtml(MAINT_ROLE_MSG) + '"';
+        if (!maintenanceAvailable) return ' disabled title="' + escHtml(MAINT_UNAVAILABLE_MSG) + '"';
+        return '';
+    }
+    function postsLock(a) {
+        const lock = staffLock(a);
+        if (lock) return lock;
         if (!maintenanceAvailable) return ' disabled title="' + escHtml(MAINT_UNAVAILABLE_MSG) + '"';
         return '';
     }
@@ -1474,7 +1534,10 @@
                 + '<td class="text-end text-nowrap">'
                 + (resolved
                     ? notifyBtn + '<button type="button" class="btn btn-sm btn-outline-secondary" data-report-act="reopen">Reopen</button>'
-                    : '<button type="button" class="btn btn-sm btn-outline-danger me-1" data-report-act="action"' + staffLock(t) + '>Act on account…</button>'
+                    : ((r.statuses && r.statuses.length)
+                        ? '<button type="button" class="btn btn-sm btn-outline-danger me-1" data-report-act="posts"' + postsLock(t) + '>Act on posts…</button>'
+                        : '')
+                      + '<button type="button" class="btn btn-sm btn-outline-danger me-1" data-report-act="action"' + staffLock(t) + '>Act on account…</button>'
                       + '<button type="button" class="btn btn-sm btn-outline-success me-1" data-report-act="resolve">Resolve</button>'
                       + notifyBtn)
                 + '</td></tr>';
@@ -1490,6 +1553,10 @@
             const act = btn.dataset.reportAct;
             if (act === 'action') {
                 openActionModal(r.target_account, { reportId: rid, report: r, after: loadReports });
+                return;
+            }
+            if (act === 'posts') {
+                openPostsModal(r);
                 return;
             }
             if (act === 'notify') {
@@ -1612,6 +1679,116 @@
     document.getElementById('masto-notice-form').addEventListener('submit', e => {
         e.preventDefault();
         sendReportNotice(false).catch(() => { /* handled above */ });
+    });
+
+    // ── act on reported posts ───────────────────────────────────────────────
+    const postsModalEl = document.getElementById('mastoPostsModal');
+    const postsModal = bootstrap.Modal.getOrCreateInstance(postsModalEl);
+    const postsListEl = document.getElementById('masto-posts-list');
+    let postsModalReport = null;  // report the posts modal currently applies to
+
+    function updatePostsSubmitState() {
+        const any = postsListEl.querySelectorAll('input[name="status_ids"]:checked').length > 0;
+        document.getElementById('masto-posts-submit').disabled = !any;
+    }
+    postsListEl.addEventListener('change', updatePostsSubmitState);
+
+    // Opens the "act on posts" modal for report r, listing its reported
+    // statuses as checkboxes (all selected by default).
+    function openPostsModal(r) {
+        postsModalReport = r;
+        const t = r.target_account || {};
+        document.getElementById('masto-posts-report-id').textContent = r.id;
+        document.getElementById('masto-posts-target-link').innerHTML = acctLink(t);
+
+        let html = '';
+        (r.statuses || []).forEach(s => {
+            const sid = escHtml(String(s.id));
+            const excerpt = (s.excerpt || '(no text)').slice(0, 200);
+            html += '<div class="form-check mb-2 pb-2 border-bottom border-secondary">'
+                + '<input class="form-check-input" type="checkbox" name="status_ids" value="' + sid + '" id="masto-posts-status-' + sid + '" checked>'
+                + '<label class="form-check-label small" for="masto-posts-status-' + sid + '">'
+                + escHtml(excerpt)
+                + (s.url ? ' <a href="' + escHtml(s.url) + '" target="_blank" rel="noopener" class="text-muted"><i class="bi bi-box-arrow-up-right"></i></a>' : '')
+                + ' <span class="text-muted">' + fmtDate(s.created_at) + '</span>'
+                + (s.media_count ? ' <span class="badge bg-secondary">' + s.media_count + ' media</span>' : '')
+                + '</label>'
+                + '</div>';
+        });
+        postsListEl.innerHTML = html;
+
+        document.getElementById('masto-posts-type-delete').checked = true;
+        document.getElementById('masto-posts-text').value = '';
+
+        const emailEl = document.getElementById('masto-posts-email');
+        const emailHint = document.getElementById('masto-posts-email-hint');
+        if (t.domain) {
+            emailEl.checked = false;
+            emailEl.disabled = true;
+            emailHint.textContent = 'Remote account: no local user to email.';
+            emailHint.style.display = '';
+        } else {
+            emailEl.checked = true;
+            emailEl.disabled = false;
+            emailHint.style.display = 'none';
+        }
+
+        document.getElementById('masto-posts-error').textContent = '';
+        const resultEl = document.getElementById('masto-posts-result');
+        resultEl.innerHTML = '';
+        resultEl.style.display = 'none';
+        document.getElementById('masto-posts-busy').style.display = 'none';
+        updatePostsSubmitState();
+        postsModal.show();
+    }
+
+    document.getElementById('masto-posts-form').addEventListener('submit', e => {
+        e.preventDefault();
+        const r = postsModalReport;
+        if (!r) return;
+        const ids = Array.from(postsListEl.querySelectorAll('input[name="status_ids"]:checked')).map(cb => cb.value);
+        if (!ids.length) return;
+        const type = document.querySelector('input[name="masto-posts-type"]:checked').value;
+        const text = document.getElementById('masto-posts-text').value;
+        const email = document.getElementById('masto-posts-email').checked;
+        const submitBtn = document.getElementById('masto-posts-submit');
+        const errEl = document.getElementById('masto-posts-error');
+        const resultEl = document.getElementById('masto-posts-result');
+        const busyEl = document.getElementById('masto-posts-busy');
+        errEl.textContent = '';
+        resultEl.innerHTML = '';
+        resultEl.style.display = 'none';
+        submitBtn.disabled = true;
+        busyEl.style.display = '';
+
+        const fd = new FormData();
+        fd.append('type', type);
+        ids.forEach(id => fd.append('status_ids', id));
+        fd.append('text', text);
+        fd.append('send_email_notification', email ? '1' : '0');
+
+        api('/moderation/mastodon/reports/' + encodeURIComponent(r.id) + '/statuses/action', fd)
+            .then(d => {
+                busyEl.style.display = 'none';
+                resultEl.innerHTML = escHtml(d.message || 'Done.');
+                resultEl.style.display = '';
+                setTimeout(() => {
+                    postsModal.hide();
+                    loadReports();
+                    maybeOpenNoticeModal(r);
+                }, 1200);
+            })
+            .catch(err => {
+                busyEl.style.display = 'none';
+                errEl.innerHTML = errorBox(err.message);
+                submitBtn.disabled = false;
+            });
+    });
+
+    postsModalEl.addEventListener('hidden.bs.modal', () => {
+        const resultEl = document.getElementById('masto-posts-result');
+        resultEl.innerHTML = '';
+        resultEl.style.display = 'none';
     });
 
     // ── pending approvals ─────────────────────────────────────────────────

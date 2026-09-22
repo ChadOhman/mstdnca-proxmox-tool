@@ -429,6 +429,17 @@ class MastodonAdminClient(_MastodonClientBase):
             return open_reports + resolved_reports
         return self.list_reports(resolved=resolved, **filter_kwargs)
 
+    def get_report(self, report_id):
+        """Fetch one report and reduce it with :func:`summarize_report`.
+
+        ``target_account`` in the result carries ``is_staff``/``domain`` (from
+        ``summarize_admin_account``) and ``statuses`` carries ``id``/``url``/
+        ``excerpt`` (from ``summarize_status``) -- everything the status-action
+        UI needs to let a moderator pick which reported posts to act on.
+        """
+        data, _ = self._request("GET", f"/api/v1/admin/reports/{int(report_id)}")
+        return summarize_report(data)
+
     def resolve_report(self, report_id):
         data, _ = self._request("POST", f"/api/v1/admin/reports/{int(report_id)}/resolve")
         return data

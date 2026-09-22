@@ -556,6 +556,26 @@ class TestClientOperations:
         assert "target_account_id" not in url
 
     @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_get_report_hits_the_right_path_and_reduces(self, mock_urlopen):
+        mock_urlopen.return_value = _resp({
+            "id": "42", "category": "spam", "comment": "bad", "action_taken": False,
+            "target_account": {
+                "id": "2", "username": "bad", "domain": "remote.example",
+                "role": {"name": "Moderator", "permissions": "16"},
+                "account": {"id": "2", "acct": "bad@remote.example"},
+            },
+            "statuses": [{"id": "9", "url": "https://masto.example/@bad/9", "content": "<p>buy now</p>"}],
+        })
+        out = MastodonAdminClient(API, "t").get_report(42)
+        assert mock_urlopen.call_args[0][0].full_url == f"{API}/api/v1/admin/reports/42"
+        assert out["id"] == "42"
+        assert out["target_account"]["domain"] == "remote.example"
+        assert out["target_account"]["is_staff"] is True
+        assert out["statuses"][0]["id"] == "9"
+        assert out["statuses"][0]["url"] == "https://masto.example/@bad/9"
+        assert out["statuses"][0]["excerpt"] == "buy now"
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
     def test_search_accounts_sends_only_given_filters(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").search_accounts(email="a@b.com", username="bob")
@@ -836,6 +856,7 @@ class TestMastodonRouteAuth:
         ("post", "/moderation/mastodon/save"),
         ("post", "/moderation/mastodon/test"),
         ("post", "/moderation/mastodon/reports/1/resolve"),
+        ("post", "/moderation/mastodon/reports/1/statuses/action"),
         ("post", "/moderation/mastodon/accounts/1/approve"),
         ("post", "/moderation/mastodon/accounts/1/action"),
         ("post", "/moderation/mastodon/accounts/1/unsuspend"),
