@@ -87,6 +87,13 @@ class TestModeratorAllowed:
         assert b"/moderation/mastodon/welcome/save" in resp.data
         assert b"/moderation/mastodon/report_notice/save" in resp.data
 
+    def test_moderator_moderation_page_shows_activity_log_pill(self, moderator_client):
+        resp = moderator_client.get("/moderation/", follow_redirects=False)
+        assert resp.status_code == 200
+        assert b'id="log-tab"' in resp.data
+        assert b"Activity log" in resp.data
+        assert b'href="/moderation/log"' in resp.data
+
     def test_moderator_can_reach_watch_and_summary(self, moderator_client):
         resp = moderator_client.get("/moderation/mastodon/watch", follow_redirects=False)
         assert resp.status_code == 200

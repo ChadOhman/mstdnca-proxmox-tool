@@ -30,6 +30,7 @@ INTERVAL_BOUNDS = {
     "prometheus_collect_interval": (10, 86400, 60),  # seconds
     "moderation_check_interval_hours": (1, 8760, 24),
     "moderation_watch_poll_minutes": (1, 1440, 5),
+    "moderation_log_retention_days": (30, 3650, 365),
 }
 
 VALID_WINDOW_DAYS = frozenset({
@@ -816,14 +817,40 @@ def _check_app_update(app):
 
 
 def _purge_old_audit_logs(app):
-    """Delete audit log entries older than 90 days."""
+    """Delete audit log entries older than their retention threshold.
+
+    Moderation-related rows (see core.moderation_log.moderation_log_filter --
+    the same definition that drives the Moderation page's Activity log tab)
+    get their own configurable retention window so a moderation team can keep
+    a longer history than the rest of the audit log. Everything else is
+    purged at the fixed 90-day threshold this job has always used.
+    """
     with app.app_context():
+        from sqlalchemy import not_
+
+        from core.moderation_log import moderation_log_filter
         from models import AuditLog, db
-        cutoff = datetime.now(timezone.utc) - timedelta(days=90)
-        deleted = AuditLog.query.filter(AuditLog.timestamp < cutoff).delete()
+
+        moderation_retention_days = interval_setting("moderation_log_retention_days")
+        now = datetime.now(timezone.utc)
+        general_cutoff = now - timedelta(days=90)
+        moderation_cutoff = now - timedelta(days=moderation_retention_days)
+
+        is_moderation = moderation_log_filter()
+        deleted_moderation = AuditLog.query.filter(
+            is_moderation, AuditLog.timestamp < moderation_cutoff
+        ).delete(synchronize_session=False)
+        deleted_general = AuditLog.query.filter(
+            not_(is_moderation), AuditLog.timestamp < general_cutoff
+        ).delete(synchronize_session=False)
         db.session.commit()
+
+        deleted = deleted_moderation + deleted_general
         if deleted:
-            logger.info(f"Purged {deleted} audit log entries older than 90 days.")
+            logger.info(
+                "Purged %d audit log entries (%d moderation, older than %d days; %d general, older than 90 days).",
+                deleted, deleted_moderation, moderation_retention_days, deleted_general,
+            )
 
 
 def _poll_unifi_events(app):
@@ -1655,7 +1682,7 @@ def init_scheduler(app):
         trigger=IntervalTrigger(hours=24),
         args=[app],
         id="audit_log_purge",
-        name="Purge audit log entries older than 90 days",
+        name="Purge audit log entries past retention (90 days general, configurable for moderation rows)",
         replace_existing=True,
         max_instances=1,
     )
