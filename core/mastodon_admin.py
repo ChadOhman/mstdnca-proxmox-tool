@@ -13,6 +13,7 @@ scopes. Create it from an application under *Preferences -> Development* on
 the Mastodon instance while logged in as an admin.
 """
 
+import ipaddress
 import json
 import logging
 import re
@@ -43,6 +44,9 @@ ACCOUNT_ACTION_TYPES = ("none", "disable", "silence", "suspend", "sensitive")
 ACCOUNT_LIFT_ACTIONS = ("enable", "unsilence", "unsuspend", "unsensitive")
 # Valid ``severity`` values for domain blocks.
 DOMAIN_BLOCK_SEVERITIES = ("silence", "suspend", "noop")
+# Valid ``origin``/``status`` values for GET /api/v2/admin/accounts (search_accounts).
+ACCOUNT_SEARCH_ORIGINS = ("local", "remote")
+ACCOUNT_SEARCH_STATUSES = ("active", "pending", "suspended", "disabled", "silenced", "sensitized")
 
 # Mastodon UserRole::Flags: bit 16 is invite_users, the only permission the default
 # "everyone" role carries. Any other bit means the role is staff. Must match the
@@ -180,6 +184,14 @@ def strip_html(text):
         return ""
     text = _TAG_RE.sub(" ", text)
     return " ".join(unescape(text).split())
+
+
+def _int_or_zero(value):
+    """Coerce ``value`` to ``int``, defaulting to 0 for anything unparseable."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _extract_v2_max_chars(data):
@@ -387,9 +399,35 @@ class MastodonAdminClient(_MastodonClientBase):
 
     # ------------------------------------------------------------------ reports
 
-    def list_reports(self, resolved=False):
-        raw = self._get_all("/api/v1/admin/reports", params={"resolved": "true" if resolved else "false"})
+    def list_reports(self, resolved=False, *, target_account_id=None, account_id=None, max_pages=_MAX_PAGES):
+        """List reports, optionally filtered to a target account and/or a reporting account.
+
+        ``target_account_id`` filters to reports *about* that account,
+        ``account_id`` to reports *filed by* that account; either (or both)
+        may be given.
+        """
+        params = {"resolved": "true" if resolved else "false"}
+        if target_account_id is not None:
+            params["target_account_id"] = str(int(target_account_id))
+        if account_id is not None:
+            params["account_id"] = str(int(account_id))
+        raw = self._get_all("/api/v1/admin/reports", params=params, max_pages=max_pages)
         return [summarize_report(r) for r in raw]
+
+    def reports_for_account(self, account_id, *, as_target=True, resolved=None):
+        """List reports about (``as_target=True``) or filed by (``as_target=False``) an account.
+
+        When ``resolved`` is ``None`` (the default) both open and resolved
+        reports are fetched -- one page each -- and concatenated with open
+        reports first; otherwise a single call is made for that ``resolved``
+        value.
+        """
+        filter_kwargs = {"target_account_id": account_id} if as_target else {"account_id": account_id}
+        if resolved is None:
+            open_reports = self.list_reports(resolved=False, max_pages=1, **filter_kwargs)
+            resolved_reports = self.list_reports(resolved=True, max_pages=1, **filter_kwargs)
+            return open_reports + resolved_reports
+        return self.list_reports(resolved=resolved, **filter_kwargs)
 
     def resolve_report(self, report_id):
         data, _ = self._request("POST", f"/api/v1/admin/reports/{int(report_id)}/resolve")
@@ -427,6 +465,59 @@ class MastodonAdminClient(_MastodonClientBase):
     def get_admin_account(self, account_id):
         data, _ = self._request("GET", f"/api/v1/admin/accounts/{int(account_id)}")
         return summarize_admin_account(data)
+
+    def search_accounts(self, *, email=None, ip=None, username=None, display_name=None,
+                        origin=None, status=None, limit=25):
+        """Search admin accounts by any combination of filters.
+
+        Mastodon matches ``email``, ``username`` and ``display_name`` as
+        prefixes, and ``ip`` by CIDR containment. Only the filters actually
+        given are sent; ``origin``/``status`` are validated locally against
+        Mastodon's known values before the request is made.
+        """
+        if origin is not None and origin not in ACCOUNT_SEARCH_ORIGINS:
+            raise ValueError(f"Unknown origin '{origin}'")
+        if status is not None and status not in ACCOUNT_SEARCH_STATUSES:
+            raise ValueError(f"Unknown status '{status}'")
+        params = {}
+        if email:
+            params["email"] = email
+        if ip:
+            params["ip"] = ip
+        if username:
+            params["username"] = username
+        if display_name:
+            params["display_name"] = display_name
+        if origin:
+            params["origin"] = origin
+        if status:
+            params["status"] = status
+        params["limit"] = str(max(1, min(100, int(limit))))
+        raw = self._get_all("/api/v2/admin/accounts", params=params, max_pages=1)
+        return [summarize_admin_account(a) for a in raw]
+
+    def accounts_sharing_ip(self, ip, *, exclude_id=None, limit=10):
+        """Find other admin accounts that have logged in from ``ip`` (or a CIDR containing it)."""
+        try:
+            ipaddress.ip_network(ip, strict=False)
+        except ValueError as exc:
+            raise ValueError("invalid IP or CIDR") from exc
+        results = self.search_accounts(ip=ip, limit=limit + 1)
+        if exclude_id is not None:
+            exclude_id = str(exclude_id)
+            results = [a for a in results if str(a.get("id")) != exclude_id]
+        return results[:limit]
+
+    def delete_account(self, account_id):
+        """Permanently delete an account.
+
+        Mastodon reserves the deleted account's username and email so
+        neither can be reused; the API does not check whether the account is
+        suspended first, so callers must enforce that themselves before
+        calling this.
+        """
+        self._request("DELETE", f"/api/v1/admin/accounts/{int(account_id)}")
+        return True
 
     def account_action(self, account_id, action_type, text="", report_id=None, send_email_notification=False):
         if action_type not in ACCOUNT_ACTION_TYPES:
@@ -740,13 +831,32 @@ def summarize_admin_account(adm):
     adm = adm or {}
     role = adm.get("role") or {}
     role_name = role.get("name", "") if isinstance(role, dict) else str(role or "")
-    out = _account_public(adm.get("account"))
+    account = adm.get("account") or {}
+    out = _account_public(account)
+
+    ips = []
+    for ip in adm.get("ips") or []:
+        if not isinstance(ip, dict):
+            continue
+        ips.append({"ip": ip.get("ip", ""), "used_at": ip.get("used_at")})
+    ips.sort(key=lambda row: parse_iso(row["used_at"]) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    ips = ips[:10]
+
+    fields = []
+    for f in account.get("fields") or []:
+        if not isinstance(f, dict):
+            continue
+        fields.append({"name": strip_html(f.get("name", "")), "value": strip_html(f.get("value", ""))})
+        if len(fields) >= 8:
+            break
+
     out.update({
         "id": adm.get("id") or out["id"],
         "username": adm.get("username", ""),
         "domain": adm.get("domain"),
         "email": adm.get("email", ""),
         "ip": adm.get("ip", ""),
+        "ips": ips,
         "locale": adm.get("locale", ""),
         "created_at": adm.get("created_at", ""),
         "confirmed": bool(adm.get("confirmed")),
@@ -759,6 +869,15 @@ def summarize_admin_account(adm):
         "role_name": role_name,
         "is_staff": is_staff_role(role),
         "invite_request": adm.get("invite_request") or "",
+        "followers_count": _int_or_zero(account.get("followers_count")),
+        "following_count": _int_or_zero(account.get("following_count")),
+        "statuses_count": _int_or_zero(account.get("statuses_count")),
+        "last_status_at": account.get("last_status_at"),
+        "note": strip_html(account.get("note", ""))[:500],
+        "fields": fields,
+        "bot": bool(account.get("bot")),
+        "locked": bool(account.get("locked")),
+        "header": account.get("header_static") or account.get("header") or "",
     })
     if not out["acct"]:
         out["acct"] = out["username"] + (f"@{out['domain']}" if out["domain"] else "")

@@ -190,6 +190,64 @@ class TestHelpers:
         out = summarize_account_activity({"id": "1", "username": "a", "account": {}})
         assert out["last_login_at"] is None
 
+    def test_summarize_admin_account_ips_sorted_newest_first_and_capped(self):
+        ips = [
+            {"ip": f"10.0.0.{i}", "used_at": f"2026-01-{i + 1:02d}T00:00:00Z"}
+            for i in range(1, 13)
+        ]
+        adm = {"id": "5", "username": "u", "domain": None, "ips": ips}
+        out = summarize_admin_account(adm)
+        assert len(out["ips"]) == 10
+        # Newest used_at (day 13) first.
+        assert out["ips"][0] == {"ip": "10.0.0.12", "used_at": "2026-01-13T00:00:00Z"}
+        assert out["ips"][-1]["used_at"] == "2026-01-04T00:00:00Z"
+
+    def test_summarize_admin_account_ips_empty_when_absent(self):
+        out = summarize_admin_account({"id": "5", "username": "u", "domain": None})
+        assert out["ips"] == []
+
+    def test_summarize_admin_account_counts_note_fields_bot_locked_header(self):
+        adm = {
+            "id": "5", "username": "u", "domain": None,
+            "account": {
+                "acct": "u", "followers_count": 10, "following_count": "20", "statuses_count": None,
+                "last_status_at": "2026-05-01T00:00:00Z",
+                "note": "<p>Hello <b>world</b></p>" + ("x" * 600),
+                "fields": [
+                    {"name": "<b>Site</b>", "value": '<a href="x">example.com</a>'},
+                    {"name": "Extra1", "value": "v"}, {"name": "Extra2", "value": "v"},
+                    {"name": "Extra3", "value": "v"}, {"name": "Extra4", "value": "v"},
+                    {"name": "Extra5", "value": "v"}, {"name": "Extra6", "value": "v"},
+                    {"name": "Extra7", "value": "v"}, {"name": "Extra8-dropped", "value": "v"},
+                ],
+                "bot": True, "locked": True,
+                "header_static": "https://masto.example/header.png",
+            },
+        }
+        out = summarize_admin_account(adm)
+        assert out["followers_count"] == 10
+        assert out["following_count"] == 20
+        assert out["statuses_count"] == 0
+        assert out["last_status_at"] == "2026-05-01T00:00:00Z"
+        assert out["note"].startswith("Hello world")
+        assert len(out["note"]) == 500
+        assert len(out["fields"]) == 8
+        assert out["fields"][0] == {"name": "Site", "value": "example.com"}
+        assert out["bot"] is True
+        assert out["locked"] is True
+        assert out["header"] == "https://masto.example/header.png"
+
+    def test_summarize_admin_account_header_falls_back_and_defaults_empty(self):
+        out = summarize_admin_account({
+            "id": "5", "username": "u", "domain": None, "account": {"header": "https://masto.example/h.png"},
+        })
+        assert out["header"] == "https://masto.example/h.png"
+        out2 = summarize_admin_account({"id": "6", "username": "v", "domain": None})
+        assert out2["header"] == ""
+        assert out2["fields"] == []
+        assert out2["bot"] is False
+        assert out2["locked"] is False
+
 
 # ---------------------------------------------------------------------------
 # Client transport
@@ -453,6 +511,137 @@ class TestClientOperations:
         assert "resolved=true" in mock_urlopen.call_args[0][0].full_url
 
     @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_list_reports_passes_target_account_id(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").list_reports(target_account_id="7")
+        url = mock_urlopen.call_args[0][0].full_url
+        assert "target_account_id=7" in url
+        assert "&account_id=7" not in url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_list_reports_passes_account_id(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").list_reports(account_id=9)
+        url = mock_urlopen.call_args[0][0].full_url
+        assert "account_id=9" in url
+        assert "target_account_id" not in url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_reports_for_account_resolved_none_makes_two_calls_open_first(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            _resp([{"id": "1", "action_taken": False}]),
+            _resp([{"id": "2", "action_taken": True}]),
+        ]
+        out = MastodonAdminClient(API, "t").reports_for_account("7")
+        assert [r["id"] for r in out] == ["1", "2"]
+        urls = [c[0][0].full_url for c in mock_urlopen.call_args_list]
+        assert "resolved=false" in urls[0]
+        assert "target_account_id=7" in urls[0]
+        assert "resolved=true" in urls[1]
+        assert "target_account_id=7" in urls[1]
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_reports_for_account_resolved_given_makes_one_call(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").reports_for_account("7", resolved=True)
+        assert mock_urlopen.call_count == 1
+        assert "resolved=true" in mock_urlopen.call_args[0][0].full_url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_reports_for_account_as_target_false_uses_account_id_filter(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").reports_for_account("7", as_target=False, resolved=False)
+        url = mock_urlopen.call_args[0][0].full_url
+        assert "account_id=7" in url
+        assert "target_account_id" not in url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_search_accounts_sends_only_given_filters(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").search_accounts(email="a@b.com", username="bob")
+        url = mock_urlopen.call_args[0][0].full_url
+        assert "email=a%40b.com" in url
+        assert "username=bob" in url
+        assert "ip=" not in url
+        assert "display_name=" not in url
+        assert "origin=" not in url
+        assert "status=" not in url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_search_accounts_clamps_limit(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").search_accounts(username="x", limit=500)
+        assert "limit=100" in mock_urlopen.call_args[0][0].full_url
+
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").search_accounts(username="x", limit=0)
+        assert "limit=1" in mock_urlopen.call_args[0][0].full_url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_search_accounts_reduces_with_summarize_admin_account(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([{"id": "1", "username": "bob", "domain": None}])
+        out = MastodonAdminClient(API, "t").search_accounts(username="bob")
+        assert out[0]["acct"] == "bob"
+        assert "ips" in out[0]
+
+    def test_search_accounts_rejects_bad_origin(self):
+        with pytest.raises(ValueError):
+            MastodonAdminClient(API, "t").search_accounts(origin="planet")
+
+    def test_search_accounts_rejects_bad_status(self):
+        with pytest.raises(ValueError):
+            MastodonAdminClient(API, "t").search_accounts(status="banned")
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_search_accounts_accepts_valid_origin_and_status(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").search_accounts(origin="local", status="suspended")
+        url = mock_urlopen.call_args[0][0].full_url
+        assert "origin=local" in url
+        assert "status=suspended" in url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_accounts_sharing_ip_validates_ip(self, mock_urlopen):
+        with pytest.raises(ValueError):
+            MastodonAdminClient(API, "t").accounts_sharing_ip("not-an-ip")
+        mock_urlopen.assert_not_called()
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_accounts_sharing_ip_accepts_cidr(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([])
+        MastodonAdminClient(API, "t").accounts_sharing_ip("10.0.0.0/24")
+        assert "ip=10.0.0.0%2F24" in mock_urlopen.call_args[0][0].full_url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_accounts_sharing_ip_excludes_id_and_caps(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([
+            {"id": "1", "username": "a", "domain": None},
+            {"id": "2", "username": "b", "domain": None},
+            {"id": "3", "username": "c", "domain": None},
+        ])
+        out = MastodonAdminClient(API, "t").accounts_sharing_ip("10.0.0.5", exclude_id="2", limit=2)
+        assert [a["id"] for a in out] == ["1", "3"]
+        # requests limit+1 so exclusion doesn't shrink below the caller's cap
+        assert "limit=3" in mock_urlopen.call_args[0][0].full_url
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_accounts_sharing_ip_caps_at_limit(self, mock_urlopen):
+        mock_urlopen.return_value = _resp([
+            {"id": str(i), "username": f"u{i}", "domain": None} for i in range(5)
+        ])
+        out = MastodonAdminClient(API, "t").accounts_sharing_ip("10.0.0.5", limit=2)
+        assert len(out) == 2
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
+    def test_delete_account_sends_delete_to_right_path(self, mock_urlopen):
+        mock_urlopen.return_value = _resp({})
+        result = MastodonAdminClient(API, "t").delete_account(5)
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_method() == "DELETE"
+        assert req.full_url == f"{API}/api/v1/admin/accounts/5"
+        assert result is True
+
+    @patch("core.mastodon_admin.urllib.request.urlopen")
     def test_lookup_account_chains_public_then_admin(self, mock_urlopen):
         mock_urlopen.side_effect = [
             _resp({"id": "77", "acct": "someone"}),
@@ -641,6 +830,9 @@ class TestMastodonRouteAuth:
         ("get", "/moderation/mastodon/pending"),
         ("get", "/moderation/mastodon/domain_blocks"),
         ("get", "/moderation/mastodon/accounts/lookup?acct=x"),
+        ("get", "/moderation/mastodon/accounts/search?email=a@b.com"),
+        ("get", "/moderation/mastodon/accounts/1/context"),
+        ("post", "/moderation/mastodon/accounts/1/delete"),
         ("post", "/moderation/mastodon/save"),
         ("post", "/moderation/mastodon/test"),
         ("post", "/moderation/mastodon/reports/1/resolve"),
@@ -1062,6 +1254,137 @@ class TestMastodonMutationRoutes:
         assert resp.status_code == 200
         masto_client.delete_domain_block.assert_called_once_with(3)
         assert _last_audit(app, "mastodon_domain_block_delete").resource_name == "spam.example"
+
+
+class TestAccountSearchContextDelete:
+    def test_search_requires_a_filter(self, auth_client, masto_client):
+        resp = auth_client.get("/moderation/mastodon/accounts/search")
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == "Provide an email, IP, username or display name"
+        masto_client.search_accounts.assert_not_called()
+
+    def test_search_rejects_bad_ip(self, auth_client, masto_client):
+        resp = auth_client.get("/moderation/mastodon/accounts/search?ip=not-an-ip")
+        assert resp.status_code == 400
+        assert "invalid IP or CIDR" in resp.get_json()["error"]
+        masto_client.search_accounts.assert_not_called()
+
+    def test_search_forwards_email_filter_and_annotates_watched(self, app, auth_client, masto_client):
+        masto_client.search_accounts.return_value = [{"id": "5", "acct": "someone"}]
+        resp = auth_client.get("/moderation/mastodon/accounts/search?email=someone%40example.com")
+        assert resp.status_code == 200
+        masto_client.search_accounts.assert_called_once_with(email="someone@example.com", limit=25)
+        accounts = resp.get_json()["accounts"]
+        assert accounts[0]["watched"] is False
+        entry = _last_audit(app, "mastodon_account_search")
+        assert entry.details == {"filters": ["email"]}
+        assert "someone@example.com" not in json.dumps(entry.details)
+
+    def test_context_populates_all_sections(self, auth_client, masto_client):
+        masto_client.get_admin_account.return_value = {"id": "5", "acct": "x", "ip": "10.0.0.5"}
+        masto_client.reports_for_account.side_effect = (
+            lambda account_id, as_target=True, resolved=None: [{"id": "1"}] if as_target else [{"id": "2"}]
+        )
+        masto_client.account_statuses.return_value = [{"id": "9"}]
+        masto_client.accounts_sharing_ip.return_value = [{"id": "6"}]
+
+        resp = auth_client.get("/moderation/mastodon/accounts/5/context")
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["reports_about"] == [{"id": "1"}]
+        assert body["reports_by"] == [{"id": "2"}]
+        assert body["recent_statuses"] == [{"id": "9"}]
+        assert body["same_ip"] == [{"id": "6"}]
+        assert body["errors"] == {}
+        masto_client.account_statuses.assert_called_once_with(5, limit=10)
+        masto_client.accounts_sharing_ip.assert_called_once_with("10.0.0.5", exclude_id="5", limit=10)
+
+    def test_context_section_failure_is_isolated_and_still_200(self, auth_client, masto_client):
+        masto_client.get_admin_account.return_value = {"id": "5", "acct": "x", "ip": "10.0.0.5"}
+        masto_client.reports_for_account.side_effect = MastodonAPIError(
+            "Mastodon API returned HTTP 500: boom", 500,
+        )
+        masto_client.account_statuses.return_value = []
+        masto_client.accounts_sharing_ip.return_value = []
+
+        resp = auth_client.get("/moderation/mastodon/accounts/5/context")
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["reports_about"] is None
+        assert body["reports_by"] is None
+        assert "boom" in body["errors"]["reports_about"]
+        assert "boom" in body["errors"]["reports_by"]
+        # A failing sub-section never 502s the whole response.
+        assert body["ok"] is True
+
+    def test_context_without_ip_skips_shared_ip_lookup(self, auth_client, masto_client):
+        masto_client.get_admin_account.return_value = {"id": "5", "acct": "x", "ip": ""}
+        masto_client.reports_for_account.return_value = []
+        masto_client.account_statuses.return_value = []
+
+        resp = auth_client.get("/moderation/mastodon/accounts/5/context")
+        assert resp.status_code == 200
+        assert resp.get_json()["same_ip"] == []
+        masto_client.accounts_sharing_ip.assert_not_called()
+
+    def test_context_target_lookup_failure_is_502(self, auth_client, masto_client):
+        masto_client.get_admin_account.side_effect = MastodonAPIError(
+            "Mastodon API returned HTTP 404: not found", 404,
+        )
+        resp = auth_client.get("/moderation/mastodon/accounts/5/context")
+        assert resp.status_code == 502
+        masto_client.reports_for_account.assert_not_called()
+
+    def test_delete_requires_admin(self, moderator_client, masto_client):
+        resp = moderator_client.post("/moderation/mastodon/accounts/5/delete", data={
+            "acct": "bad", "confirm": "bad",
+        }, follow_redirects=False)
+        assert resp.status_code == 302
+        assert resp.headers["Location"].rstrip("/").endswith("/moderation")
+        masto_client.delete_account.assert_not_called()
+
+    def test_delete_wrong_confirmation_is_400(self, auth_client, masto_client):
+        resp = auth_client.post("/moderation/mastodon/accounts/5/delete", data={
+            "acct": "bad", "confirm": "not-bad",
+        })
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == "Type the account handle to confirm"
+        masto_client.delete_account.assert_not_called()
+        masto_client.get_admin_account.assert_not_called()
+
+    def test_delete_requires_suspended_target(self, auth_client, masto_client):
+        masto_client.get_admin_account.return_value = {"id": "5", "acct": "bad", "suspended": False}
+        resp = auth_client.post("/moderation/mastodon/accounts/5/delete", data={
+            "acct": "bad", "confirm": "bad",
+        })
+        assert resp.status_code == 400
+        assert "Suspend" in resp.get_json()["error"]
+        masto_client.delete_account.assert_not_called()
+
+    def test_delete_suspended_non_staff_target_deletes_and_audits(self, app, auth_client, masto_client):
+        masto_client.get_admin_account.return_value = {
+            "id": "5", "acct": "bad", "suspended": True, "is_staff": False, "domain": "remote.example",
+        }
+        masto_client.delete_account.return_value = True
+        resp = auth_client.post("/moderation/mastodon/accounts/5/delete", data={
+            "acct": "bad", "confirm": "bad",
+        })
+        assert resp.status_code == 200
+        assert resp.get_json()["deleted"] is True
+        masto_client.delete_account.assert_called_once_with(5)
+        entry = _last_audit(app, "mastodon_account_delete")
+        assert entry.resource_name == "bad"
+        assert entry.details == {"account_id": "5", "domain": "remote.example"}
+
+    def test_delete_get_admin_account_failure_is_502(self, auth_client, masto_client):
+        masto_client.get_admin_account.side_effect = MastodonAPIError(
+            "Mastodon API returned HTTP 404: not found", 404,
+        )
+        resp = auth_client.post("/moderation/mastodon/accounts/5/delete", data={
+            "acct": "bad", "confirm": "bad",
+        })
+        assert resp.status_code == 502
+        masto_client.delete_account.assert_not_called()
 
 
 class TestMastodonViewerDenied:
