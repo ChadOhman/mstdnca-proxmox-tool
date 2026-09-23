@@ -21,19 +21,27 @@
         this.style.height = Math.min(this.scrollHeight, 120) + 'px';
     });
 
-    // Submit on Enter (Shift+Enter for newline)
+    function submitMessage() {
+        var message = chatInput.value.trim();
+        if (!message || isStreaming) return;
+        sendMessage(message);
+    }
+
+    // Submit on Enter (Shift+Enter for newline). Call submitMessage() directly
+    // rather than dispatching a synthetic 'submit' event: a dispatched Event is
+    // not cancelable, so Firefox performs the real form submission regardless
+    // of preventDefault(), reloading the page and aborting the in-flight fetch
+    // ("NetworkError when attempting to fetch resource.").
     chatInput.addEventListener('keydown', function(e) {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
-            chatForm.dispatchEvent(new Event('submit'));
+            submitMessage();
         }
     });
 
     chatForm.addEventListener('submit', function(e) {
         e.preventDefault();
-        var message = chatInput.value.trim();
-        if (!message || isStreaming) return;
-        sendMessage(message);
+        submitMessage();
     });
 
     if (newChatBtn) {
@@ -253,6 +261,15 @@
                     }
 
                     read();
+                }).catch(function(err) {
+                    // The stream broke after headers arrived (server restart,
+                    // dropped connection): unlock the input and say so instead
+                    // of leaving the spinner forever.
+                    isStreaming = false;
+                    setInputEnabled(true);
+                    assistantBubble.innerHTML = (fullText ? renderMarkdown(fullText) : '') +
+                        '<div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> ' +
+                        escHtml(err.message || 'Connection lost') + '</div>';
                 });
             }
             read();
