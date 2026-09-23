@@ -280,11 +280,11 @@ class TestRecordAlert:
         import core.notifier as notifier_mod
 
         with app.app_context():
-            status = {"id": "1001", "url": "u1001", "excerpt": "hey", "visibility": "public"}
+            status = {"id": "1001", "url": "https://example.social/@acc5/1001", "excerpt": "hey", "visibility": "public"}
             mw.record_alert("watched_post", {"id": "acc5", "acct": "acc5@example.social"}, status)
 
         notifier_mod.send_moderation_alert_notification.assert_called_once_with(
-            "watched_post", "acc5@example.social", url="u1001", excerpt="hey"
+            "watched_post", "acc5@example.social", url="https://example.social/@acc5/1001", excerpt="hey"
         )
 
     def test_no_notify_when_notify_false(self, app):

@@ -37,6 +37,17 @@ from core.moderation_log import KIND_FILTERS, MODERATION_ACTION_PREFIXES, modera
 from models import AuditLog, ModerationAlert, ModerationWatch, Setting, User, db
 
 
+def _audit(action, resource_type, **kwargs):
+    """log_action for this blueprint: moderators-only real-time broadcast.
+
+    Moderation events name Fediverse accounts and actions such as "reset
+    password" or "disable 2FA"; the activity toast must reach connected
+    moderators only, not every logged-in user (GHSA-qq45-f2h2-9j4q).
+    """
+    kwargs.setdefault("audience", "moderators")
+    return log_action(action, resource_type, **kwargs)
+
+
 def _clean_api_url(raw, label):
     """Normalise an integration API base URL from a form. Returns (value, error).
 
@@ -346,7 +357,7 @@ def save():
     Setting.set("moderation_check_interval_hours", request.form.get("check_interval_hours", "24").strip())
     Setting.set("moderation_auto_ban_enabled", "true" if request.form.get("auto_ban_enabled") else "false")
 
-    log_action("moderation_config_save", "moderation")
+    _audit("moderation_config_save", "moderation")
     db.session.commit()
     flash("Moderation settings saved.", "success")
     return redirect(url_for("moderation.index"))
@@ -455,7 +466,7 @@ def _mastodon_json(fn, *, audit=None):
         return jsonify({"ok": False, "error": str(exc)}), 400
     if audit:
         action, resource_type, resource_name, details = audit
-        log_action(action, resource_type, resource_name=resource_name, details=details)
+        _audit(action, resource_type, resource_name=resource_name, details=details)
         db.session.commit()
     body = {"ok": True}
     if isinstance(payload, dict):
@@ -490,7 +501,7 @@ def _bot_json(fn, *, audit=None):
         return jsonify({"ok": False, "error": exc.message}), 502
     if audit:
         action, resource_type, resource_name, details = audit
-        log_action(action, resource_type, resource_name=resource_name, details=details)
+        _audit(action, resource_type, resource_name=resource_name, details=details)
         db.session.commit()
     body = {"ok": True}
     if isinstance(payload, dict):
@@ -597,7 +608,7 @@ def mastodon_save():
         # verified identity may no longer apply.
         Setting.set("moderation_mastodon_token_account", "")
 
-    log_action("moderation_mastodon_config_save", "moderation")
+    _audit("moderation_mastodon_config_save", "moderation")
     db.session.commit()
     flash("Mastodon moderation settings saved.", "success")
     return redirect(url_for("moderation.index", tab="mastodon"))
@@ -820,7 +831,7 @@ def mastodon_report_statuses_action(report_id):
 
     target = report.get("target_account") or {}
     if target.get("is_staff") and not current_user.can_moderate_staff:
-        log_action("mastodon_account_action_refused", "mastodon_account",
+        _audit("mastodon_account_action_refused", "mastodon_account",
                    resource_name=target.get("acct") or str(target.get("id") or ""),
                    details={"account_id": str(target.get("id") or ""), "type": f"posts:{action}",
                             "target_role": target.get("role_name", ""), "report_id": str(report_id)})
@@ -860,7 +871,7 @@ def mastodon_report_statuses_action(report_id):
     except MaintenanceBusy:
         return jsonify({"ok": False, "error": "Another server-side action is running"}), 409
 
-    log_action(
+    _audit(
         f"mastodon_report_posts_{action}",
         "mastodon_report",
         resource_name=f"report {report_id}",
@@ -1043,7 +1054,7 @@ def mastodon_account_action(account_id):
     except MastodonAPIError as exc:
         return jsonify({"ok": False, "error": exc.message}), 502
     if target.get("is_staff") and not current_user.can_moderate_staff:
-        log_action("mastodon_account_action_refused", "mastodon_account",
+        _audit("mastodon_account_action_refused", "mastodon_account",
                    resource_name=acct or target.get("acct") or str(account_id),
                    details={"account_id": str(account_id), "type": action_type,
                             "target_role": target.get("role_name", ""),
@@ -1083,7 +1094,7 @@ def mastodon_account_delete(account_id):
         return jsonify({"ok": False, "error": "Suspend the account before deleting it"}), 400
 
     if target.get("is_staff") and not current_user.can_moderate_staff:
-        log_action("mastodon_account_action_refused", "mastodon_account",
+        _audit("mastodon_account_action_refused", "mastodon_account",
                    resource_name=acct or target.get("acct") or str(account_id),
                    details={"account_id": str(account_id), "type": "delete",
                             "target_role": target.get("role_name", "")})
@@ -1100,7 +1111,7 @@ def mastodon_account_delete(account_id):
 @bp.route("/mastodon/accounts/<int:account_id>/maintenance", methods=["POST"])
 def mastodon_account_maintenance(account_id):
     if not current_user.can_maintain_mastodon_accounts:
-        log_action("mastodon_maintenance_refused", "mastodon_account",
+        _audit("mastodon_maintenance_refused", "mastodon_account",
                    resource_name=str(account_id),
                    details={"account_id": str(account_id), "action": _form_text("action"), "reason": "permission"})
         db.session.commit()
@@ -1125,7 +1136,7 @@ def mastodon_account_maintenance(account_id):
         return jsonify({"ok": False, "error": "Maintenance actions apply to local accounts only"}), 400
 
     if target.get("is_staff") and not current_user.can_moderate_staff:
-        log_action("mastodon_account_action_refused", "mastodon_account",
+        _audit("mastodon_account_action_refused", "mastodon_account",
                    resource_name=acct or target.get("acct") or str(account_id),
                    details={"account_id": str(account_id), "type": f"maintenance:{action}",
                             "target_role": target.get("role_name", "")})
@@ -1156,7 +1167,7 @@ def mastodon_account_maintenance(account_id):
     except MaintenanceBusy:
         return jsonify({"ok": False, "error": "Another maintenance action is running"}), 409
 
-    log_action(
+    _audit(
         f"mastodon_maintenance_{action}",
         "mastodon_account",
         resource_name=acct or username,
@@ -1309,7 +1320,7 @@ def mastodon_watch_remove(watch_id):
         return jsonify({"ok": False, "error": "Watch not found"}), 404
     acct = watch.acct
     db.session.delete(watch)
-    log_action("mastodon_watch_remove", "mastodon_account", resource_name=acct,
+    _audit("mastodon_watch_remove", "mastodon_account", resource_name=acct,
                details={"watch_id": watch_id, "account_id": watch.mastodon_account_id})
     db.session.commit()
     return jsonify({"ok": True})
@@ -1363,7 +1374,7 @@ def mastodon_alerts_ack_all():
         },
         synchronize_session=False,
     )
-    log_action("mastodon_alerts_ack_all", "moderation", details={"kind": kind or None, "count": count})
+    _audit("mastodon_alerts_ack_all", "moderation", details={"kind": kind or None, "count": count})
     db.session.commit()
     return jsonify({"ok": True, "count": count})
 
@@ -1469,7 +1480,7 @@ def mastodon_welcome_save():
     enabled = _form_flag("welcome_enabled")
     Setting.set("moderation_welcome_enabled", "true" if enabled else "false")
 
-    log_action(
+    _audit(
         "moderation_welcome_config_save",
         "moderation",
         details={"enabled": enabled, "template_len": len(template.strip()), "token_changed": token_changed},
@@ -1507,7 +1518,7 @@ def mastodon_report_notice_save():
         return redirect(url_for("moderation.index", tab="mastodon"))
 
     Setting.set("moderation_report_notice_template", template.strip())
-    log_action(
+    _audit(
         "moderation_report_notice_config_save",
         "moderation",
         details={"template_len": len(template.strip())},
@@ -1547,7 +1558,7 @@ def mastodon_watch_poll_now():
     t = _threading.Thread(target=_worker, daemon=True)
     t.start()
 
-    log_action("mastodon_watch_poll_now", "moderation")
+    _audit("mastodon_watch_poll_now", "moderation")
     db.session.commit()
     return jsonify({"ok": True, "started": True})
 
@@ -1642,7 +1653,7 @@ def mastodon_watch_save():
     Setting.set("moderation_watch_silent_scan_window_days", str(silent_scan_window_days))
     Setting.set("moderation_log_retention_days", str(log_retention_days))
 
-    log_action("moderation_watch_config_save", "moderation")
+    _audit("moderation_watch_config_save", "moderation")
     db.session.commit()
 
     reschedule_moderation_watch(poll_minutes)

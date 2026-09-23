@@ -433,15 +433,15 @@
                                     statusDiv.innerHTML =
                                         '<div class="alert alert-success py-2 small">' +
                                         '<i class="bi bi-check-circle-fill me-1"></i>' +
-                                        (data.message || 'Upload successful') + '</div>';
+                                        escHtml(data.message || 'Upload successful') + '</div>';
                                     // Update the status badge inline
                                     if (badgeDiv && data.path) {
-                                        var sizeTxt = data.size_mb ? '<strong>' + data.size_mb + ' MB</strong>' : '';
+                                        var sizeTxt = data.size_mb ? '<strong>' + escHtml(data.size_mb) + ' MB</strong>' : '';
                                         badgeDiv.innerHTML =
                                             '<div class="alert alert-dark border py-2 mb-2 small">' +
                                             '<i class="bi bi-database-check text-success"></i> ' +
                                             'Database installed &mdash; ' + sizeTxt +
-                                            '<span class="text-muted ms-1 font-monospace">' + data.path + '</span>' +
+                                            '<span class="text-muted ms-1 font-monospace">' + escHtml(data.path) + '</span>' +
                                             '</div>';
                                     }
                                     // Auto-fill manual path field and update icon
@@ -453,7 +453,7 @@
                                     statusDiv.innerHTML =
                                         '<div class="alert alert-danger py-2 small">' +
                                         '<i class="bi bi-exclamation-triangle-fill me-1"></i>' +
-                                        (data.message || 'Upload failed (HTTP ' + xhr.status + ')') + '</div>';
+                                        escHtml(data.message || 'Upload failed (HTTP ' + xhr.status + ')') + '</div>';
                                 }
                             };
 
@@ -490,13 +490,13 @@
                                         statusDiv.innerHTML =
                                             '<div class="alert alert-success py-2 small">' +
                                             '<i class="bi bi-check-circle-fill me-1"></i>' +
-                                            (data.message || 'Database OK') + '</div>';
+                                            escHtml(data.message || 'Database OK') + '</div>';
                                         setPathIcon('ok', 'File found (' + (data.size_mb || '?') + ' MB)');
                                     } else {
                                         statusDiv.innerHTML =
                                             '<div class="alert alert-danger py-2 small">' +
                                             '<i class="bi bi-exclamation-triangle-fill me-1"></i>' +
-                                            (data.message || 'Verification failed') + '</div>';
+                                            escHtml(data.message || 'Verification failed') + '</div>';
                                         setPathIcon('warn', data.message || 'Verification failed');
                                     }
                                 };
@@ -946,6 +946,7 @@
                         data.storages.forEach(st => {
                             const opt = document.createElement('option');
                             opt.value = st.storage;
+                            // textContent below: DOM API, no escaping needed (escaping here would double-encode)
                             let label = st.storage + ' (' + st.type + ')';
                             if (st.avail) label += ' \u2014 ' + (st.avail / 1073741824).toFixed(1) + ' GB free';
                             opt.textContent = label;
@@ -983,9 +984,9 @@
             // Build storage options
             let storageOpts = '<option value="">-- Select storage --</option>';
             (window._backupStorages || []).forEach(st => {
-                let label = st.storage + ' (' + st.type + ')';
+                let label = escHtml(st.storage) + ' (' + escHtml(st.type) + ')';
                 if (st.avail) label += ' \u2014 ' + (st.avail / 1073741824).toFixed(1) + ' GB free';
-                storageOpts += '<option value="' + st.storage + '">' + label + '</option>';
+                storageOpts += '<option value="' + escHtml(st.storage) + '">' + label + '</option>';
             });
 
             const tagNameEsc = escHtml(tagName);

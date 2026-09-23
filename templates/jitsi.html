@@ -987,7 +987,7 @@ function loadSdUsers() {
         .then(r => r.json())
         .then(data => {
             if (data.error) {
-                container.innerHTML = '<p class="text-warning small mb-0"><i class="bi bi-exclamation-triangle"></i> ' + data.error + '</p>';
+                container.innerHTML = '<p class="text-warning small mb-0"><i class="bi bi-exclamation-triangle"></i> ' + escHtml(data.error) + '</p>';
                 return;
             }
             if (!data.users || data.users.length === 0) {
@@ -997,12 +997,17 @@ function loadSdUsers() {
             let html = '<table class="table table-sm table-dark table-borderless mb-0">'
                 + '<thead><tr><th>Username</th><th class="text-end">Actions</th></tr></thead><tbody>';
             data.users.forEach(u => {
-                html += '<tr><td><i class="bi bi-person"></i> ' + u + '</td>'
+                // Usernames come from the Prosody accounts directory on the guest.
+                // Escape for text and attribute context, and use the app-wide
+                // data-confirm modal (base.html) instead of an inline onclick
+                // string, which cannot safely embed an arbitrary name.
+                const userEsc = escHtml(u);
+                html += '<tr><td><i class="bi bi-person"></i> ' + userEsc + '</td>'
                     + '<td class="text-end">'
-                    + '<form method="post" action="/jitsi/secure-domain/remove-user" style="display:inline">'
-                    + '<input type="hidden" name="username" value="' + u + '">'
-                    + '<button type="submit" class="btn btn-sm btn-outline-danger" '
-                    + 'onclick="return confirm(\'Delete user ' + u + '?\')">'
+                    + '<form method="post" action="/jitsi/secure-domain/remove-user" style="display:inline" '
+                    + 'data-confirm="Delete user ' + userEsc + '?">'
+                    + '<input type="hidden" name="username" value="' + userEsc + '">'
+                    + '<button type="submit" class="btn btn-sm btn-outline-danger">'
                     + '<i class="bi bi-trash"></i></button>'
                     + '</form></td></tr>';
             });
