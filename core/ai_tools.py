@@ -705,6 +705,158 @@ def _handle_get_unifi_health(tool_input, user):
     })
 
 
+# ---- Node apt updates (mirrors routes/hosts.py update management) ----
+
+_HOST_UPDATE_ACTIONS = ("refresh", "apply", "cancel")
+# Proxmox apt "Priority" -> the severity the scheduler stores (core/scheduler._persist_host_packages)
+_APT_SEVERITY = {"important": "critical", "required": "important"}
+
+
+def _host_for_tool(tool_input):
+    from models import ProxmoxHost
+    host = ProxmoxHost.query.get(tool_input.get("host_id") or 0)
+    return host, (None if host else {"error": "Host not found"})
+
+
+def _host_apt_updates(host):
+    """Live pending apt packages for a PVE or PBS host, as the host page's /updates endpoint returns them."""
+    from routes.hosts import _get_client_and_node
+    client, node_name = _get_client_and_node(host)
+    if host.is_pbs:
+        return client.get_apt_updates() or [], node_name
+    return (client.get_apt_updates(node_name) if node_name else []), node_name
+
+
+def _apply_job_summary(host_id):
+    from routes.hosts import _apply_jobs, _apply_lock
+    with _apply_lock:
+        job = _apply_jobs.get(host_id)
+        if not job:
+            return None
+        log = "".join(job.get("log") or [])
+        return {
+            "running": bool(job.get("running")),
+            "success": job.get("success"),
+            "cancelled": bool(job.get("cancelled")),
+            "log_tail": log[-1500:],
+        }
+
+
+def _handle_get_host_updates(tool_input, user):
+    host, err = _host_for_tool(tool_input)
+    if err:
+        return json.dumps(err)
+    result = {"host_id": host.id, "name": host.name, "type": host.host_type}
+    try:
+        updates, node = _host_apt_updates(host)
+        packages = [
+            {
+                "package": u.get("Package"),
+                "title": u.get("Title"),
+                "current": u.get("OldVersion"),
+                "available": u.get("Version") or u.get("NewVersion"),
+                "severity": _APT_SEVERITY.get(u.get("Priority", ""), "normal"),
+            }
+            for u in updates
+        ]
+        result.update({"source": "live", "node": node, "count": len(packages),
+                       "security_count": sum(1 for p in packages if p["severity"] == "critical"),
+                       "packages": packages})
+    except Exception:
+        logger.warning("AI host updates: live apt query failed for %s; using last scan", host.name, exc_info=True)
+        pending = host.pending_updates()
+        result.update({
+            "source": "last_scan",
+            "note": "The host could not be queried live; these packages are from the last scheduled scan.",
+            "count": len(pending),
+            "security_count": len(host.security_updates()),
+            "packages": [{"package": p.package_name, "current": p.current_version, "available": p.available_version,
+                          "severity": p.severity, "discovered_at": p.discovered_at.isoformat() if p.discovered_at else None}
+                         for p in pending],
+        })
+    job = _apply_job_summary(host.id)
+    if job:
+        result["apply_job"] = job
+    return json.dumps(result)
+
+
+def _handle_manage_host_updates(tool_input, user):
+    """refresh (apt-get update via API), apply (SSH dist-upgrade job) or cancel, as routes/hosts.py does."""
+    from auth.audit import log_action
+    from models import db
+
+    action = tool_input.get("action")
+    if action not in _HOST_UPDATE_ACTIONS:
+        return json.dumps({"error": f"Invalid action: {action}"})
+    host, err = _host_for_tool(tool_input)
+    if err:
+        return json.dumps(err)
+
+    if action == "refresh":
+        from routes.hosts import _get_client_and_node
+        client, node_name = _get_client_and_node(host)
+        if host.is_pbs:
+            upid = client.refresh_apt_cache()
+        else:
+            if not node_name:
+                return json.dumps({"error": "Could not determine the node name"})
+            upid = client.refresh_apt_cache(node_name)
+        log_action("host_refresh_updates", "host", resource_id=host.id, resource_name=host.name,
+                   details={"via": "ai_assistant"})
+        db.session.commit()
+        return json.dumps({"success": True, "task": upid,
+                           "message": f"apt-get update started on {host.name}; call get_host_updates in a moment "
+                                      "for the refreshed list."})
+
+    from routes.hosts import _apply_jobs, _apply_lock
+
+    if action == "cancel":
+        with _apply_lock:
+            job = _apply_jobs.get(host.id)
+            if not job or not job.get("running"):
+                return json.dumps({"success": False, "message": "No update job is running on this host."})
+            job["cancelled"] = True
+        log_action("host_apply_updates_cancel", "host", resource_id=host.id, resource_name=host.name,
+                   details={"via": "ai_assistant"})
+        db.session.commit()
+        return json.dumps({"success": True, "message": f"Cancellation requested for the update job on {host.name}; "
+                                                       "apt stops at the next safe point."})
+
+    # apply
+    if not host.ssh_credential:
+        return json.dumps({"error": f"No SSH credential is configured for {host.name}; updates can only be applied "
+                                    "over SSH. Set one on the host page."})
+    with _apply_lock:
+        existing = _apply_jobs.get(host.id)
+        if existing and existing.get("running"):
+            return json.dumps({"error": "An update job is already running for this host; check get_host_updates."})
+
+    if not tool_input.get("confirm"):
+        pending = host.pending_updates()
+        kind = "PBS" if host.is_pbs else "PVE"
+        summary = (f"This will run 'apt-get dist-upgrade' over SSH on {kind} host '{host.name}' "
+                   f"({len(pending)} package(s) pending at the last scan, {len(host.security_updates())} security). "
+                   "Kernel or Proxmox package upgrades may require a reboot afterwards; the job can be cancelled "
+                   "but packages already unpacking will finish.")
+        return _confirmation_required("manage_host_updates", summary, host_id=host.id, host=host.name, action="apply")
+
+    from flask import current_app
+
+    from routes.hosts import _run_apply, _threading
+    with _apply_lock:
+        existing = _apply_jobs.get(host.id)
+        if existing and existing.get("running"):
+            return json.dumps({"error": "An update job is already running for this host; check get_host_updates."})
+        _apply_jobs[host.id] = {"log": [], "running": True, "success": None, "cancelled": False}
+    _threading.Thread(target=_run_apply, args=(host.id, current_app._get_current_object()), daemon=True).start()
+    log_action("host_apply_updates", "host", resource_id=host.id, resource_name=host.name,
+               details={"via": "ai_assistant"})
+    db.session.commit()
+    return json.dumps({"success": True,
+                       "message": f"Update job started on {host.name}. Call get_host_updates to follow its "
+                                  "progress (apply_job.running / success / log_tail)."})
+
+
 # ---- Tool registry ----
 
 TOOL_REGISTRY = {
@@ -945,6 +1097,44 @@ TOOL_REGISTRY = {
         "input_schema": {"type": "object", "properties": {}, "required": []},
         "required_permission": "can_view_unifi",
         "handler": _handle_get_unifi_health,
+    },
+    "get_host_updates": {
+        "description": (
+            "Pending apt package updates on a Proxmox PVE or PBS host (the node itself, not its guests), queried "
+            "live with severity, falling back to the last scheduled scan if the host is unreachable. Also reports "
+            "the state of a running or finished update job (running, success, log tail)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "integer", "description": "The host ID (from get_host_status)"},
+            },
+            "required": ["host_id"],
+        },
+        "required_permission": "can_view_hosts",
+        "handler": _handle_get_host_updates,
+    },
+    "manage_host_updates": {
+        "description": (
+            "Node apt maintenance on a PVE/PBS host. 'refresh' runs apt-get update through the Proxmox API and "
+            "needs no confirmation. 'apply' runs apt-get dist-upgrade over SSH as a background job: state-changing, "
+            "so the first call returns a confirmation-required preview and only a second call with "
+            "\"confirm\": true starts it. 'cancel' stops a running apply job."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "integer", "description": "The host ID (from get_host_status)"},
+                "action": {"type": "string", "enum": list(_HOST_UPDATE_ACTIONS), "description": "What to do"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "apply only: set to true only after the user has explicitly confirmed.",
+                },
+            },
+            "required": ["host_id", "action"],
+        },
+        "required_permission": "can_manage_hosts",
+        "handler": _handle_manage_host_updates,
     },
 }
 
