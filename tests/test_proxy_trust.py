@@ -69,10 +69,12 @@ def _last_ip(application, action):
 
 class TestProxyFixInstallation:
     def test_not_installed_by_default(self, direct_app):
-        assert type(direct_app.wsgi_app).__name__ != "ProxyFix"
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        assert not isinstance(direct_app.wsgi_app, ProxyFix)
 
     def test_installed_when_count_positive(self, proxied_app):
-        assert type(proxied_app.wsgi_app).__name__ == "ProxyFix"
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        assert isinstance(proxied_app.wsgi_app, ProxyFix)
 
     def test_hop_count_matches_config(self, proxied_app):
         fix = proxied_app.wsgi_app
@@ -228,7 +230,7 @@ class TestProxiedDeployment:
         assert _last_ip(proxied_app, "login_failed") == "198.51.100.31"
 
     def test_cf_connecting_ip_ignored_when_the_peer_is_public(self, proxied_app):
-        """A public peer is not proxy infrastructure, so its CF header is ignored."""
+        """A public peer is not proxy infrastructure, so none of its headers count."""
         with proxied_app.test_client() as c:
             c.post(
                 "/login",
@@ -239,9 +241,10 @@ class TestProxiedDeployment:
                     "CF-Connecting-IP": "10.0.0.5",
                 },
             )
-        # ProxyFix honoured X-Forwarded-For (the operator declared one hop), but
-        # the CF header did not get to override it.
-        assert _last_ip(proxied_app, "login_failed") == "198.51.100.40"
+        # The operator declared one hop, but the hop must be a trusted peer:
+        # a public address is not, so neither X-Forwarded-For nor the CF
+        # header is honoured and the audit entry names the real peer.
+        assert _last_ip(proxied_app, "login_failed") == "8.8.4.4"
 
     def test_garbage_cf_connecting_ip_is_ignored(self, proxied_app):
         with proxied_app.test_client() as c:
@@ -511,3 +514,128 @@ class TestTrustedSubnetValidation:
                 if previous is not None:
                     Setting.set("trusted_subnets", previous)
                     _db.session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Forwarded headers are only honoured from a trusted *peer* (GHSA-w9wf residual):
+# TRUSTED_PROXY_COUNT=1 with the default 0.0.0.0 bind used to let a client that
+# connects directly forge X-Forwarded-For and pick up the local bypass.
+# ---------------------------------------------------------------------------
+
+
+def _make_peers_app(peers, secret):
+    application = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+        "SECRET_KEY": secret,
+        "WTF_CSRF_ENABLED": False,
+        "TRUSTED_PROXY_COUNT": 1,
+        "TRUSTED_PROXY_PEERS": peers,
+    })
+    with application.app_context():
+        admin = User.query.filter_by(username="admin").first()
+        admin.set_password(_ADMIN_PASSWORD)
+        Setting.set("local_bypass_enabled", "true")
+        Setting.set("trusted_subnets", "10.0.0.0/8")
+        _db.session.commit()
+    return application
+
+
+class TestTrustedProxyPeers:
+    # A genuinely public address: Python's ipaddress treats the RFC 5737
+    # documentation ranges (203.0.113.0/24, 198.51.100.0/24) as *private*, so
+    # they would be trusted by the default policy and prove nothing here.
+    _PUBLIC_PEER = "8.8.8.8"
+    # No Cloudflare marker, so the request is not vetoed by the CF check and
+    # only the peer policy stands between the forged header and the bypass.
+    _FORGED_XFF = {"X-Forwarded-For": "10.0.0.5"}
+
+    def test_public_peer_cannot_forge_forwarded_for_even_when_a_hop_is_trusted(self, proxied_app):
+        """The residual hole: count=1, direct connection from a public address."""
+        with proxied_app.test_client() as c:
+            resp = c.get("/", environ_base={"REMOTE_ADDR": self._PUBLIC_PEER},
+                         headers=self._FORGED_XFF, follow_redirects=False)
+        assert resp.status_code == 302
+        assert "/login" in resp.headers["Location"]
+
+    def test_public_peer_is_audited_by_its_real_address(self, proxied_app):
+        with proxied_app.test_client() as c:
+            c.post("/login", data={"username": "admin", "password": "test-only-wrong"},
+                   environ_base={"REMOTE_ADDR": self._PUBLIC_PEER}, headers=self._FORGED_XFF)
+        assert _last_ip(proxied_app, "login_failed") == self._PUBLIC_PEER
+
+    def test_public_peer_cannot_forge_host_or_scheme(self, proxied_app):
+        with proxied_app.test_client() as c:
+            resp = c.get("/login", environ_base={"REMOTE_ADDR": self._PUBLIC_PEER},
+                         headers={"X-Forwarded-Host": "evil.example", "X-Forwarded-Proto": "https"})
+        assert resp.status_code == 200
+        assert "evil.example" not in resp.headers.get("Content-Security-Policy", "")
+
+    def test_lan_peer_forwarding_still_reaches_the_bypass(self, proxied_app):
+        """Control for the test above: the same forged header from a trusted peer is honoured."""
+        with proxied_app.test_client() as c:
+            resp = c.get("/", environ_base={"REMOTE_ADDR": "127.0.0.1"},
+                         headers=self._FORGED_XFF, follow_redirects=False)
+        assert resp.status_code == 200
+
+    def test_lan_peer_is_still_trusted_by_default(self, proxied_app):
+        with proxied_app.test_client() as c:
+            resp = c.get("/", environ_base={"REMOTE_ADDR": "192.168.1.2"},
+                         headers={"X-Forwarded-For": "10.0.0.99"}, follow_redirects=False)
+        assert resp.status_code == 200
+
+    def test_explicit_allowlist_trusts_only_listed_peers(self):
+        application = _make_peers_app("203.0.113.0/24", "test-only-peers-secret-key-0001")
+        with application.test_client() as c:
+            allowed = c.get("/", environ_base={"REMOTE_ADDR": "203.0.113.9"},
+                            headers={"X-Forwarded-For": "10.0.0.99"}, follow_redirects=False)
+            # A loopback proxy is no longer trusted once an explicit list is set.
+            loopback = c.get("/", environ_base={"REMOTE_ADDR": "127.0.0.1"},
+                             headers={"X-Forwarded-For": "10.0.0.99"}, follow_redirects=False)
+        assert allowed.status_code == 200
+        assert loopback.status_code == 302
+
+    def test_allowlist_with_no_valid_entry_trusts_nobody(self):
+        application = _make_peers_app("not-an-address, 300.1.1.1", "test-only-peers-secret-key-0002")
+        with application.test_client() as c:
+            resp = c.get("/", environ_base={"REMOTE_ADDR": "127.0.0.1"},
+                         headers={"X-Forwarded-For": "10.0.0.99"}, follow_redirects=False)
+        assert resp.status_code == 302
+
+    def test_middleware_is_still_a_proxyfix(self, proxied_app):
+        from werkzeug.middleware.proxy_fix import ProxyFix
+
+        from auth.proxy_trust import TrustedPeerProxyFix
+        assert isinstance(proxied_app.wsgi_app, TrustedPeerProxyFix)
+        assert isinstance(proxied_app.wsgi_app, ProxyFix)
+        assert proxied_app.wsgi_app.peers is None
+
+
+class TestProxyTrustHelpers:
+    def test_parse(self):
+        from auth.proxy_trust import parse_trusted_proxy_peers as parse
+        assert parse(None) is None
+        assert parse("") is None
+        assert parse("   ") is None
+        nets = parse("10.0.0.7, 192.168.1.0/24,, bogus")
+        assert [str(n) for n in nets] == ["10.0.0.7/32", "192.168.1.0/24"]
+        assert parse("bogus") == []
+        assert [str(n) for n in parse(["10.0.0.7"])] == ["10.0.0.7/32"]
+
+    @pytest.mark.parametrize("addr, expected", [
+        ("127.0.0.1", True), ("10.1.2.3", True), ("192.168.0.9", True), ("fd00::1", True),
+        ("::ffff:10.0.0.5", True), ("8.8.8.8", False), ("::ffff:8.8.8.8", False),
+        ("2606:4700:4700::1111", False), ("", False), (None, False), ("garbage", False),
+    ])
+    def test_default_policy_is_loopback_or_private(self, addr, expected):
+        from auth.proxy_trust import peer_is_trusted
+        assert peer_is_trusted(addr, None) is expected
+
+    def test_explicit_list(self):
+        import ipaddress
+
+        from auth.proxy_trust import peer_is_trusted
+        peers = [ipaddress.ip_network("203.0.113.0/24")]
+        assert peer_is_trusted("203.0.113.9", peers)
+        assert not peer_is_trusted("127.0.0.1", peers)
+        assert not peer_is_trusted("203.0.113.9", [])

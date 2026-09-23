@@ -125,9 +125,38 @@ Environment=TRUSTED_PROXY_COUNT=1
 Never set it higher than the number of proxies you control: each extra hop lets
 the client choose one more entry of `X-Forwarded-For`, i.e. forge its own IP.
 
+Forwarded headers are also only honoured when the TCP connection comes from a
+proxy you trust, so a client that reaches gunicorn directly (bypassing the
+proxy) cannot forge its address even with `TRUSTED_PROXY_COUNT=1`:
+
+| `TRUSTED_PROXY_PEERS` | Meaning |
+| --- | --- |
+| unset (default) | Loopback and private (RFC 1918 / ULA) peers are trusted — cloudflared or nginx on the same host or LAN. |
+| `10.0.0.7,192.168.1.0/24` | Only these addresses/ranges are trusted. Use this when the proxy has a public address, or to pin the exact proxy host. |
+
 The listen address is configurable too — `scripts/setup.sh --bind 127.0.0.1:5000`
 (or `Environment=BIND_ADDR=...` in the unit) when a proxy on the same host fronts
 the app. The default stays `0.0.0.0:5000` for direct LAN access.
+
+### Hardening the service (recommended, not applied by `setup.sh`)
+
+`scripts/setup.sh` writes a unit tuned for a trusted LAN. When the app is
+reachable from anywhere else, edit `/etc/systemd/system/mstdnca-proxmox-tool.service`:
+
+- **Bind to loopback and terminate TLS in the proxy.** `Environment=BIND_ADDR=127.0.0.1:5000`
+  together with `TRUSTED_PROXY_COUNT=1`; nothing then reaches gunicorn except
+  through the proxy.
+- **Secure cookies once TLS fronts the app.** Remove `Environment=SESSION_COOKIE_SECURE=0`
+  (the default is secure) so the session and remember-me cookies are never
+  sent over plain HTTP.
+- **Systemd sandboxing.** The unit ships with `NoNewPrivileges`, `PrivateTmp` and
+  `ProtectHome=read-only`. Add `ProtectSystem=strict` with
+  `ReadWritePaths=/var/lib/mstdnca /etc/mstdnca /opt/mstdnca` (the data, secret
+  and application directories the updater writes to).
+- The service runs as root because the SSH/sudo model needs it today; that is
+  tracked separately.
+
+After editing: `systemctl daemon-reload && systemctl restart mstdnca-proxmox-tool`.
 
 ## Configuration
 

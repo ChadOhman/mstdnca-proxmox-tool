@@ -56,14 +56,23 @@ def create_app(test_config=None):
     # all and request.remote_addr stays the real TCP peer everywhere.
     proxy_count = app.config.get("TRUSTED_PROXY_COUNT", 0) or 0
     if proxy_count > 0:
-        from werkzeug.middleware.proxy_fix import ProxyFix
-        app.wsgi_app = ProxyFix(
+        # Even then, forwarded headers are only honoured when the TCP peer is
+        # one of the trusted proxies (TRUSTED_PROXY_PEERS, default: loopback
+        # or private), so a client that reaches gunicorn directly cannot forge
+        # its source address by bypassing the proxy.
+        from auth.proxy_trust import TrustedPeerProxyFix, parse_trusted_proxy_peers
+        peers = parse_trusted_proxy_peers(app.config.get("TRUSTED_PROXY_PEERS"))
+        app.wsgi_app = TrustedPeerProxyFix(
             app.wsgi_app,
+            peers=peers,
             x_for=proxy_count,
             x_proto=proxy_count,
             x_host=proxy_count,
             x_prefix=proxy_count,
         )
+        logger.info("Forwarded headers trusted from %s (%d hop(s))",
+                    "loopback/private peers" if peers is None else ", ".join(str(n) for n in peers) or "no peer",
+                    proxy_count)
 
     # Ensure data directory exists
     os.makedirs(DATA_DIR, exist_ok=True)

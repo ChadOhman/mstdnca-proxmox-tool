@@ -86,6 +86,10 @@ class Config:
     # nginx) terminates connections and appends X-Forwarded-For. Setting it
     # higher than the real number of hops lets clients forge their own IP.
     TRUSTED_PROXY_COUNT = _trusted_proxy_count()
+    # Which TCP peers may set forwarded headers when TRUSTED_PROXY_COUNT > 0:
+    # comma-separated addresses/CIDRs. Unset = loopback or private peers only
+    # (a proxy on the same host or LAN). See auth/proxy_trust.py.
+    TRUSTED_PROXY_PEERS = os.environ.get("TRUSTED_PROXY_PEERS", "")
 
     # Default scan interval in hours
     SCAN_INTERVAL_HOURS = int(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
