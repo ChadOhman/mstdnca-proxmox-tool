@@ -69,11 +69,12 @@ def _get_discord_config(channel="admin"):
     login sweeps) -- each has its own webhook URL and enabled flag so the two
     kinds of alerts can be routed to different Discord channels.
     """
+    from core.secret_settings import get_secret_setting
     if channel == "moderation":
-        webhook_url = Setting.get("discord_moderation_webhook_url")
+        webhook_url = get_secret_setting("discord_moderation_webhook_url", None)
         enabled = Setting.get("discord_moderation_enabled", "false") == "true"
     else:
-        webhook_url = Setting.get("discord_webhook_url")
+        webhook_url = get_secret_setting("discord_webhook_url", None)
         enabled = Setting.get("discord_enabled", "false") == "true"
     return {"webhook_url": webhook_url, "enabled": enabled}
 

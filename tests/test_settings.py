@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from core.secret_settings import get_secret_setting
 from models import Setting
 
 
@@ -36,7 +37,7 @@ class TestDiscordSettings:
         assert resp.status_code == 302
 
         with app.app_context():
-            assert Setting.get("discord_webhook_url") == "https://discord.com/api/webhooks/123/abc"
+            assert get_secret_setting("discord_webhook_url") == "https://discord.com/api/webhooks/123/abc"
             assert Setting.get("discord_enabled") == "true"
             assert Setting.get("discord_notify_updates") == "true"
             assert Setting.get("discord_notify_updates_security_only") == "false"
@@ -75,7 +76,7 @@ class TestDiscordSettings:
 
         with app.app_context():
             # The route only saves webhook_url when it is non-empty
-            assert Setting.get("discord_webhook_url") == "https://discord.com/api/webhooks/existing/url"
+            assert get_secret_setting("discord_webhook_url") == "https://discord.com/api/webhooks/existing/url"
 
     def test_save_discord_rejects_non_discord_host(self, app, auth_client):
         """A webhook URL pointed at a non-Discord host must be rejected on save
@@ -91,7 +92,7 @@ class TestDiscordSettings:
         assert resp.status_code == 302
 
         with app.app_context():
-            assert Setting.get("discord_webhook_url") != "https://evil.example.com/api/webhooks/1/tok"
+            assert get_secret_setting("discord_webhook_url") != "https://evil.example.com/api/webhooks/1/tok"
 
     def test_save_discord_rejects_non_https_scheme(self, app, auth_client):
         with app.app_context():
@@ -105,7 +106,7 @@ class TestDiscordSettings:
         assert resp.status_code == 302
 
         with app.app_context():
-            assert Setting.get("discord_webhook_url") != "http://discord.com/api/webhooks/1/tok"
+            assert get_secret_setting("discord_webhook_url") != "http://discord.com/api/webhooks/1/tok"
 
     def test_save_discord_rejects_file_scheme(self, app, auth_client):
         with app.app_context():
@@ -119,7 +120,7 @@ class TestDiscordSettings:
         assert resp.status_code == 302
 
         with app.app_context():
-            assert Setting.get("discord_webhook_url") != "file:///etc/passwd"
+            assert get_secret_setting("discord_webhook_url") != "file:///etc/passwd"
 
     def test_save_discord_rejects_wrong_path(self, app, auth_client):
         with app.app_context():
@@ -133,7 +134,7 @@ class TestDiscordSettings:
         assert resp.status_code == 302
 
         with app.app_context():
-            assert Setting.get("discord_webhook_url") != "https://discord.com/not-a-webhook"
+            assert get_secret_setting("discord_webhook_url") != "https://discord.com/not-a-webhook"
 
 
 class TestModerationDiscordSettings:
@@ -152,7 +153,7 @@ class TestModerationDiscordSettings:
         assert resp.status_code == 302
 
         with app.app_context():
-            assert Setting.get("discord_moderation_webhook_url") == "https://discord.com/api/webhooks/321/mod-tok"
+            assert get_secret_setting("discord_moderation_webhook_url") == "https://discord.com/api/webhooks/321/mod-tok"
             assert Setting.get("discord_moderation_enabled") == "true"
 
     def test_save_rejects_non_discord_host(self, app, auth_client):
@@ -167,7 +168,7 @@ class TestModerationDiscordSettings:
         assert resp.status_code == 302
 
         with app.app_context():
-            assert Setting.get("discord_moderation_webhook_url") != "https://evil.example.com/api/webhooks/1/tok"
+            assert get_secret_setting("discord_moderation_webhook_url") != "https://evil.example.com/api/webhooks/1/tok"
 
     def test_blank_webhook_keeps_existing(self, app, auth_client):
         with app.app_context():
@@ -180,7 +181,7 @@ class TestModerationDiscordSettings:
         )
 
         with app.app_context():
-            assert Setting.get("discord_moderation_webhook_url") == "https://discord.com/api/webhooks/1/existing"
+            assert get_secret_setting("discord_moderation_webhook_url") == "https://discord.com/api/webhooks/1/existing"
 
     def test_enabled_toggle_off_when_checkbox_absent(self, app, auth_client):
         with app.app_context():
@@ -210,7 +211,7 @@ class TestModerationDiscordSettings:
         )
 
         with app.app_context():
-            assert Setting.get("discord_webhook_url") == "https://discord.com/api/webhooks/1/admin-untouched"
+            assert get_secret_setting("discord_webhook_url") == "https://discord.com/api/webhooks/1/admin-untouched"
             assert Setting.get("discord_enabled") == "true"
 
     def test_test_route_calls_moderation_sender(self, app, auth_client):

@@ -203,8 +203,9 @@ def save():
     if auth_token:
         # Blank submission keeps the currently stored token — the field is
         # never rendered with its real value, so an empty field means
-        # "unchanged", not "clear the token".
-        Setting.set("prometheus_auth_token", auth_token)
+        # "unchanged", not "clear the token". Stored encrypted at rest.
+        from core.secret_settings import set_secret_setting
+        set_secret_setting("prometheus_auth_token", auth_token)
     Setting.set("prometheus_enabled",
                 "true" if "prometheus_enabled" in request.form else "false")
     Setting.set("prometheus_auto_upgrade",

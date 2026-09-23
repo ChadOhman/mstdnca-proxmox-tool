@@ -231,7 +231,8 @@ def save_discord():
         if not ok:
             flash(f"Invalid Discord webhook URL: {reason}.", "error")
             return redirect(url_for("settings.index"))
-        Setting.set("discord_webhook_url", webhook_url)
+        from core.secret_settings import set_secret_setting
+        set_secret_setting("discord_webhook_url", webhook_url)
     Setting.set("discord_enabled", "true" if enabled else "false")
     Setting.set("discord_notify_updates", "true" if notify_updates else "false")
     Setting.set("discord_notify_updates_security_only", "true" if notify_security_only else "false")
@@ -294,7 +295,8 @@ def save_discord_moderation():
         if not ok:
             flash(f"Invalid Discord webhook URL: {reason}.", "error")
             return redirect(url_for("settings.index"))
-        Setting.set("discord_moderation_webhook_url", webhook_url)
+        from core.secret_settings import set_secret_setting
+        set_secret_setting("discord_moderation_webhook_url", webhook_url)
     Setting.set("discord_moderation_enabled", "true" if enabled else "false")
 
     log_action("settings_discord_moderation_save", "settings", resource_name="discord_moderation")
@@ -997,12 +999,27 @@ def import_config():
     if not import_hosts and counts.get("skipped_hosts"):
         message += (
             f" {len(counts['skipped_hosts'])} existing host(s) not updated "
-            "(check 'Import host connection fields' to overwrite — this also clears their stored credential)."
+            "(check 'Import connection fields' to overwrite — this also clears their stored credential)."
+        )
+    if not import_hosts and counts.get("skipped_guests"):
+        message += (
+            f" {len(counts['skipped_guests'])} existing guest(s) kept their IP/connection method "
+            "(check 'Import connection fields' to overwrite)."
+        )
+    if counts.get("cleared_secrets"):
+        message += (
+            f" Cleared stored secret(s) for repointed endpoint(s): {', '.join(counts['cleared_secrets'])} "
+            "— re-enter them."
         )
     if not import_roles and counts.get("skipped_roles"):
         message += (
             f" {counts['skipped_roles']} role(s) not imported "
             "(check 'Import role permissions' to apply them)."
+        )
+    if counts.get("clamped_roles"):
+        message += (
+            f" Role level capped at operator tier for: {', '.join(sorted(set(counts['clamped_roles'])))} "
+            "(imports never grant admin tier — raise it manually if intended)."
         )
     flash(message, "success")
     return redirect(url_for("settings.index"))

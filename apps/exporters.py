@@ -1100,8 +1100,9 @@ def _regenerate_prometheus_config(_log=None):
             extra_configs += get_unpoller_scrape_config(prom_guest.ip_address)
 
     # Generate full config
+    from core.secret_settings import get_secret_setting
     mstdnca_url = Setting.get("prometheus_mstdnca_metrics_url", "")
-    auth_token = Setting.get("prometheus_auth_token", "")
+    auth_token = get_secret_setting("prometheus_auth_token", "")
     yml = _generate_prometheus_yml(mstdnca_url, auth_token, extra_configs)
 
     # Push to Prometheus guest

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from core.secret_settings import get_secret_setting
 from models import Guest, GuestService, db
 
 # ---------------------------------------------------------------------------
@@ -749,7 +750,7 @@ class TestPrometheusAuthTokenMasking:
         }, follow_redirects=True)
         with app.app_context():
             from models import Setting
-            assert Setting.get("prometheus_auth_token") == "test-only-existing"
+            assert get_secret_setting("prometheus_auth_token") == "test-only-existing"
 
     def test_nonblank_token_saves(self, auth_client, app):
         auth_client.post("/prometheus/save", data={
@@ -763,8 +764,7 @@ class TestPrometheusAuthTokenMasking:
             "prometheus_backup_mode": "snapshot",
         }, follow_redirects=True)
         with app.app_context():
-            from models import Setting
-            assert Setting.get("prometheus_auth_token") == "test-only-newtoken"
+            assert get_secret_setting("prometheus_auth_token") == "test-only-newtoken"
 
 
 # ---------------------------------------------------------------------------

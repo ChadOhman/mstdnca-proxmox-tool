@@ -13,7 +13,7 @@ import logging
 from flask import Blueprint, Response, request
 from flask_login import current_user
 
-from models import Setting
+from core.secret_settings import get_secret_setting
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +23,8 @@ bp = Blueprint("prometheus_metrics", __name__)
 @bp.route("/metrics")
 def metrics():
     """Return all registered metrics in Prometheus text exposition format."""
-    # Optional bearer token authentication
-    expected_token = Setting.get("prometheus_auth_token", "")
+    # Optional bearer token authentication (token is stored encrypted at rest)
+    expected_token = get_secret_setting("prometheus_auth_token", "")
     if expected_token:
         # Check Authorization header first, then query param
         auth_header = request.headers.get("Authorization", "")
