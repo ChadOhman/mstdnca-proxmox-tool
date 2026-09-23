@@ -255,7 +255,7 @@ class TestHelpers:
 
 
 class TestClientTransport:
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_get_sends_bearer_and_parses_json(self, mock_urlopen):
         mock_urlopen.return_value = _resp({"id": "1"})
         c = MastodonAdminClient(API + "/", "test-only-token")
@@ -266,7 +266,7 @@ class TestClientTransport:
         assert req.get_header("Authorization") == "Bearer test-only-token"
         assert req.get_method() == "GET"
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_post_with_body_is_json(self, mock_urlopen):
         mock_urlopen.return_value = _resp({})
         c = MastodonAdminClient(API, "t")
@@ -276,13 +276,13 @@ class TestClientTransport:
         assert req.get_header("Content-type") == "application/json"
         assert json.loads(mock_urlopen.call_args[1]["data"].decode()) == {"type": "suspend"}
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_empty_body_is_empty_dict(self, mock_urlopen):
         mock_urlopen.return_value = _resp(None, raw=b"")
         data, _ = MastodonAdminClient(API, "t")._request("POST", "/api/v1/z")
         assert data == {}
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_http_error_carries_status_and_api_message(self, mock_urlopen):
         mock_urlopen.side_effect = _http_error(403, {"error": "This action is outside the authorized scopes"})
         with pytest.raises(MastodonAPIError) as ei:
@@ -291,7 +291,7 @@ class TestClientTransport:
         assert "HTTP 403" in ei.value.message
         assert "outside the authorized scopes" in ei.value.message
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_transport_error_never_leaks_exception_text(self, mock_urlopen):
         mock_urlopen.side_effect = urllib.error.URLError("secret-internal-host.lan refused")
         with pytest.raises(MastodonAPIError) as ei:
@@ -299,13 +299,13 @@ class TestClientTransport:
         assert "secret-internal-host" not in ei.value.message
         assert ei.value.http_status is None
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_non_json_response(self, mock_urlopen):
         mock_urlopen.return_value = _resp(None, raw=b"<html>oops</html>")
         with pytest.raises(MastodonAPIError):
             MastodonAdminClient(API, "t")._request("GET", "/api/v1/x")
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_pagination_follows_same_origin_link(self, mock_urlopen):
         mock_urlopen.side_effect = [
             _resp([{"id": "1"}], headers={"Link": f'<{API}/api/v1/admin/domain_blocks?max_id=1>; rel="next"'}),
@@ -316,7 +316,7 @@ class TestClientTransport:
         second = mock_urlopen.call_args_list[1][0][0]
         assert second.full_url == f"{API}/api/v1/admin/domain_blocks?max_id=1"
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_pagination_refuses_cross_origin_link(self, mock_urlopen):
         mock_urlopen.return_value = _resp(
             [{"id": "1"}], headers={"Link": '<https://evil.example/steal?x=1>; rel="next"'},
@@ -326,7 +326,7 @@ class TestClientTransport:
         assert "different host" in ei.value.message
         assert mock_urlopen.call_count == 1
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_pagination_page_cap(self, mock_urlopen):
         link = {"Link": f'<{API}/api/v1/admin/reports?max_id=0>; rel="next"'}
         mock_urlopen.side_effect = [_resp([{"id": str(i)}], headers=link) for i in range(50)]
@@ -334,13 +334,13 @@ class TestClientTransport:
         assert len(items) == 3
         assert mock_urlopen.call_count == 3
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_list_endpoint_rejects_non_list(self, mock_urlopen):
         mock_urlopen.return_value = _resp({"error": "nope"})
         with pytest.raises(MastodonAPIError):
             MastodonAdminClient(API, "t")._get_all("/api/v1/admin/reports")
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_extra_headers_are_sent(self, mock_urlopen):
         mock_urlopen.return_value = _resp({})
         MastodonAdminClient(API, "t")._request(
@@ -349,7 +349,7 @@ class TestClientTransport:
         req = mock_urlopen.call_args[0][0]
         assert req.get_header("Idempotency-key") == "abc123"
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_rate_limit_headers_parsed_on_success(self, mock_urlopen):
         mock_urlopen.return_value = _resp({}, headers={
             "X-RateLimit-Limit": "300",
@@ -362,7 +362,7 @@ class TestClientTransport:
         assert c.rate_limit.remaining == 50
         assert c.rate_limit.reset_at is not None
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_rate_limit_headers_missing_gives_none_fields(self, mock_urlopen):
         mock_urlopen.return_value = _resp({})
         c = MastodonAdminClient(API, "t")
@@ -371,7 +371,7 @@ class TestClientTransport:
         assert c.rate_limit.remaining is None
         assert c.rate_limit.reset_at is None
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_rate_limit_headers_malformed_never_raises(self, mock_urlopen):
         mock_urlopen.return_value = _resp({}, headers={
             "X-RateLimit-Limit": "not-a-number", "X-RateLimit-Reset": "not-a-date",
@@ -381,7 +381,7 @@ class TestClientTransport:
         assert c.rate_limit.limit is None
         assert c.rate_limit.reset_at is None
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_429_carries_retry_after_from_header_and_rate_limit_state(self, mock_urlopen):
         fp = io.BytesIO(json.dumps({"error": "throttled"}).encode())
         mock_urlopen.side_effect = urllib.error.HTTPError(
@@ -396,7 +396,7 @@ class TestClientTransport:
         assert c.rate_limit.remaining == 0
         assert "rate limited by Mastodon" in ei.value.message
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_429_without_retry_after_header_falls_back_to_reset_at(self, mock_urlopen):
         reset_at = (datetime.now(timezone.utc) + timedelta(seconds=45)).isoformat()
         fp = io.BytesIO(b"")
@@ -409,7 +409,7 @@ class TestClientTransport:
         assert ei.value.retry_after is not None
         assert 0 <= ei.value.retry_after <= 45
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_non_429_http_error_leaves_retry_after_none(self, mock_urlopen):
         mock_urlopen.side_effect = _http_error(403, {"error": "nope"})
         with pytest.raises(MastodonAPIError) as ei:
@@ -432,7 +432,7 @@ class TestClientTransport:
 
 
 class TestMaxStatusChars:
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_parses_v2_configuration(self, mock_urlopen):
         mock_urlopen.return_value = _resp({"configuration": {"statuses": {"max_characters": 1000}}})
         c = MastodonAdminClient(API, "t")
@@ -441,7 +441,7 @@ class TestMaxStatusChars:
         assert mock_urlopen.call_count == 1
         assert "/api/v2/instance" in mock_urlopen.call_args[0][0].full_url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_falls_back_to_v1_max_toot_chars_on_404(self, mock_urlopen):
         mock_urlopen.side_effect = [_http_error(404), _resp({"max_toot_chars": 700})]
         c = MastodonAdminClient(API, "t")
@@ -450,28 +450,28 @@ class TestMaxStatusChars:
         assert mock_urlopen.call_count == 2
         assert "/api/v1/instance" in mock_urlopen.call_args_list[1][0][0].full_url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_defaults_to_500_when_both_lack_the_key(self, mock_urlopen):
         mock_urlopen.side_effect = [_resp({"configuration": {"statuses": {}}}), _resp({"uri": "example.social"})]
         c = MastodonAdminClient(API, "t")
 
         assert c.max_status_chars() == MAX_STATUS_CHARS == 500
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_clamps_a_tiny_value_up_to_the_floor(self, mock_urlopen):
         mock_urlopen.return_value = _resp({"configuration": {"statuses": {"max_characters": 5}}})
         c = MastodonAdminClient(API, "t")
 
         assert c.max_status_chars() == MIN_STATUS_CHARS == 100
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_clamps_a_huge_value_down_to_the_ceiling(self, mock_urlopen):
         mock_urlopen.return_value = _resp({"configuration": {"statuses": {"max_characters": 99999}}})
         c = MastodonAdminClient(API, "t")
 
         assert c.max_status_chars() == MAX_STATUS_CHARS_CEILING == 25000
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_raises_when_both_endpoints_fail_for_a_non_404_reason(self, mock_urlopen):
         mock_urlopen.side_effect = [_http_error(500, {"error": "boom"}), _http_error(500, {"error": "boom2"})]
         c = MastodonAdminClient(API, "t")
@@ -486,7 +486,7 @@ class TestMaxStatusChars:
 
 
 class TestClientOperations:
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_verify_probes_admin_scope(self, mock_urlopen):
         mock_urlopen.side_effect = [
             _resp({
@@ -504,13 +504,13 @@ class TestClientOperations:
         assert urls[0].endswith("/api/v1/accounts/verify_credentials")
         assert "/api/v1/admin/reports" in urls[1]
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_list_reports_passes_resolved_flag(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").list_reports(resolved=True)
         assert "resolved=true" in mock_urlopen.call_args[0][0].full_url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_list_reports_passes_target_account_id(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").list_reports(target_account_id="7")
@@ -518,7 +518,7 @@ class TestClientOperations:
         assert "target_account_id=7" in url
         assert "&account_id=7" not in url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_list_reports_passes_account_id(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").list_reports(account_id=9)
@@ -526,7 +526,7 @@ class TestClientOperations:
         assert "account_id=9" in url
         assert "target_account_id" not in url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_reports_for_account_resolved_none_makes_two_calls_open_first(self, mock_urlopen):
         mock_urlopen.side_effect = [
             _resp([{"id": "1", "action_taken": False}]),
@@ -540,14 +540,14 @@ class TestClientOperations:
         assert "resolved=true" in urls[1]
         assert "target_account_id=7" in urls[1]
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_reports_for_account_resolved_given_makes_one_call(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").reports_for_account("7", resolved=True)
         assert mock_urlopen.call_count == 1
         assert "resolved=true" in mock_urlopen.call_args[0][0].full_url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_reports_for_account_as_target_false_uses_account_id_filter(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").reports_for_account("7", as_target=False, resolved=False)
@@ -555,7 +555,7 @@ class TestClientOperations:
         assert "account_id=7" in url
         assert "target_account_id" not in url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_get_report_hits_the_right_path_and_reduces(self, mock_urlopen):
         mock_urlopen.return_value = _resp({
             "id": "42", "category": "spam", "comment": "bad", "action_taken": False,
@@ -575,7 +575,7 @@ class TestClientOperations:
         assert out["statuses"][0]["url"] == "https://masto.example/@bad/9"
         assert out["statuses"][0]["excerpt"] == "buy now"
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_search_accounts_sends_only_given_filters(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").search_accounts(email="a@b.com", username="bob")
@@ -587,7 +587,7 @@ class TestClientOperations:
         assert "origin=" not in url
         assert "status=" not in url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_search_accounts_clamps_limit(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").search_accounts(username="x", limit=500)
@@ -597,7 +597,7 @@ class TestClientOperations:
         MastodonAdminClient(API, "t").search_accounts(username="x", limit=0)
         assert "limit=1" in mock_urlopen.call_args[0][0].full_url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_search_accounts_reduces_with_summarize_admin_account(self, mock_urlopen):
         mock_urlopen.return_value = _resp([{"id": "1", "username": "bob", "domain": None}])
         out = MastodonAdminClient(API, "t").search_accounts(username="bob")
@@ -612,7 +612,7 @@ class TestClientOperations:
         with pytest.raises(ValueError):
             MastodonAdminClient(API, "t").search_accounts(status="banned")
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_search_accounts_accepts_valid_origin_and_status(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").search_accounts(origin="local", status="suspended")
@@ -620,19 +620,19 @@ class TestClientOperations:
         assert "origin=local" in url
         assert "status=suspended" in url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_accounts_sharing_ip_validates_ip(self, mock_urlopen):
         with pytest.raises(ValueError):
             MastodonAdminClient(API, "t").accounts_sharing_ip("not-an-ip")
         mock_urlopen.assert_not_called()
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_accounts_sharing_ip_accepts_cidr(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").accounts_sharing_ip("10.0.0.0/24")
         assert "ip=10.0.0.0%2F24" in mock_urlopen.call_args[0][0].full_url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_accounts_sharing_ip_excludes_id_and_caps(self, mock_urlopen):
         mock_urlopen.return_value = _resp([
             {"id": "1", "username": "a", "domain": None},
@@ -644,7 +644,7 @@ class TestClientOperations:
         # requests limit+1 so exclusion doesn't shrink below the caller's cap
         assert "limit=3" in mock_urlopen.call_args[0][0].full_url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_accounts_sharing_ip_caps_at_limit(self, mock_urlopen):
         mock_urlopen.return_value = _resp([
             {"id": str(i), "username": f"u{i}", "domain": None} for i in range(5)
@@ -652,7 +652,7 @@ class TestClientOperations:
         out = MastodonAdminClient(API, "t").accounts_sharing_ip("10.0.0.5", limit=2)
         assert len(out) == 2
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_delete_account_sends_delete_to_right_path(self, mock_urlopen):
         mock_urlopen.return_value = _resp({})
         result = MastodonAdminClient(API, "t").delete_account(5)
@@ -661,7 +661,7 @@ class TestClientOperations:
         assert req.full_url == f"{API}/api/v1/admin/accounts/5"
         assert result is True
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_lookup_account_chains_public_then_admin(self, mock_urlopen):
         mock_urlopen.side_effect = [
             _resp({"id": "77", "acct": "someone"}),
@@ -673,7 +673,7 @@ class TestClientOperations:
         assert urls[0] == f"{API}/api/v1/accounts/lookup?acct=someone"
         assert urls[1] == f"{API}/api/v1/admin/accounts/77"
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_lookup_account_not_found(self, mock_urlopen):
         mock_urlopen.side_effect = _http_error(404, {"error": "Record not found"})
         with pytest.raises(MastodonAPIError) as ei:
@@ -684,7 +684,7 @@ class TestClientOperations:
         with pytest.raises(MastodonAPIError):
             MastodonAdminClient(API, "t").lookup_account("  ")
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_account_action_body(self, mock_urlopen):
         mock_urlopen.return_value = _resp({})
         MastodonAdminClient(API, "t").account_action(5, "suspend", text="bye", report_id=9, send_email_notification=True)
@@ -701,7 +701,7 @@ class TestClientOperations:
         with pytest.raises(MastodonAPIError):
             MastodonAdminClient(API, "t").lift_account_action(5, "delete")
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_create_domain_block_body(self, mock_urlopen):
         mock_urlopen.return_value = _resp({"id": "3", "domain": "spam.example", "severity": "suspend"})
         out = MastodonAdminClient(API, "t").create_domain_block("Spam.Example", severity="suspend", reject_media=True)
@@ -720,7 +720,7 @@ class TestClientOperations:
         with pytest.raises(ValueError):
             MastodonAdminClient(API, "t").create_domain_block("https://spam.example")
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_delete_domain_block_uses_delete(self, mock_urlopen):
         mock_urlopen.return_value = _resp({})
         MastodonAdminClient(API, "t").delete_domain_block(3)
@@ -728,7 +728,7 @@ class TestClientOperations:
         assert req.get_method() == "DELETE"
         assert req.full_url == f"{API}/api/v1/admin/domain_blocks/3"
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_list_local_accounts_sends_origin_and_status(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").list_local_accounts()
@@ -736,7 +736,7 @@ class TestClientOperations:
         assert "origin=local" in url
         assert "status=active" in url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_list_local_accounts_drops_remote_rows(self, mock_urlopen):
         mock_urlopen.return_value = _resp([
             {"id": "1", "username": "loc", "domain": None, "created_at": "2026-09-01T00:00:00Z",
@@ -747,7 +747,7 @@ class TestClientOperations:
         out = MastodonAdminClient(API, "t").list_local_accounts()
         assert [a["username"] for a in out] == ["loc"]
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_list_local_accounts_output_excludes_pii(self, mock_urlopen):
         mock_urlopen.return_value = _resp([
             {"id": "1", "username": "loc", "domain": None, "email": "loc@example.com", "ip": "9.9.9.9",
@@ -759,7 +759,7 @@ class TestClientOperations:
         assert "ip" not in out[0]
         assert "email" not in out[0]
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_list_local_accounts_stops_paging_at_cutoff(self, mock_urlopen):
         # A same-origin Link header is present, but every row on this page is at/under
         # the cutoff -- list_local_accounts must not follow it to a second page.
@@ -775,7 +775,7 @@ class TestClientOperations:
         assert [a["username"] for a in out] == ["new"]
         assert mock_urlopen.call_count == 1
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_account_statuses_passes_since_id_and_limit(self, mock_urlopen):
         mock_urlopen.return_value = _resp([{"id": "9", "content": "hi", "account": {"acct": "poster"}}])
         out = MastodonAdminClient(API, "t").account_statuses(42, since_id="100", limit=10)
@@ -784,7 +784,7 @@ class TestClientOperations:
         assert out[0]["id"] == "9"
         assert out[0]["account_acct"] == "poster"
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_account_statuses_omits_since_id_when_not_given(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").account_statuses(42)
@@ -792,7 +792,7 @@ class TestClientOperations:
         assert "since_id" not in url
         assert "limit=40" in url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_count_hint_detects_next_link(self, mock_urlopen):
         mock_urlopen.return_value = _resp(
             [{"id": "1"}], headers={"Link": f'<{API}/api/v1/admin/reports?max_id=1>; rel="next"'},
@@ -803,21 +803,21 @@ class TestClientOperations:
         assert count == 1
         assert has_next is True
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_count_hint_no_next_link(self, mock_urlopen):
         mock_urlopen.return_value = _resp([{"id": "1"}, {"id": "2"}])
         count, has_next = MastodonAdminClient(API, "t").count_hint("/api/v1/admin/reports")
         assert count == 2
         assert has_next is False
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_open_report_count_wraps_count_hint(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         count, has_next = MastodonAdminClient(API, "t").open_report_count()
         assert (count, has_next) == (0, False)
         assert "resolved=false" in mock_urlopen.call_args[0][0].full_url
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_pending_account_count_wraps_count_hint(self, mock_urlopen):
         mock_urlopen.return_value = _resp([])
         MastodonAdminClient(API, "t").pending_account_count()
@@ -1467,7 +1467,7 @@ class TestUserAgentAndProxyErrors:
     code 1010). The client must identify itself, and a non-JSON 403 must not be
     reported as a token-scope problem."""
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_requests_carry_app_user_agent(self, mock_urlopen):
         mock_urlopen.return_value = _resp({})
         MastodonAdminClient(API, "t")._request("GET", "/api/v1/x")
@@ -1475,7 +1475,7 @@ class TestUserAgentAndProxyErrors:
         assert req.get_header("User-agent") == "mstdnca-proxmox-tool"
         assert "urllib" not in req.get_header("User-agent")
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_cloudflare_text_403_is_described_as_upstream_block(self, mock_urlopen):
         fp = io.BytesIO(b"error code: 1010")
         mock_urlopen.side_effect = urllib.error.HTTPError("https://masto.example/x", 403, "Forbidden", {}, fp)
@@ -1487,7 +1487,7 @@ class TestUserAgentAndProxyErrors:
         assert "proxy or firewall" in msg
         assert "upstream firewall" in msg
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_html_error_page_is_reduced_to_text_snippet(self, mock_urlopen):
         fp = io.BytesIO(b"<html><head><title>403 Forbidden</title></head><body><h1>Access denied</h1></body></html>")
         mock_urlopen.side_effect = urllib.error.HTTPError("https://masto.example/x", 403, "Forbidden", {}, fp)
@@ -1496,7 +1496,7 @@ class TestUserAgentAndProxyErrors:
         assert "<" not in ei.value.message
         assert "Access denied" in ei.value.message
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_json_scope_error_still_reports_api_text(self, mock_urlopen):
         mock_urlopen.side_effect = _http_error(403, {"error": "This action is outside the authorized scopes"})
         with pytest.raises(MastodonAPIError) as ei:
@@ -1506,7 +1506,7 @@ class TestUserAgentAndProxyErrors:
 
 
 class TestPeerTubeUserAgent:
-    @patch("core.moderation.urllib.request.urlopen")
+    @patch("core.moderation.open_no_redirect")
     def test_fetch_users_sends_app_user_agent(self, mock_urlopen):
         from core.moderation import fetch_peertube_users
 
@@ -1514,7 +1514,7 @@ class TestPeerTubeUserAgent:
         fetch_peertube_users("https://pt.example", "t")
         assert mock_urlopen.call_args[0][0].get_header("User-agent") == "mstdnca-proxmox-tool"
 
-    @patch("core.moderation.urllib.request.urlopen")
+    @patch("core.moderation.open_no_redirect")
     def test_ban_sends_app_user_agent(self, mock_urlopen):
         from core.moderation import ban_peertube_user
 

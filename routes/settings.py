@@ -576,12 +576,23 @@ def save_unifi_logging():
 @bp.route("/unpoller", methods=["POST"])
 def save_unpoller():
     enabled = "unpoller_enabled" in request.form
-    prefix = request.form.get("unpoller_metric_prefix", "unpoller").strip()
-    site_name = request.form.get("unpoller_site_name", "default").strip()
+    prefix = request.form.get("unpoller_metric_prefix", "unpoller").strip() or "unpoller"
+    site_name = request.form.get("unpoller_site_name", "default").strip() or "default"
+
+    # The prefix lands in the metric-name position of PromQL queries, where
+    # escape_label_value cannot help; routes/unpoller.py already validates the
+    # same setting this way, and this second save handler must not bypass it.
+    from apps.utils import _validate_no_control_chars, _validate_shell_param
+    try:
+        _validate_shell_param(prefix, "Metric prefix")
+        _validate_no_control_chars(site_name, "Site name")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("settings.index"))
 
     Setting.set("unpoller_enabled", "true" if enabled else "false")
-    Setting.set("unpoller_metric_prefix", prefix or "unpoller")
-    Setting.set("unpoller_site_name", site_name or "default")
+    Setting.set("unpoller_metric_prefix", prefix)
+    Setting.set("unpoller_site_name", site_name)
 
     log_action("settings_unpoller_save", "settings", resource_name="unpoller")
     db.session.commit()

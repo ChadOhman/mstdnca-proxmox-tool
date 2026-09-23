@@ -8,6 +8,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from apps.utils import _validate_shell_param
+from core.url_safety import is_redirect, open_no_redirect
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +106,12 @@ def fetch_peertube_users(api_url, api_token):
         req.add_header("Authorization", f"Bearer {api_token}")
         req.add_header("User-Agent", _USER_AGENT)
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            # Never follow a redirect with the bearer token (GHSA-gj96-qjq5-q57h).
+            with open_no_redirect(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:
+            if is_redirect(exc):
+                return None, f"PeerTube API answered with a redirect (HTTP {exc.code}); not following it"
             return None, f"PeerTube API error: HTTP {exc.code} - {exc.reason}"
         except Exception as exc:
             return None, f"PeerTube API error: {exc}"
@@ -156,11 +160,13 @@ def ban_peertube_user(api_url, api_token, user_id, reason=""):
     req.add_header("Content-Type", "application/json")
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+        with open_no_redirect(req, timeout=30) as resp:
             if resp.status in (200, 204):
                 return True, None
             return False, f"Unexpected status {resp.status}"
     except urllib.error.HTTPError as exc:
+        if is_redirect(exc):
+            return False, f"PeerTube API answered with a redirect (HTTP {exc.code}); not following it"
         return False, f"HTTP {exc.code}: {exc.reason}"
     except Exception as exc:
         return False, str(exc)

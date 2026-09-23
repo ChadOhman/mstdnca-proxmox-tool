@@ -435,7 +435,7 @@ def save_cloudflare():
             flash("Team domain and audience tag are required to enable CF Access-only mode.", "error")
             return redirect(url_for("security.index"))
 
-    if team_domain and not _CF_TEAM_DOMAIN_RE.match(team_domain.lower()):
+    if team_domain and not _CF_TEAM_DOMAIN_RE.fullmatch(team_domain.lower()):
         flash("Invalid Cloudflare team domain. Expected format: <team>.cloudflareaccess.com", "error")
         return redirect(url_for("security.index"))
 

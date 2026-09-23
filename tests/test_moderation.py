@@ -333,7 +333,7 @@ class TestFetchMastodonEmails:
 class TestFetchPeertubeUsers:
     """Tests for core.moderation.fetch_peertube_users()."""
 
-    @patch("core.moderation.urllib.request.urlopen")
+    @patch("core.moderation.open_no_redirect")
     def test_success_single_page(self, mock_urlopen):
         from core.moderation import fetch_peertube_users
 
@@ -357,7 +357,7 @@ class TestFetchPeertubeUsers:
         assert users[0]["role"] == 0
         assert users[1]["email"] == "user1@pt.com"  # lowercased
 
-    @patch("core.moderation.urllib.request.urlopen")
+    @patch("core.moderation.open_no_redirect")
     def test_pagination(self, mock_urlopen):
         from core.moderation import fetch_peertube_users
 
@@ -388,7 +388,7 @@ class TestFetchPeertubeUsers:
         assert err is None
         assert len(users) == 150
 
-    @patch("core.moderation.urllib.request.urlopen")
+    @patch("core.moderation.open_no_redirect")
     def test_api_error(self, mock_urlopen):
         import urllib.error
 
@@ -405,7 +405,7 @@ class TestFetchPeertubeUsers:
 class TestBanPeertubeUser:
     """Tests for core.moderation.ban_peertube_user()."""
 
-    @patch("core.moderation.urllib.request.urlopen")
+    @patch("core.moderation.open_no_redirect")
     def test_success(self, mock_urlopen):
         from core.moderation import ban_peertube_user
 
@@ -419,7 +419,7 @@ class TestBanPeertubeUser:
         assert ok is True
         assert err is None
 
-    @patch("core.moderation.urllib.request.urlopen")
+    @patch("core.moderation.open_no_redirect")
     def test_failure(self, mock_urlopen):
         import urllib.error
 

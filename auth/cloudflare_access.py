@@ -42,7 +42,7 @@ _TEAM_DOMAIN_RE = re.compile(r'^[a-z0-9-]+\.cloudflareaccess\.com$')
 
 
 def _is_valid_team_domain(team_domain):
-    return bool(team_domain) and bool(_TEAM_DOMAIN_RE.match(team_domain.lower()))
+    return bool(team_domain) and bool(_TEAM_DOMAIN_RE.fullmatch(team_domain.lower()))
 
 
 def _get_cf_config():

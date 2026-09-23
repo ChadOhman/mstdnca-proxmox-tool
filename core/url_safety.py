@@ -18,6 +18,7 @@ rebinding between the two) wherever that matters.
 
 import ipaddress
 import socket
+import urllib.request
 from urllib.parse import urlparse
 
 # Schemes we are willing to make outbound requests with.
@@ -48,7 +49,39 @@ def _ip_is_blocked(ip_str):
         or ip.is_multicast
         or ip.is_reserved
         or ip.is_unspecified
+        # Everything else the IANA special-purpose registries say is not
+        # globally routable: carrier-grade NAT (100.64.0.0/10), benchmarking
+        # (198.18.0.0/15), and similar ranges that ``is_private`` leaves out.
+        or not ip.is_global
     )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect so the 3xx surfaces to the caller as an HTTPError."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def open_no_redirect(req, data=None, timeout=None):
+    """``urllib.request.urlopen`` that never follows a redirect.
+
+    A request that carries a bearer token must not be replayed wherever a
+    3xx points: urllib copies ``Authorization`` onto the redirected request,
+    including one to a different host, so a compromised or misconfigured
+    endpoint could collect the token (or steer the server at an internal
+    address). The 3xx is raised as ``urllib.error.HTTPError`` instead.
+    """
+    return _no_redirect_opener.open(req, data=data, timeout=timeout)
+
+
+def is_redirect(exc):
+    """True for an ``HTTPError`` produced by :func:`open_no_redirect` refusing a 3xx."""
+    code = getattr(exc, "code", None)
+    return isinstance(code, int) and 300 <= code < 400
 
 
 def validate_outbound_url(url, allowed_hosts=None, allowed_schemes=_ALLOWED_SCHEMES, allowed_ports=_ALLOWED_PORTS):
