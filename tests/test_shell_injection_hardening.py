@@ -964,7 +964,7 @@ class TestRunMaintenanceFailsClosed:
 
 
 # ---------------------------------------------------------------------------
-# Mastodon status batch actions (Admin::StatusBatchAction via bin/rails runner)
+# Mastodon report status actions (Admin::ModerationAction / StatusBatchAction via bin/rails runner)
 # ---------------------------------------------------------------------------
 
 
@@ -1009,6 +1009,24 @@ class TestStatusActionCommands:
         script = self._script()
         assert "report.status_ids.map(&:to_s) & [" in script
         assert "raise 'none of the selected statuses belong to this report' if ids.empty?" in script
+
+    def test_script_uses_moderation_action_on_mastodon_46_plus(self):
+        # 4.6 moved delete/mark_as_sensitive to Admin::ModerationAction; it acts on
+        # the whole report unless narrowed to the selected statuses.
+        script = self._script()
+        assert "if Admin.const_defined?(:ModerationAction)" in script
+        assert "Admin::ModerationAction.new(params)" in script
+        assert "define_singleton_method(:status_ids) { selected }" in script
+        assert "define_singleton_method(:collections) { [] }" in script
+
+    def test_script_falls_back_to_status_batch_action(self):
+        script = self._script()
+        assert "Admin::StatusBatchAction.new(params.merge(status_ids: ids))" in script
+
+    def test_script_surfaces_validation_errors_before_save(self):
+        script = self._script()
+        assert script.index("unless action.valid?") < script.index("action.save!")
+        assert "action.errors.full_messages" in script
 
     def test_script_ends_with_ok_marker(self):
         script = self._script()
