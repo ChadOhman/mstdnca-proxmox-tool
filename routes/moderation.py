@@ -36,6 +36,26 @@ from core.mastodon_maintenance import (
 from core.moderation_log import KIND_FILTERS, MODERATION_ACTION_PREFIXES, moderation_log_filter
 from models import AuditLog, ModerationAlert, ModerationWatch, Setting, User, db
 
+
+def _clean_api_url(raw, label):
+    """Normalise an integration API base URL from a form. Returns (value, error).
+
+    A stored bearer token is sent to this URL on every poll, so it must be
+    well-formed and https; an empty value clears the setting.
+    """
+    from apps.utils import _validate_http_url
+
+    value = (raw or "").strip().rstrip("/")
+    if not value:
+        return "", None
+    try:
+        _validate_http_url(value, label)
+    except ValueError as exc:
+        return None, str(exc)
+    if not value.startswith("https://"):
+        return None, f"{label} must start with https://"
+    return value, None
+
 logger = logging.getLogger(__name__)
 
 # Upper bound on free-text fields (reasons, comments) forwarded to Mastodon.
@@ -312,7 +332,11 @@ def log():
 def save():
     from auth.credential_store import encrypt
 
-    Setting.set("moderation_peertube_api_url", request.form.get("peertube_api_url", "").strip())
+    peertube_api_url, err = _clean_api_url(request.form.get("peertube_api_url", ""), "PeerTube API URL")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("moderation.index"))
+    Setting.set("moderation_peertube_api_url", peertube_api_url)
 
     # Only update token if a new one was provided (not the placeholder)
     new_token = request.form.get("peertube_api_token", "").strip()
@@ -546,9 +570,9 @@ def _watched_account_ids(account_ids):
 def mastodon_save():
     from auth.credential_store import encrypt
 
-    api_url = request.form.get("mastodon_api_url", "").strip().rstrip("/")
-    if api_url and not (api_url.startswith("https://") or api_url.startswith("http://")):
-        flash("Mastodon API URL must start with https://", "error")
+    api_url, err = _clean_api_url(request.form.get("mastodon_api_url", ""), "Mastodon API URL")
+    if err:
+        flash(err, "error")
         return redirect(url_for("moderation.index", tab="mastodon"))
 
     previous_api_url = Setting.get("moderation_mastodon_api_url", "")

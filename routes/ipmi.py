@@ -249,10 +249,12 @@ def prom_debug(host_id):
     if Setting.get("prometheus_enabled", "false") != "true":
         return jsonify({"error": "Prometheus not enabled"})
     try:
-        from clients.prometheus_query import PrometheusQueryClient
+        from clients.prometheus_query import PrometheusQueryClient, escape_label_value
         prom = PrometheusQueryClient()
         target = host.ipmi_address or host.hostname
-        inst = f'instance="{target}"'
+        # Host fields are admin-entered but not PromQL-validated; escape them
+        # like every other label value (GHSA-gj96-qjq5-q57h).
+        inst = f'instance="{escape_label_value(target)}"'
         # Query all ipmi_ metrics for this instance
         results = prom.query(f'{{__name__=~"ipmi_.*",{inst}}}')
         metrics = {}

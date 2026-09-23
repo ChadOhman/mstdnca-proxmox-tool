@@ -277,7 +277,7 @@ class TestValidateReportNoticeTemplate:
 
 
 class TestMastodonBotClient:
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_post_direct_body_headers_and_bearer(self, mock_urlopen):
         mock_urlopen.return_value = _resp({
             "id": "9001", "url": "u9001", "created_at": "2026-09-21T00:00:00Z",
@@ -293,7 +293,7 @@ class TestMastodonBotClient:
         body = json.loads(mock_urlopen.call_args[1]["data"].decode())
         assert body == {"status": "hello there", "visibility": "direct"}
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_post_direct_returns_summarized_status(self, mock_urlopen):
         mock_urlopen.return_value = _resp({
             "id": "9001", "url": "u9001", "created_at": "2026-09-21T00:00:00Z",
@@ -306,7 +306,7 @@ class TestMastodonBotClient:
         assert out["id"] == "9001"
         assert out["account_acct"] == "bot@example.social"
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_post_direct_raises_on_http_error(self, mock_urlopen):
         mock_urlopen.side_effect = _http_error(422, {"error": "Text can't be blank"})
         client = MastodonBotClient(API, "tok123")
@@ -314,7 +314,7 @@ class TestMastodonBotClient:
         with pytest.raises(MastodonAPIError):
             client.post_direct("", idempotency_key="welcome-1")
 
-    @patch("core.mastodon_admin.urllib.request.urlopen")
+    @patch("core.mastodon_admin.open_no_redirect")
     def test_verify_reduces_fields(self, mock_urlopen):
         mock_urlopen.return_value = _resp({
             "id": "9", "acct": "bot@example.social", "display_name": "Bot", "bot": True,

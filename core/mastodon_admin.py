@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from html import unescape
 
 from core.errors import describe_exception
+from core.url_safety import is_redirect, open_no_redirect
 
 logger = logging.getLogger(__name__)
 
@@ -264,10 +265,17 @@ class _MastodonClientBase:
             req.add_header(name, value)
 
         try:
-            with urllib.request.urlopen(req, data=data, timeout=_TIMEOUT) as resp:  # noqa: S310
+            # Never follow a redirect: the bearer token would go wherever the
+            # 3xx points, including another host (GHSA-gj96-qjq5-q57h).
+            with open_no_redirect(req, data=data, timeout=_TIMEOUT) as resp:
                 raw = resp.read()
                 resp_headers = resp.headers
         except urllib.error.HTTPError as exc:
+            if is_redirect(exc):
+                raise MastodonAPIError(
+                    f"Mastodon API answered with a redirect (HTTP {exc.code}); not following it. "
+                    "Check the configured API URL."
+                ) from exc
             self.rate_limit = _parse_rate_limit_headers(exc.headers or {})
             retry_after = None
             if exc.code == 429:
