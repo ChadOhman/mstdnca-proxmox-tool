@@ -2672,3 +2672,101 @@ class TestPurgeOldUpdateHistory:
                 _S.set("update_history_retention_days", "365")
                 _S.set("scan_result_retention_days", "90")
             self._cleanup(app, gid)
+
+
+# ---------------------------------------------------------------------------
+# Release tags from third-party feeds are validated before they are stored
+# (GHSA-hx66-9rjm-v8mx): the scheduler's own release checks used to persist the
+# raw GitHub tag, and run_*_upgrade read it back into a download URL.
+# ---------------------------------------------------------------------------
+
+_HOSTILE_TAGS = ["v1.2.3; rm -rf /", "v1.2.3'", "v1.2.3 ../../etc", "$(id)", "../../../etc"]
+
+
+def _fake_release_response(tag):
+    import json
+
+    fake_resp = MagicMock()
+    fake_resp.__enter__ = MagicMock(return_value=fake_resp)
+    fake_resp.__exit__ = MagicMock(return_value=False)
+    fake_resp.read.return_value = json.dumps({"tag_name": tag, "html_url": "u"}).encode()
+    return fake_resp
+
+
+class TestSchedulerReleaseTagValidation:
+    @pytest.mark.parametrize("tag", _HOSTILE_TAGS)
+    def test_prometheus_check_rejects_hostile_tag(self, tag):
+        from core.scheduler import _check_prometheus_release
+
+        mock_setting = MagicMock()
+        mock_setting.get.side_effect = lambda k, d="": {
+            "prometheus_guest_id": "42",
+            "prometheus_installed": "true",
+            "prometheus_current_version": "2.0.0",
+            "prometheus_auto_upgrade": "true",
+        }.get(k, d)
+        mock_prom = MagicMock()
+        mocks = {"models": MagicMock(Setting=mock_setting, db=MagicMock()),
+                 "apps.prometheus_app": mock_prom, "auth.audit": MagicMock()}
+        with _SysModulesPatch(mocks), patch("urllib.request.urlopen", return_value=_fake_release_response(tag)):
+            _check_prometheus_release(_make_app())
+
+        assert not any(c.args[0] == "prometheus_latest_version" for c in mock_setting.set.call_args_list)
+        mock_prom.run_prometheus_upgrade.assert_not_called()
+
+    def test_prometheus_check_accepts_valid_tag(self):
+        from core.scheduler import _check_prometheus_release
+
+        mock_setting = MagicMock()
+        mock_setting.get.side_effect = lambda k, d="": {
+            "prometheus_guest_id": "42",
+            "prometheus_installed": "true",
+            "prometheus_current_version": "2.0.0",
+            "prometheus_auto_upgrade": "false",
+        }.get(k, d)
+        mocks = {"models": MagicMock(Setting=mock_setting, db=MagicMock())}
+        with _SysModulesPatch(mocks), patch("urllib.request.urlopen", return_value=_fake_release_response("v2.1.0")):
+            _check_prometheus_release(_make_app())
+
+        mock_setting.set.assert_any_call("prometheus_latest_version", "2.1.0")
+
+    @pytest.mark.parametrize("tag", _HOSTILE_TAGS)
+    def test_unpoller_check_rejects_hostile_tag(self, tag):
+        from core.scheduler import _check_unpoller_release
+
+        mock_setting = MagicMock()
+        mock_setting.get.side_effect = lambda k, d="": {
+            "unpoller_installed": "true",
+            "unpoller_current_version": "2.0.0",
+            "unpoller_auto_upgrade": "true",
+        }.get(k, d)
+        mock_unpoller = MagicMock()
+        mocks = {"models": MagicMock(Setting=mock_setting, db=MagicMock()),
+                 "apps.unpoller": mock_unpoller, "auth.audit": MagicMock()}
+        with _SysModulesPatch(mocks), patch("urllib.request.urlopen", return_value=_fake_release_response(tag)):
+            _check_unpoller_release(_make_app())
+
+        assert not any(c.args[0] == "unpoller_latest_version" for c in mock_setting.set.call_args_list)
+        mock_unpoller.run_unpoller_upgrade.assert_not_called()
+
+    @pytest.mark.parametrize("tag", _HOSTILE_TAGS)
+    def test_app_update_check_rejects_hostile_tag(self, tag):
+        from core.scheduler import _check_app_update
+
+        app = _make_app(config={"GITHUB_REPO": "org/repo", "APP_VERSION": "1.0.0"})
+        mock_setting = MagicMock()
+        mock_setting.get.side_effect = lambda k, d="": {
+            "app_update_branch": "main",
+            "app_auto_update": "true",
+            "app_last_notified_version": "",
+        }.get(k, d)
+        mock_notifier = MagicMock()
+        mocks = {"models": MagicMock(Setting=mock_setting), "core.notifier": mock_notifier}
+        with _SysModulesPatch(mocks), \
+             patch("urllib.request.urlopen", return_value=_fake_release_response(tag)), \
+             patch("subprocess.Popen") as mock_popen:
+            _check_app_update(app)
+
+        assert not any(c.args[0] == "latest_app_version" for c in mock_setting.set.call_args_list)
+        mock_notifier.send_app_update_notification.assert_not_called()
+        mock_popen.assert_not_called()

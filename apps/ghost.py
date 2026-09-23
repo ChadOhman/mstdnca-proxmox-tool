@@ -396,9 +396,9 @@ def _resolve_ghost_http_target(ssh, ghost_dir):
     if not isinstance(data, dict):
         return hostname, host, port
     candidate = urlparse(str(data.get("url") or "")).hostname or ""
-    if _HOSTNAME_RE.match(candidate):
+    if _HOSTNAME_RE.fullmatch(candidate):
         hostname = candidate
-    if _HOSTNAME_RE.match(str(data.get("host") or "")):
+    if _HOSTNAME_RE.fullmatch(str(data.get("host") or "")):
         host = str(data["host"])
     try:
         p = int(data.get("port") or 0)

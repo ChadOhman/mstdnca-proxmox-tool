@@ -21,4 +21,4 @@ def validate_pg_db_name(name):
     whitespace, or shell metacharacters that a real (but unusual) PostgreSQL
     identifier could legally contain.
     """
-    return bool(name) and bool(PG_DB_NAME_RE.match(name))
+    return bool(name) and bool(PG_DB_NAME_RE.fullmatch(name))
