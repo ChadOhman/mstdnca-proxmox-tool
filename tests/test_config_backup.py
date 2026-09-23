@@ -685,3 +685,226 @@ class TestDatabaseBackup:
         assert resp.status_code == 200
         assert resp.headers["Content-Disposition"].startswith("attachment")
         assert resp.data.startswith(b"SQLite format 3")
+
+
+# ---------------------------------------------------------------------------
+# GHSA-8mgh-j8r7-7rf2 residuals: guest repointing, secret-destination URLs,
+# role-level escalation, destructive automation toggles
+# ---------------------------------------------------------------------------
+
+
+def _upload_config(client, doc, **extra_form):
+    import io
+    data = {"config_file": (io.BytesIO(json.dumps(doc).encode()), "config.json"), **extra_form}
+    return client.post("/settings/config/import", data=data,
+                       content_type="multipart/form-data", follow_redirects=True)
+
+
+def _empty_doc(**sections):
+    doc = {"version": 1, "hosts": [], "tags": [], "guests": [], "roles": [], "settings": {}}
+    doc.update(sections)
+    return doc
+
+
+class TestImportGuestsOptIn:
+    """An import must not repoint an existing guest's IP while it still carries
+    a credential; the SSH client auto-accepts host keys, so the old root/sudo
+    secret would otherwise be sent to whatever address the file names."""
+
+    @pytest.fixture()
+    def guest_with_credential(self, app, seeded_config):
+        from models import Credential
+        with app.app_context():
+            cred = Credential(name="test-only-guest-cred", username="root", auth_type="password",
+                              encrypted_value=encrypt("test-only-guest-pw"))
+            db.session.add(cred)
+            db.session.flush()
+            guest = Guest.query.filter_by(name="web01").first()
+            guest.credential_id = cred.id
+            db.session.commit()
+            cred_id = cred.id
+        yield cred_id
+        with app.app_context():
+            guest = Guest.query.filter_by(name="web01").first()
+            if guest is not None:
+                guest.credential_id = None
+            cred = db.session.get(Credential, cred_id)
+            if cred is not None:
+                db.session.delete(cred)
+            db.session.commit()
+
+    def _doc(self):
+        return _empty_doc(guests=[{
+            "vmid": 101, "name": "web01", "guest_type": "ct", "host_name": "pve1",
+            "ip_address": "203.0.113.9", "connection_method": "ssh",
+            "auto_update": True, "tags": ["production"],
+        }])
+
+    def test_existing_guest_ip_unchanged_without_opt_in(self, app, auth_client, guest_with_credential):
+        resp = _upload_config(auth_client, self._doc())
+        assert resp.status_code == 200
+        assert b"kept their IP/connection method" in resp.data
+        with app.app_context():
+            guest = Guest.query.filter_by(name="web01").first()
+            assert guest.ip_address == "10.0.0.101"
+            assert guest.credential_id == guest_with_credential
+            # Non-connection fields still import.
+            assert guest.auto_update is True
+
+    def test_existing_guest_ip_changed_with_opt_in_clears_credential_link(
+        self, app, auth_client, guest_with_credential,
+    ):
+        resp = _upload_config(auth_client, self._doc(), import_hosts="on")
+        assert resp.status_code == 200
+        assert b"guest credential (web01)" in resp.data
+        with app.app_context():
+            guest = Guest.query.filter_by(name="web01").first()
+            assert guest.ip_address == "203.0.113.9"
+            assert guest.credential_id is None
+
+    def test_same_ip_with_opt_in_keeps_credential(self, app, auth_client, guest_with_credential):
+        doc = self._doc()
+        doc["guests"][0]["ip_address"] = "10.0.0.101"
+        _upload_config(auth_client, doc, import_hosts="on")
+        with app.app_context():
+            guest = Guest.query.filter_by(name="web01").first()
+            assert guest.credential_id == guest_with_credential
+
+    def test_new_guest_gets_connection_fields_without_opt_in(self, app, auth_client, seeded_config):
+        doc = _empty_doc(guests=[{
+            "vmid": 555, "name": "test-only-new-guest", "guest_type": "vm", "host_name": "pve1",
+            "ip_address": "10.0.0.55", "connection_method": "ssh",
+        }])
+        _upload_config(auth_client, doc)
+        with app.app_context():
+            guest = Guest.query.filter_by(name="test-only-new-guest").first()
+            assert guest is not None
+            assert guest.ip_address == "10.0.0.55"
+            db.session.delete(guest)
+            db.session.commit()
+
+
+class TestImportSecretDestinations:
+    """Integration URLs that a stored token/password is sent to follow the
+    host rule: repointing needs the opt-in and clears the paired secret."""
+
+    @pytest.fixture()
+    def integrations_configured(self, app):
+        with app.app_context():
+            Setting.set("unifi_base_url", "https://udm.example.internal")
+            Setting.set("unifi_password", encrypt("test-only-unifi-pw"))
+            Setting.set("moderation_mastodon_api_url", "https://mstdn.example")
+            Setting.set("moderation_mastodon_api_token", encrypt("test-only-mastodon-token"))
+            Setting.set("moderation_bot_token", encrypt("test-only-bot-token"))
+        yield
+        with app.app_context():
+            for key in ("unifi_base_url", "unifi_password", "moderation_mastodon_api_url",
+                        "moderation_mastodon_api_token", "moderation_bot_token"):
+                Setting.set(key, "")
+
+    def test_repointed_url_skipped_without_opt_in(self, app, auth_client, integrations_configured):
+        doc = _empty_doc(settings={"unifi_base_url": "https://collector.attacker.invalid",
+                                   "moderation_mastodon_api_url": "https://collector.attacker.invalid"})
+        resp = _upload_config(auth_client, doc)
+        assert resp.status_code == 200
+        assert b"unifi_base_url" in resp.data  # reported as skipped
+        with app.app_context():
+            assert Setting.get("unifi_base_url") == "https://udm.example.internal"
+            assert Setting.get("moderation_mastodon_api_url") == "https://mstdn.example"
+            assert Setting.get("unifi_password")
+            assert Setting.get("moderation_mastodon_api_token")
+
+    def test_repointed_url_with_opt_in_clears_paired_secrets(self, app, auth_client, integrations_configured):
+        doc = _empty_doc(settings={"unifi_base_url": "https://udm2.example.internal",
+                                   "moderation_mastodon_api_url": "https://mstdn2.example"})
+        resp = _upload_config(auth_client, doc, import_hosts="on")
+        assert resp.status_code == 200
+        assert b"Cleared stored secret(s)" in resp.data
+        with app.app_context():
+            assert Setting.get("unifi_base_url") == "https://udm2.example.internal"
+            assert not Setting.get("unifi_password")
+            assert Setting.get("moderation_mastodon_api_url") == "https://mstdn2.example"
+            assert not Setting.get("moderation_mastodon_api_token")
+            assert not Setting.get("moderation_bot_token")
+
+    def test_unchanged_url_never_clears_secrets(self, app, auth_client, integrations_configured):
+        doc = _empty_doc(settings={"unifi_base_url": "https://udm.example.internal"})
+        resp = _upload_config(auth_client, doc)
+        assert resp.status_code == 200
+        assert b"Cleared stored secret" not in resp.data
+        with app.app_context():
+            assert Setting.get("unifi_password")
+
+    def test_auto_ban_toggle_is_never_imported(self, app, auth_client):
+        with app.app_context():
+            Setting.set("moderation_auto_ban_enabled", "false")
+        doc = _empty_doc(settings={"moderation_auto_ban_enabled": "true"})
+        resp = _upload_config(auth_client, doc, import_hosts="on", import_roles="on")
+        assert resp.status_code == 200
+        with app.app_context():
+            assert Setting.get("moderation_auto_ban_enabled") == "false"
+
+
+class TestImportRoleLevelClamp:
+    """An import may lower a custom role or create one up to operator tier,
+    but never raise one into the admin tier (User.is_admin is level >= 3)."""
+
+    ROLE = "test-only-clamp-role"
+    NEW_ROLE = "test-only-clamp-new-role"
+
+    @pytest.fixture()
+    def custom_role(self, app):
+        with app.app_context():
+            role = Role.query.filter_by(name=self.ROLE).first()
+            if role is None:
+                role = Role(name=self.ROLE, display_name="Clamp", level=1, is_builtin=False, base_tier="viewer")
+                db.session.add(role)
+                db.session.commit()
+            role_id = role.id
+        yield role_id
+        with app.app_context():
+            for name in (self.ROLE, self.NEW_ROLE):
+                role = Role.query.filter_by(name=name).first()
+                if role is not None:
+                    db.session.delete(role)
+            db.session.commit()
+
+    def test_existing_role_is_not_raised_to_admin(self, app, auth_client, custom_role):
+        doc = _empty_doc(roles=[{"name": self.ROLE, "display_name": "Clamp", "level": 3,
+                                 "is_builtin": False, "base_tier": "admin", "can_manage_users": True}])
+        resp = _upload_config(auth_client, doc, import_roles="on")
+        assert resp.status_code == 200
+        assert b"Role level capped" in resp.data
+        with app.app_context():
+            role = db.session.get(Role, custom_role)
+            # Raised only as far as the operator tier; "admin" base tier refused.
+            assert role.level == 2
+            assert role.base_tier == "viewer"
+            assert role.can_manage_users is True  # permission flags still opt-in imported
+
+    def test_existing_role_can_be_lowered(self, app, auth_client, custom_role):
+        with app.app_context():
+            db.session.get(Role, custom_role).level = 2
+            db.session.commit()
+        doc = _empty_doc(roles=[{"name": self.ROLE, "level": 1, "is_builtin": False}])
+        _upload_config(auth_client, doc, import_roles="on")
+        with app.app_context():
+            assert db.session.get(Role, custom_role).level == 1
+
+    def test_new_role_capped_at_operator(self, app, auth_client, custom_role):
+        doc = _empty_doc(roles=[{"name": self.NEW_ROLE, "display_name": "New", "level": 4,
+                                 "is_builtin": False, "base_tier": "admin"}])
+        _upload_config(auth_client, doc, import_roles="on")
+        with app.app_context():
+            role = Role.query.filter_by(name=self.NEW_ROLE).first()
+            assert role is not None
+            assert role.level == 2
+            assert role.base_tier is None
+
+    def test_builtin_roles_untouched(self, app, auth_client):
+        with app.app_context():
+            admin_level = Role.query.filter_by(name="admin").first().level
+        doc = _empty_doc(roles=[{"name": "admin", "level": 1, "is_builtin": True}])
+        _upload_config(auth_client, doc, import_roles="on")
+        with app.app_context():
+            assert Role.query.filter_by(name="admin").first().level == admin_level

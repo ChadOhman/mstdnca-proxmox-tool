@@ -9,13 +9,18 @@ SECURITY-CRITICAL:
   secret-shaped (``_SECRET_KEY_PATTERN``) or whose value looks like Fernet
   ciphertext is redacted, on top of an explicit extra set. New secret-bearing
   settings are caught automatically without needing a code change here.
-- Import uses an ALLOWLIST-style blocklist for auth-critical settings
+- Import always skips a fixed denylist of auth-critical settings
   (``_AUTH_CRITICAL_SETTING_KEYS``) so a tampered/shared export can never
-  disable auth, and interval settings are bounds-checked rather than trusted.
-- Importing role permissions and host connection fields is opt-in
-  (``import_roles`` / ``import_hosts``); when unchecked those sections are
-  left untouched.  Overwriting an existing host's connection fields always
-  clears its stored credential so a repointed host can't leak the old secret.
+  disable auth or switch on destructive automation, and interval settings are
+  bounds-checked rather than trusted.
+- Importing role permissions is opt-in (``import_roles``), and an import can
+  never raise a role above the operator tier (``_MAX_IMPORTED_ROLE_LEVEL``).
+- Importing *connection fields* is opt-in (``import_hosts``): an existing
+  host's hostname/port/IPMI address, an existing guest's IP address and
+  connection method, and any integration URL that a stored token or password
+  is sent to (``_SECRET_DESTINATION_SETTINGS``). When unchecked those fields
+  are left untouched. When checked, repointing always clears the stored
+  secret that would otherwise be sent to the new endpoint.
 - Secrets are never restored — administrators must re-enter credentials.
 - The whole import is applied atomically: writes go through the session
   without per-row commits, and the caller commits once (or not at all, on
@@ -82,7 +87,25 @@ _AUTH_CRITICAL_SETTING_KEYS = frozenset({
     "cf_access_team_domain",
     "app_auto_update",
     "app_update_branch",
+    # Turns on unattended PeerTube bans; a shared export must not enable it.
+    "moderation_auto_ban_enabled",
 })
+
+# Integration endpoints that a stored secret is sent to on the next poll.
+# Repointing one of these through an import while keeping the secret would
+# hand the token/password to whatever the import names, so they are treated
+# exactly like host connection fields: only changed with the ``import_hosts``
+# opt-in, and the paired secrets are cleared in the same transaction.
+_SECRET_DESTINATION_SETTINGS = {
+    "moderation_mastodon_api_url": ("moderation_mastodon_api_token", "moderation_bot_token"),
+    "moderation_peertube_api_url": ("moderation_peertube_api_token",),
+    "unifi_base_url": ("unifi_password",),
+}
+
+# Custom roles can be created or edited by an import, but never above the
+# operator tier: ``User.is_admin`` is ``level >= 3``, so an imported level of 3
+# would be a silent privilege escalation for everyone already holding the role.
+_MAX_IMPORTED_ROLE_LEVEL = Role.BASE_TIER_LEVELS["operator"]
 
 # Interval-type settings: validated against core.scheduler.INTERVAL_BOUNDS
 # rather than blanket-skipped, since they're legitimate to import but an
@@ -116,6 +139,13 @@ _GUEST_FIELDS = (
     "power_state", "reboot_required", "require_snapshot", "backup_storage",
     "backup_mode", "backup_compress",
 )
+
+# Guest fields that decide where the guest's SSH credential is sent. Like host
+# connection fields, an existing guest's values are only overwritten with the
+# ``import_hosts`` opt-in, and a changed address clears the guest's own
+# credential link. (The SSH client auto-accepts host keys, so nothing else
+# would stop the old root/sudo credential from reaching the new address.)
+_GUEST_CONNECTION_FIELDS = ("ip_address", "connection_method")
 
 _ROLE_FIELDS = ("name", "display_name", "level", "is_builtin", "base_tier", *Role.PERMISSION_FIELDS)
 
@@ -212,14 +242,16 @@ def apply_import(doc, import_roles=False, import_hosts=False):
 
     ``import_roles`` and ``import_hosts`` are opt-in and default to False:
     - When ``import_roles`` is False, the roles section is ignored entirely
-      (no role is created or modified).
-    - When ``import_hosts`` is False, existing hosts are left untouched (their
-      connection fields are never overwritten); new hosts may still be
-      created with connection fields, since a new host has no stored
-      credential to leak. When ``import_hosts`` is True and an existing host's
-      connection fields are overwritten, that host's stored credential is
-      cleared in the same transaction so it can't be repointed to a new
-      endpoint while still holding the old secret.
+      (no role is created or modified). Even when True, no custom role is
+      created or raised above ``_MAX_IMPORTED_ROLE_LEVEL``.
+    - When ``import_hosts`` is False, existing hosts' connection fields,
+      existing guests' IP address / connection method, and the integration
+      URLs in ``_SECRET_DESTINATION_SETTINGS`` are left untouched (new hosts
+      and guests may still be created with connection fields, since nothing
+      stored yet can leak). When ``import_hosts`` is True, repointing any of
+      them clears the paired stored secret in the same transaction: the host's
+      password/token/IPMI password, the guest's credential link, or the
+      integration's token/password.
 
     Writes go through the session without per-row commits — the caller is
     responsible for committing once, and for rolling back the whole session on
@@ -237,7 +269,10 @@ def apply_import(doc, import_roles=False, import_hosts=False):
     counts = {"hosts": 0, "tags": 0, "guests": 0, "settings": 0, "roles": 0}
     skipped_settings = []
     skipped_hosts = []
+    skipped_guests = []
     skipped_roles = 0
+    clamped_roles = []
+    cleared_secrets = []
 
     # --- Tags first (guests reference them by name) ---
     for item in doc["tags"]:
@@ -313,12 +348,35 @@ def apply_import(doc, import_roles=False, import_hosts=False):
             guest = Guest.query.filter_by(proxmox_host_id=host.id, vmid=vmid).first()
         if guest is None:
             guest = Guest.query.filter_by(name=name, guest_type=guest_type).first()
-        if guest is None:
+        is_new = guest is None
+        if is_new:
             guest = Guest(name=name, guest_type=guest_type)
             db.session.add(guest)
 
+        # Connection fields of an EXISTING guest follow the host rules: never
+        # overwritten without the opt-in, and a changed address drops the
+        # guest's own credential link so the old secret is not replayed there.
+        repointed = False
+        for field in _GUEST_CONNECTION_FIELDS:
+            if field not in item:
+                continue
+            if is_new:
+                setattr(guest, field, item[field])
+                continue
+            if item[field] == getattr(guest, field):
+                continue
+            if not import_hosts:
+                if name not in skipped_guests:
+                    skipped_guests.append(name)
+                continue
+            setattr(guest, field, item[field])
+            repointed = True
+        if repointed and guest.credential_id is not None:
+            guest.credential_id = None
+            cleared_secrets.append(f"guest credential ({name})")
+
         for field in _GUEST_FIELDS:
-            if field in item:
+            if field in item and field not in _GUEST_CONNECTION_FIELDS:
                 setattr(guest, field, item[field])
         guest.name = name
         guest.guest_type = guest_type
@@ -341,24 +399,37 @@ def apply_import(doc, import_roles=False, import_hosts=False):
             role = Role.query.filter_by(name=rname).first()
             if role is not None and role.is_builtin:
                 continue  # never mutate builtin roles on import
+            # An import may lower a custom role or create one up to the
+            # operator tier, but never raise one into the admin tier.
+            wanted_level = item.get("level")
+            wanted_level = int(wanted_level) if isinstance(wanted_level, int) else 1
+            wanted_tier = item.get("base_tier")
             if role is None:
                 if item.get("is_builtin"):
                     continue  # do not create phantom builtin roles
+                level = min(wanted_level, _MAX_IMPORTED_ROLE_LEVEL)
+                if level < wanted_level:
+                    clamped_roles.append(rname)
+                if wanted_tier and Role.BASE_TIER_LEVELS.get(wanted_tier, 0) > level:
+                    wanted_tier = None
                 role = Role(
                     name=rname,
                     display_name=(item.get("display_name") or rname),
-                    level=int(item.get("level") or 1),
+                    level=level,
                     is_builtin=False,
-                    base_tier=item.get("base_tier"),
+                    base_tier=wanted_tier,
                 )
                 db.session.add(role)
             else:
                 if item.get("display_name"):
                     role.display_name = item["display_name"]
-                if item.get("base_tier"):
-                    role.base_tier = item["base_tier"]
-                if isinstance(item.get("level"), int):
-                    role.level = item["level"]
+                level = min(wanted_level, max(role.level, _MAX_IMPORTED_ROLE_LEVEL))
+                if level < wanted_level:
+                    clamped_roles.append(rname)
+                if wanted_tier and Role.BASE_TIER_LEVELS.get(wanted_tier, 0) <= level:
+                    role.base_tier = wanted_tier
+                if "level" in item:
+                    role.level = level
             for perm in Role.PERMISSION_FIELDS:
                 if perm in item:
                     setattr(role, perm, bool(item[perm]))
@@ -387,12 +458,25 @@ def apply_import(doc, import_roles=False, import_hosts=False):
                 skipped_settings.append(key)
                 continue
             value = str(parsed)
+        if key in _SECRET_DESTINATION_SETTINGS and (value or "") != (Setting.get(key, "") or ""):
+            # Repointing an endpoint that a stored secret is sent to: same
+            # opt-in and same consequence as a host's connection fields.
+            if not import_hosts:
+                skipped_settings.append(key)
+                continue
+            for secret_key in _SECRET_DESTINATION_SETTINGS[key]:
+                if Setting.get(secret_key, ""):
+                    Setting.set_no_commit(secret_key, "")
+                    cleared_secrets.append(secret_key)
         Setting.set_no_commit(key, value)
         counts["settings"] += 1
 
     counts["skipped_settings"] = skipped_settings
     counts["skipped_hosts"] = skipped_hosts
+    counts["skipped_guests"] = skipped_guests
     counts["skipped_roles"] = skipped_roles
+    counts["clamped_roles"] = clamped_roles
+    counts["cleared_secrets"] = cleared_secrets
     return counts
 
 

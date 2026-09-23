@@ -79,22 +79,14 @@ def _get_jibri_secret(key):
     exactly once: it is returned as-is and immediately re-encrypted, so the next
     read takes the normal path.
     """
-    raw = Setting.get(key, "")
-    if not raw:
-        return ""
-    from auth.credential_store import decrypt
-    try:
-        return decrypt(raw) or ""
-    except Exception:
-        logger.info("Migrating legacy plaintext setting %s to encrypted storage", key)
-        _set_jibri_secret(key, raw)
-        return raw
+    from core.secret_settings import get_secret_setting
+    return get_secret_setting(key, "")
 
 
 def _set_jibri_secret(key, value):
     """Store a Jibri secret encrypted at rest."""
-    from auth.credential_store import encrypt
-    Setting.set(key, encrypt(value) if value else "")
+    from core.secret_settings import set_secret_setting
+    set_secret_setting(key, value)
 
 
 def _validate_recording_dir(recording_dir):
