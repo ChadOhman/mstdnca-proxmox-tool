@@ -778,7 +778,7 @@
             const lockTd = row.querySelector('.gs-lock');
             if (lockTd && s) {
                 if (s.lock) {
-                    const lk = String(s.lock).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    const lk = escHtml(s.lock);
                     lockTd.innerHTML = '<span class="badge bg-warning text-dark ms-1" title="Locked by Proxmox — operation in progress or interrupted">' +
                         '<i class="bi bi-lock-fill"></i> ' + lk + '</span>';
                 } else {
@@ -842,9 +842,7 @@ function _pkgRequiresReboot(name) {
     const rebootWarning    = document.getElementById('rebootWarning');
     const rebootWarningText = document.getElementById('rebootWarningText');
 
-    function escHtml(s) {
-        return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
+    // escHtml is provided by static/esc.js (loaded in base.html)
 
     function loadUpdates() {
         updatesLoading.classList.remove('d-none');

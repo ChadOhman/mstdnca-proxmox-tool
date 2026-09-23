@@ -227,6 +227,23 @@ def build_admin_client():
     return MastodonAdminClient(api_url, plain), None
 
 
+def _http_url_or_none(value):
+    """Keep a status URL only if it is a plain http(s) URL.
+
+    The value comes from the Fediverse (a remote status' ``url``) and ends up
+    in an ``href`` on the Moderation page and in a Discord alert; a
+    ``javascript:`` or ``data:`` scheme must never be stored.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if len(value) > 512 or not value.lower().startswith(("http://", "https://")):
+        return None
+    if any(ch in value for ch in " \"'<>\\") or any(ord(ch) < 32 for ch in value):
+        return None
+    return value
+
+
 def record_alert(kind, account, status=None, *, notify=True):
     """Insert a deduplicated :class:`ModerationAlert`, or return ``None`` if it already exists.
 
@@ -244,7 +261,7 @@ def record_alert(kind, account, status=None, *, notify=True):
     if ModerationAlert.query.filter_by(dedupe_key=dedupe_key).first():
         return None
 
-    status_url = status.get("url") if status else None
+    status_url = _http_url_or_none(status.get("url")) if status else None
     excerpt = status.get("excerpt") if status else account.get("excerpt")
     acct = account.get("acct", "")
 

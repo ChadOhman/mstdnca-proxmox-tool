@@ -311,12 +311,18 @@ def create_app(test_config=None):
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         # CSP: allows CDN-hosted Bootstrap/HTMX/Chart.js plus inline scripts and styles.
         # Tighten by migrating inline JS to nonces or external files in a future pass.
+        # img-src allows https: so Fediverse avatars/headers on the Moderation
+        # page render. connect-src pins WebSockets to this host instead of the
+        # bare ws:/wss: schemes, which let injected script open a socket to
+        # any host (an exfiltration channel the rest of the policy closes).
+        from flask import request as _req
+        ws_host = _req.host if _req else ""
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
             "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
-            "img-src 'self' data:; "
-            "connect-src 'self' ws: wss:; "
+            "img-src 'self' data: https:; "
+            f"connect-src 'self' ws://{ws_host} wss://{ws_host}; "
             "font-src 'self' https://cdn.jsdelivr.net https://fonts.gstatic.com; "
             "object-src 'none'; "
             "base-uri 'self';"
