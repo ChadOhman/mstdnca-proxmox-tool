@@ -70,15 +70,16 @@ def create_app(test_config=None):
             x_host=proxy_count,
             x_prefix=proxy_count,
         )
-        # Log the policy, not the configured values (CodeQL treats anything
-        # read from app.config as potentially secret).
+        # Log which policy is in effect with literal messages only: CodeQL
+        # treats every value read from app.config as potentially secret, so
+        # nothing derived from the setting (not even its length) may be logged.
         if peers is None:
-            policy = "loopback/private peers (default)"
+            logger.info("Forwarded headers trusted from loopback/private proxy peers (default policy)")
         elif peers:
-            policy = f"{len(peers)} configured peer range(s)"
+            logger.info("Forwarded headers trusted from the TRUSTED_PROXY_PEERS allowlist only")
         else:
-            policy = "no peer (TRUSTED_PROXY_PEERS set but empty)"
-        logger.info("Forwarded headers trusted from %s, %d hop(s)", policy, proxy_count)
+            # parse_trusted_proxy_peers already warned about the empty allowlist.
+            logger.info("Forwarded headers ignored from every peer (TRUSTED_PROXY_PEERS names no valid range)")
 
     # Ensure data directory exists
     os.makedirs(DATA_DIR, exist_ok=True)
