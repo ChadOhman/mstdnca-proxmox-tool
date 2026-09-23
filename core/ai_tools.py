@@ -474,11 +474,189 @@ def _handle_manage_snapshot(tool_input, user):
     })
 
 
+_BACKUP_ACTIONS = ("create", "delete", "restore", "protect", "unprotect")
+_BACKUP_MODES = ("snapshot", "suspend", "stop")
+_BACKUP_COMPRESS = ("0", "gzip", "lzo", "zstd")
+
+
+def _backup_defaults(guest):
+    """Per-guest -> per-tag -> global backup defaults, exactly as routes/guests.py::create_backup."""
+    from models import Setting
+    from routes.guests import _get_tag_backup_defaults
+    tag = _get_tag_backup_defaults(guest)
+    return {
+        "storage": guest.backup_storage or tag.get("storage") or Setting.get("backup_storage", ""),
+        "mode": guest.backup_mode or tag.get("mode") or Setting.get("backup_mode", "snapshot"),
+        "compress": guest.backup_compress or tag.get("compress") or Setting.get("backup_compress", "zstd"),
+    }
+
+
+def _serialize_backup(vol):
+    volid = vol.get("volid") or ""
+    ctime = vol.get("ctime")
+    return {
+        "volid": volid,
+        "storage": vol.get("storage") or (volid.split(":", 1)[0] if ":" in volid else None),
+        "created_at": datetime.fromtimestamp(ctime, tz=timezone.utc).isoformat() if ctime else None,
+        "size": _fmt_bytes(vol.get("size", 0)),
+        "size_bytes": vol.get("size", 0),
+        "format": vol.get("format"),
+        "protected": bool(vol.get("protected")),
+        "notes": vol.get("notes", ""),
+        "verified": (vol.get("verification") or {}).get("state"),
+    }
+
+
+def _guest_backups(guest, client, node):
+    """Backups for a guest: the configured default storage, else every backup-capable storage."""
+    storage = _backup_defaults(guest)["storage"]
+    if storage:
+        backups = client.list_backups(node, guest.vmid, storage) or []
+        for vol in backups:
+            vol.setdefault("storage", storage)
+        return backups
+    return client.list_all_backups(node, guest.vmid) or []
+
+
+def _handle_list_backups(tool_input, user):
+    from models import Guest
+    guest = Guest.query.get(tool_input["guest_id"])
+    client, node, err = _live_guest(guest, user)
+    if err:
+        return json.dumps(err)
+    backups = _guest_backups(guest, client, node)
+    storages = [s.get("storage") for s in client.list_node_storages(node, content_type="backup") or []]
+    return json.dumps({
+        "guest_id": guest.id,
+        "name": guest.name,
+        "defaults": _backup_defaults(guest),
+        "backup_storages": [s for s in storages if s],
+        "count": len(backups),
+        "backups": [_serialize_backup(v) for v in backups],
+    })
+
+
+def _handle_manage_backup(tool_input, user):
+    """create / delete / restore / protect / unprotect a backup, mirroring the routes/guests.py backup views."""
+    from auth.audit import log_action
+    from models import Guest, db
+
+    action = tool_input.get("action")
+    if action not in _BACKUP_ACTIONS:
+        return json.dumps({"error": f"Invalid action: {action}"})
+    guest = Guest.query.get(tool_input["guest_id"])
+    err = _linked_guest(guest, user)
+    if err:
+        return json.dumps(err)
+
+    volid = (tool_input.get("volid") or "").strip()
+    if action != "create" and not volid:
+        return json.dumps({"error": "volid is required (take it from list_backups)"})
+
+    if action == "create":
+        defaults = _backup_defaults(guest)
+        storage = (tool_input.get("storage") or "").strip() or defaults["storage"]
+        mode = (tool_input.get("mode") or "").strip() or defaults["mode"]
+        compress = (tool_input.get("compress") or "").strip() or defaults["compress"]
+        protected = bool(tool_input.get("protected"))
+        notes = (tool_input.get("notes") or "").strip()
+        if not storage:
+            return json.dumps({"error": "No backup storage is configured for this guest. Pass storage explicitly "
+                                        "(list_backups shows the backup-capable storages) or add a backup config "
+                                        "for one of its tags in Settings."})
+        if mode not in _BACKUP_MODES:
+            return json.dumps({"error": f"Invalid mode: {mode} (use snapshot, suspend or stop)"})
+        if compress not in _BACKUP_COMPRESS:
+            return json.dumps({"error": f"Invalid compress: {compress} (use zstd, gzip, lzo or 0)"})
+
+    if not tool_input.get("confirm"):
+        if action == "create":
+            summary = (f"This will create a {mode} backup of '{guest.name}' to storage '{storage}' "
+                       f"(compression {compress}{', protected' if protected else ''}).")
+            pending = {"guest_id": guest.id, "guest": guest.name, "action": action, "storage": storage,
+                       "mode": mode, "compress": compress, "protected": protected, "notes": notes}
+        else:
+            summaries = {
+                "delete": f"This will permanently delete backup '{volid}' of '{guest.name}'. This cannot be undone.",
+                "restore": (f"DESTRUCTIVE: this will replace '{guest.name}' ({guest.guest_type.upper()} {guest.vmid}) "
+                            f"entirely with the contents of '{volid}'; everything changed since that backup is lost. "
+                            f"This cannot be undone. The confirming call must also pass "
+                            f"\"confirm_name\": \"{guest.name}\"."),
+                "protect": f"This will mark backup '{volid}' of '{guest.name}' as protected (kept by pruning).",
+                "unprotect": f"This will remove protection from backup '{volid}' of '{guest.name}', so pruning may delete it.",
+            }
+            summary = summaries[action]
+            pending = {"guest_id": guest.id, "guest": guest.name, "action": action, "volid": volid}
+        return _confirmation_required("manage_backup", summary, **pending)
+
+    if action == "restore" and (tool_input.get("confirm_name") or "").strip() != guest.name:
+        return json.dumps({"error": f"Restore cancelled: confirm_name must exactly match the guest name '{guest.name}'."})
+
+    client, node, err = _live_guest(guest, user)
+    if err:
+        return json.dumps(err)
+
+    if action == "create":
+        ok, result = client.create_backup(node, guest.vmid, storage, mode=mode, compress=compress,
+                                          protected=protected, notes=notes)
+        if not ok:
+            logger.warning("AI backup create failed for guest %s: %s", guest.id, result)
+            return json.dumps({"success": False,
+                               "message": "Proxmox rejected the backup; details are in the server log."})
+        log_action("guest_backup_create", "guest", resource_id=guest.id, resource_name=guest.name,
+                   details={"storage": storage, "mode": mode, "via": "ai_assistant"})
+        db.session.commit()
+        from routes.api import start_proxmox_job
+        start_proxmox_job(guest, "backup", result, node)
+        return json.dumps({"success": True, "task": result,
+                           "message": f"{mode} backup of {guest.name} to '{storage}' started; "
+                                      "Proxmox is running it as a task."})
+
+    # The storage API accepts any volid, so the archive must be proven to belong to this guest first.
+    from routes.guests import _resolve_guest_backup
+    storage = _resolve_guest_backup(guest, client, node, volid)
+    if storage is None:
+        return json.dumps({"error": "That backup archive does not belong to this guest (check list_backups)."})
+
+    if action == "delete":
+        ok, result = client.delete_backup(node, storage, volid)
+        audit = ("guest_backup_delete", {"volid": volid})
+        message, job_type = "Backup deleted.", None
+    elif action in ("protect", "unprotect"):
+        ok, result = client.update_backup_protection(node, storage, volid, action == "protect")
+        audit = ("guest_backup_protect", {"volid": volid, "protected": action == "protect"})
+        message, job_type = f"Backup is now {action}ed.", None
+    else:
+        ok, result = client.restore_backup(node, guest.vmid, guest.guest_type, volid, storage=storage)
+        audit = ("guest_backup_restore", {"volid": volid, "storage": storage})
+        message, job_type = f"Restore of {guest.name} from '{volid}' started; Proxmox is running it as a task.", "restore"
+    if not ok:
+        logger.warning("AI backup %s failed for guest %s: %s", action, guest.id, result)
+        return json.dumps({"success": False,
+                           "message": f"Proxmox rejected the backup {action}; details are in the server log."})
+
+    log_action(audit[0], "guest", resource_id=guest.id, resource_name=guest.name,
+               details={**audit[1], "via": "ai_assistant"})
+    db.session.commit()
+    response = {"success": True, "message": message}
+    if job_type:
+        from routes.api import start_proxmox_job
+        start_proxmox_job(guest, job_type, result, node)
+        response["task"] = result
+    return json.dumps(response)
+
+
 def _live_host_status(host):
-    """Live node status (and storage pools for PVE) for one host. Raises on failure."""
+    """Live node status (and storage pools / datastores) for one host. Raises on failure."""
     if host.is_pbs:
         from clients.pbs_client import PBSClient
-        return PBSClient(host).get_node_status(), None
+        pbs = PBSClient(host)
+        datastores = [
+            {"name": d["name"], "type": "pbs-datastore", "active": True, "used": d["used"],
+             "total": d["total"], "backup_groups": d["group_count"]}
+            for d in pbs.get_all_datastores_with_status() or []
+        ]
+        return pbs.get_node_status(), datastores
     from clients.proxmox_api import ProxmoxClient
     client = ProxmoxClient(host)
     node_name = client.get_local_node_name()
@@ -525,6 +703,7 @@ def _handle_get_host_status(tool_input, user):
                     "type": st["type"],
                     "active": bool(st.get("active")),
                     **_usage(st.get("used"), st.get("total")),
+                    **({"backup_groups": st["backup_groups"]} if "backup_groups" in st else {}),
                 }
                 for st in storages
             ]
@@ -665,6 +844,52 @@ TOOL_REGISTRY = {
         },
         "required_permission": "can_manage_guests",
         "handler": _handle_manage_snapshot,
+    },
+    "list_backups": {
+        "description": (
+            "List a guest's backup archives (volid, storage, when taken, size, protected, notes, verification), "
+            "the guest's effective backup defaults (storage, mode, compression) and the backup-capable storages "
+            "on its node."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+            },
+            "required": ["guest_id"],
+        },
+        "required_permission": None,
+        "handler": _handle_list_backups,
+    },
+    "manage_backup": {
+        "description": (
+            "Create a backup of a guest, or delete / restore / protect / unprotect an existing archive. "
+            "State-changing: the first call returns a confirmation-required preview without doing anything; call "
+            "again with \"confirm\": true after the user approves. Restore REPLACES the guest and additionally "
+            "requires confirm_name equal to the guest's exact name. Create falls back to the guest's configured "
+            "storage/mode/compression when not given."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+                "action": {"type": "string", "enum": list(_BACKUP_ACTIONS), "description": "What to do"},
+                "volid": {"type": "string", "description": "Archive volid from list_backups (delete/restore/protect/unprotect)"},
+                "storage": {"type": "string", "description": "create: target storage (default: guest's configured storage)"},
+                "mode": {"type": "string", "enum": list(_BACKUP_MODES), "description": "create: vzdump mode (default: configured)"},
+                "compress": {"type": "string", "enum": list(_BACKUP_COMPRESS), "description": "create: compression (default: configured)"},
+                "protected": {"type": "boolean", "description": "create: mark the new archive protected"},
+                "notes": {"type": "string", "description": "create: notes for the new archive"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Set to true only after the user has explicitly confirmed the action.",
+                },
+                "confirm_name": {"type": "string", "description": "restore only: the guest's exact name, typed by the user"},
+            },
+            "required": ["guest_id", "action"],
+        },
+        "required_permission": "can_manage_guests",
+        "handler": _handle_manage_backup,
     },
     "list_services": {
         "description": "List all monitored services across all accessible guests, with their current status.",
