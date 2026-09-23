@@ -12,6 +12,7 @@ from apps.utils import (
     _validate_username,
 )
 from auth.audit import log_action
+from core.guest_scope import resolve_guest_selection
 from models import Guest, Setting, db
 
 
@@ -42,6 +43,13 @@ def _require_login():
     if not current_user.can_update:
         flash("'Apply Updates' permission required.", "error")
         return redirect(url_for("dashboard.index"))
+
+
+@bp.before_request
+def _require_configured_guest_scope():
+    """Refuse state-changing requests when a configured target guest is outside the user's tags."""
+    from core.guest_scope import require_configured_guest_scope
+    return require_configured_guest_scope(('ghost_guest_id',), "ghost.upgrade_page")
 
 
 def _get_ghost_settings():
@@ -137,7 +145,11 @@ def save():
         flash(str(e), "error")
         return redirect(url_for("ghost.upgrade_page"))
 
-    Setting.set("ghost_guest_id", request.form.get("ghost_guest_id", "").strip())
+    ghost_guest_id, err = resolve_guest_selection(request.form.get("ghost_guest_id", ""), "ghost_guest_id", "Ghost guest")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("ghost.upgrade_page"))
+    Setting.set("ghost_guest_id", ghost_guest_id)
     Setting.set("ghost_user", ghost_user)
     Setting.set("ghost_dir", ghost_dir)
     Setting.set("ghost_url", ghost_url)

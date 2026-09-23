@@ -34,6 +34,13 @@ def _require_login():
         return redirect(url_for("dashboard.index"))
 
 
+@bp.before_request
+def _require_configured_guest_scope():
+    """Refuse state-changing requests when a configured target guest is outside the user's tags."""
+    from core.guest_scope import require_configured_guest_scope
+    return require_configured_guest_scope(('prometheus_guest_id',), "unpoller.manage")
+
+
 def _parse_iso(value):
     if not value:
         return None

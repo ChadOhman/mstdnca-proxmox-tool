@@ -535,8 +535,12 @@ def scan_all():
             flash("A guest scan is already running.", "warning")
             return redirect(url_for("api.scan_all_progress"))
 
-    # Same target set core.scanner.scan_all_guests() used to select.
-    targets = Guest.query.filter_by(enabled=True, power_state="running").all()
+    # Same target set core.scanner.scan_all_guests() used to select, limited
+    # to the guests this user may act on (admin tier sees all; others their tags).
+    targets = [
+        g for g in Guest.query.filter_by(enabled=True, power_state="running").all()
+        if current_user.may_access_guest(g)
+    ]
     if not targets:
         flash("No running guests are available to scan.", "info")
         return redirect(url_for("dashboard.index"))
@@ -1666,9 +1670,11 @@ def collab_stream():
     # without a database round-trip on the fan-out path.
     is_admin = current_user.is_admin
     tag_ids = {t.id for t in current_user.allowed_tags}
+    from core.guest_scope import page_tag_ids as _page_tag_ids
     event_queue = collab_hub.connect(user_id, username, display_name, page=page,
                                      is_admin=is_admin, tag_ids=tag_ids,
-                                     can_moderate=current_user.can_moderate)
+                                     can_moderate=current_user.can_moderate,
+                                     page_tag_ids=_page_tag_ids(page))
 
     # Revocation is otherwise only enforced in before_request, which a stream
     # that never returns does not run again.  Capture the tracked session id up
@@ -1696,9 +1702,11 @@ def collab_stream():
     @stream_with_context
     def generate():
         try:
-            # Immediately send the current presence snapshot
+            # Immediately send the current presence snapshot, redacted to what
+            # this viewer may see (other users' guest pages outside their tags).
             import json as _json
-            yield f"data: {_json.dumps({'type': 'presence', 'users': collab_hub.get_online_users()})}\n\n"
+            snapshot = collab_hub.get_online_users(viewer_is_admin=is_admin, viewer_tag_ids=tag_ids)
+            yield f"data: {_json.dumps({'type': 'presence', 'users': snapshot})}\n\n"
             while True:
                 try:
                     event = event_queue.get(timeout=25)
@@ -1736,7 +1744,9 @@ def collab_presence():
     if not _is_safe_relative_page(page):
         return jsonify({"error": "invalid_page"}), 400
     following = data.get("following") or None  # username string or null
-    collab_hub.update_presence(current_user.id, page, following=following)
+    from core.guest_scope import page_tag_ids as _page_tag_ids
+    collab_hub.update_presence(current_user.id, page, following=following,
+                               page_tag_ids=_page_tag_ids(page))
     return jsonify({"ok": True})
 
 
@@ -1773,10 +1783,13 @@ def collab_cursor_update():
         y_pct = float(request.args["y_pct"])
     except (KeyError, TypeError, ValueError):
         return jsonify(ok=False), 400
+    page = request.args.get("page", "/")
+    if not _is_safe_relative_page(page):
+        return jsonify({"error": "invalid_page"}), 400
     cursor_hub.update(
         current_user.username,
         current_user.display_name or current_user.username,
-        request.args.get("page", "/"),
+        page,
         x_pct, y_pct,
         request.args.get("color", "#3b82f6"),
     )
@@ -1786,9 +1799,20 @@ def collab_cursor_update():
 @bp.route("/collab/cursors")
 @login_required
 def collab_cursors():
-    """Return cursor positions of all co-viewers on the given page."""
+    """Return cursor positions of all co-viewers on the given page.
+
+    A page about a guest outside the caller's tags answers with no cursors,
+    so who is looking at which guest cannot be enumerated across the tag
+    boundary.
+    """
     from core.collaboration import cursor_hub
+    from core.guest_scope import page_tag_ids, page_visible_to
     page = request.args.get("page", "/")
+    if not _is_safe_relative_page(page):
+        return jsonify({"error": "invalid_page"}), 400
+    if not page_visible_to(page_tag_ids(page), current_user.is_admin,
+                           {t.id for t in current_user.allowed_tags}):
+        return jsonify(cursors=[])
     return jsonify(cursors=cursor_hub.get_for_page(
         page, exclude_username=current_user.username
     ))

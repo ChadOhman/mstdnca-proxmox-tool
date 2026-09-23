@@ -16,6 +16,7 @@ from apps.utils import (
     _validate_username,
 )
 from auth.audit import log_action
+from core.guest_scope import resolve_guest_selection
 from models import Guest, Setting, db
 
 # ---------------------------------------------------------------------------
@@ -38,6 +39,13 @@ def _require_login():
     if not current_user.can_update:
         flash("'Apply Updates' permission required.", "error")
         return redirect(url_for("dashboard.index"))
+
+
+@bp.before_request
+def _require_configured_guest_scope():
+    """Refuse state-changing requests when a configured target guest is outside the user's tags."""
+    from core.guest_scope import require_configured_guest_scope
+    return require_configured_guest_scope(('mastodon_guest_id', 'mastodon_guest_id_2', 'mastodon_db_guest_id'), "mastodon.upgrade_page")
 
 
 def _parse_iso(value):
@@ -164,9 +172,21 @@ def save():
             flash(f"Invalid {label}: must be numeric.", "error")
             return redirect(url_for("mastodon.upgrade_page"))
 
-    Setting.set("mastodon_guest_id", request.form.get("mastodon_guest_id", "").strip())
-    Setting.set("mastodon_guest_id_2", request.form.get("mastodon_guest_id_2", "").strip())
-    Setting.set("mastodon_db_guest_id", request.form.get("mastodon_db_guest_id", "").strip())
+    mastodon_guest_id, err = resolve_guest_selection(request.form.get("mastodon_guest_id", ""), "mastodon_guest_id", "Mastodon guest")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("mastodon.upgrade_page"))
+    Setting.set("mastodon_guest_id", mastodon_guest_id)
+    mastodon_guest_id_2, err = resolve_guest_selection(request.form.get("mastodon_guest_id_2", ""), "mastodon_guest_id_2", "Second Mastodon guest")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("mastodon.upgrade_page"))
+    Setting.set("mastodon_guest_id_2", mastodon_guest_id_2)
+    mastodon_db_guest_id, err = resolve_guest_selection(request.form.get("mastodon_db_guest_id", ""), "mastodon_db_guest_id", "Mastodon database guest")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("mastodon.upgrade_page"))
+    Setting.set("mastodon_db_guest_id", mastodon_db_guest_id)
     Setting.set("mastodon_db_name", db_name)
     Setting.set("mastodon_user", mastodon_user)
     Setting.set("mastodon_app_dir", app_dir)
