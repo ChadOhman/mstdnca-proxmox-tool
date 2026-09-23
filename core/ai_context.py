@@ -37,7 +37,15 @@ def build_system_prompt(user, page_context=None):
         "list_guests and get_guest_details report the last package scan stored in the database; for live "
         "CPU, memory, disk or uptime call get_guest_resource_usage (now) or get_guest_performance_history "
         "(averages and peaks), and get_host_status for a host's own resources and storage pools. Byte values "
-        "come with a ready-made 'human' string; quote that rather than raw bytes.",
+        "come with a ready-made 'human' string; quote that rather than raw bytes. For anything about the "
+        "physical network (which switch or AP a machine is on, Wi-Fi signal, WAN status, unknown devices) "
+        "use the list_unifi_* and get_unifi_health tools; list_unifi_clients links a client back to its "
+        "guest here when the MAC matches. For the Proxmox nodes' own apt packages use get_host_updates; "
+        "manage_host_updates 'apply' is state-changing and follows the same two-phase confirmation as the "
+        "other state-changing tools, while 'refresh' only runs apt-get update and needs no confirmation. "
+        "get_ipmi_status reads a host's BMC (physical power state, temperatures, fans, PSUs, event log) and "
+        "control_ipmi_power is the two-phase-confirmed physical power switch; its hard actions (off, reset, "
+        "cycle) take down every guest on the host, so relay that warning verbatim.",
         "",
         "Keep responses concise and actionable. The chat panel renders only headings, bold, italics, inline "
         "code, fenced code blocks and '- ' bullet lists; it does not render tables, so use bullets instead.",
@@ -54,11 +62,17 @@ def build_system_prompt(user, page_context=None):
     if user.can_update:
         permissions.append("scan and apply updates")
     if user.can_view_hosts:
-        permissions.append("view host status")
+        permissions.append("view host status and pending node updates")
+    if user.can_manage_hosts:
+        permissions.append("refresh and apply node apt updates")
     if user.can_view_audit_log:
         permissions.append("search audit logs")
     if user.can_view_unifi:
         permissions.append("view network devices and clients")
+    if user.can_view_ipmi:
+        permissions.append("read hosts' BMC hardware status (IPMI)")
+    if user.can_manage_ipmi:
+        permissions.append("physical host power control through IPMI")
 
     if permissions:
         parts.append("")

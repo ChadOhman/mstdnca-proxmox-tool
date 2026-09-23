@@ -711,6 +711,453 @@ def _handle_get_host_status(tool_input, user):
     return json.dumps(result)
 
 
+# ---- UniFi lookups (read-only; scoped exactly like routes/unifi.py) ----
+
+_UNIFI_DEVICE_STATES = {0: "offline", 1: "online", 2: "pending adoption", 4: "upgrading",
+                        5: "provisioning", 6: "heartbeat missed", 7: "adopting", 9: "isolated"}
+_UNIFI_MAX_CLIENTS = 100
+
+
+def _unifi_client():
+    """(client, None) when UniFi is enabled and configured, else (None, error dict)."""
+    from models import Setting
+    if Setting.get("unifi_enabled", "false") != "true":
+        return None, {"error": "UniFi integration is not enabled"}
+    from routes.unifi import _get_unifi_client
+    client = _get_unifi_client()
+    if not client:
+        return None, {"error": "UniFi controller is not configured (Settings > UniFi)"}
+    return client, None
+
+
+def _unifi_scope(items, user):
+    """Apply the site subnet filter and the user's tag-linked network restriction, as the UniFi pages do."""
+    from models import Setting
+    from routes.unifi import _filter_by_subnet, _get_accessible_networks
+    items = _filter_by_subnet(items, "ip", Setting.get("unifi_filter_subnet", ""))
+    networks = _get_accessible_networks(user)
+    if networks is not None:
+        items = [c for c in items if c.get("network", "") in networks]
+    return items
+
+
+def _iso_from_epoch(value):
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).isoformat() if value else None
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _serialize_unifi_device(d):
+    uplink = d.get("uplink") or {}
+    state = d.get("state", 0)
+    return {
+        "name": d.get("name"),
+        "mac": d.get("mac"),
+        "ip": d.get("ip"),
+        "model": d.get("model"),
+        "type": d.get("type"),
+        "state": _UNIFI_DEVICE_STATES.get(state, f"state {state}"),
+        "adopted": bool(d.get("adopted")),
+        "version": d.get("version"),
+        "uptime_seconds": d.get("uptime", 0),
+        "cpu_percent": d.get("cpu"),
+        "memory_percent": d.get("mem"),
+        "temperature_c": d.get("temperature"),
+        "connected_clients": d.get("num_sta", 0),
+        "uplink": {"type": uplink.get("type"), "speed_mbps": uplink.get("speed")},
+        "ports_up": sum(1 for p in d.get("port_table") or [] if p.get("up")),
+        "radios": [{"radio": r.get("radio"), "channel": r.get("channel"), "clients": r.get("num_sta"),
+                    "utilisation_percent": r.get("cu_total")} for r in d.get("radio_table") or []],
+    }
+
+
+def _serialize_unifi_client(c, device_names, guest_by_mac):
+    mac = (c.get("mac") or "").lower()
+    via_mac = ((c.get("ap_mac") or c.get("sw_mac")) or "").lower()
+    guest = guest_by_mac.get(mac)
+    entry = {
+        "hostname": c.get("hostname"),
+        "ip": c.get("ip"),
+        "mac": mac,
+        "network": c.get("network"),
+        "connection": "wired" if c.get("is_wired") else "wireless",
+        "connected_to": device_names.get(via_mac) or via_mac or None,
+        "switch_port": c.get("sw_port"),
+        "ssid": c.get("essid"),
+        "signal_dbm": c.get("signal"),
+        "satisfaction_percent": c.get("satisfaction"),
+        "uptime_seconds": c.get("uptime", 0),
+        "last_seen": _iso_from_epoch(c.get("last_seen")),
+        "blocked": bool(c.get("blocked")),
+        "is_guest": bool(c.get("is_guest")),
+        "vendor": c.get("oui") or None,
+    }
+    if guest is not None:
+        entry["guest_id"] = guest.id
+        entry["guest_name"] = guest.name
+    return entry
+
+
+def _handle_list_unifi_devices(tool_input, user):
+    client, err = _unifi_client()
+    if err:
+        return json.dumps(err)
+    from models import Setting
+    from routes.unifi import _filter_by_subnet
+    devices = _filter_by_subnet(client.get_devices() or [], "ip", Setting.get("unifi_filter_subnet", ""))
+    devices.sort(key=lambda d: (d.get("name") or "").lower())
+    return json.dumps({"count": len(devices), "devices": [_serialize_unifi_device(d) for d in devices]})
+
+
+def _handle_list_unifi_clients(tool_input, user):
+    client, err = _unifi_client()
+    if err:
+        return json.dumps(err)
+    from models import Guest
+
+    clients = client.get_clients() or []
+    if tool_input.get("include_offline"):
+        seen = {(c.get("mac") or "").lower() for c in clients}
+        for c in client.get_all_clients(within=720) or []:
+            if (c.get("mac") or "").lower() not in seen:
+                c["offline"] = True
+                clients.append(c)
+    clients = _unifi_scope(clients, user)
+
+    query = (tool_input.get("query") or "").strip().lower()
+    if query:
+        fields = ("hostname", "ip", "mac", "network", "essid", "oui")
+        clients = [c for c in clients if any(query in str(c.get(f) or "").lower() for f in fields)]
+
+    device_names = {(d.get("mac") or "").lower(): d.get("name") for d in client.get_devices() or []}
+    macs = [(c.get("mac") or "").lower() for c in clients if c.get("mac")]
+    guest_by_mac = {}
+    if macs:
+        for g in Guest.query.filter(Guest.mac_address.isnot(None)).all():
+            if g.mac_address.lower() in macs and user.may_access_guest(g):
+                guest_by_mac[g.mac_address.lower()] = g
+
+    clients.sort(key=lambda c: (bool(c.get("offline")), (c.get("hostname") or "").lower()))
+    total = len(clients)
+    clients = clients[:_UNIFI_MAX_CLIENTS]
+    result = []
+    for c in clients:
+        entry = _serialize_unifi_client(c, device_names, guest_by_mac)
+        if c.get("offline"):
+            entry["online"] = False
+        result.append(entry)
+    return json.dumps({"count": total, "truncated": total > len(result), "clients": result})
+
+
+def _handle_get_unifi_health(tool_input, user):
+    client, err = _unifi_client()
+    if err:
+        return json.dumps(err)
+    subsystems = {}
+    for sub in client.get_site_health() or []:
+        name = sub.get("subsystem")
+        if not name:
+            continue
+        entry = {"status": sub.get("status")}
+        for key in ("num_user", "num_guest", "num_iot", "num_ap", "num_sw", "num_gw", "num_adopted",
+                    "num_disconnected", "num_pending"):
+            if sub.get(key) is not None:
+                entry[key] = sub[key]
+        if name.startswith("wan"):
+            gw_stats = sub.get("gw_system-stats") or sub.get("gw_system_stats") or {}
+            entry["wan_ip"] = sub.get("wan_ip") or sub.get("gw") or sub.get("ip")
+            entry["isp"] = sub.get("isp_name") or sub.get("isp_organization") or sub.get("ISP")
+            entry["latency_ms"] = next((sub[k] for k in ("latency", "internet_latency", "wan1_latency",
+                                                          "latency_average") if sub.get(k)), None)
+            entry["uptime_seconds"] = sub.get("uptime") or sub.get("wan_uptime") or gw_stats.get("uptime")
+            entry["speedtest_download_mbps"] = sub.get("speedtest_lastrun_download") or sub.get("xput_down")
+            entry["speedtest_upload_mbps"] = sub.get("speedtest_lastrun_upload") or sub.get("xput_up")
+        subsystems[name] = entry
+    return json.dumps({
+        "subsystems": subsystems,
+        "networks": [{"name": n.get("name"), "purpose": n.get("purpose"), "vlan": n.get("vlan")}
+                     for n in client.get_networks() or []],
+        "wlans": [{"name": w.get("name"), "enabled": bool(w.get("enabled", True)), "security": w.get("security"),
+                   "band": w.get("wlan_band"), "is_guest": bool(w.get("is_guest"))}
+                  for w in client.get_wlan_conf() or []],
+    })
+
+
+# ---- Node apt updates (mirrors routes/hosts.py update management) ----
+
+_HOST_UPDATE_ACTIONS = ("refresh", "apply", "cancel")
+# Proxmox apt "Priority" -> the severity the scheduler stores (core/scheduler._persist_host_packages)
+_APT_SEVERITY = {"important": "critical", "required": "important"}
+
+
+def _host_for_tool(tool_input):
+    from models import ProxmoxHost
+    host = ProxmoxHost.query.get(tool_input.get("host_id") or 0)
+    return host, (None if host else {"error": "Host not found"})
+
+
+def _host_apt_updates(host):
+    """Live pending apt packages for a PVE or PBS host, as the host page's /updates endpoint returns them."""
+    from routes.hosts import _get_client_and_node
+    client, node_name = _get_client_and_node(host)
+    if host.is_pbs:
+        return client.get_apt_updates() or [], node_name
+    return (client.get_apt_updates(node_name) if node_name else []), node_name
+
+
+def _apply_job_summary(host_id):
+    from routes.hosts import _apply_jobs, _apply_lock
+    with _apply_lock:
+        job = _apply_jobs.get(host_id)
+        if not job:
+            return None
+        log = "".join(job.get("log") or [])
+        return {
+            "running": bool(job.get("running")),
+            "success": job.get("success"),
+            "cancelled": bool(job.get("cancelled")),
+            "log_tail": log[-1500:],
+        }
+
+
+def _handle_get_host_updates(tool_input, user):
+    host, err = _host_for_tool(tool_input)
+    if err:
+        return json.dumps(err)
+    result = {"host_id": host.id, "name": host.name, "type": host.host_type}
+    try:
+        updates, node = _host_apt_updates(host)
+        packages = [
+            {
+                "package": u.get("Package"),
+                "title": u.get("Title"),
+                "current": u.get("OldVersion"),
+                "available": u.get("Version") or u.get("NewVersion"),
+                "severity": _APT_SEVERITY.get(u.get("Priority", ""), "normal"),
+            }
+            for u in updates
+        ]
+        result.update({"source": "live", "node": node, "count": len(packages),
+                       "security_count": sum(1 for p in packages if p["severity"] == "critical"),
+                       "packages": packages})
+    except Exception:
+        logger.warning("AI host updates: live apt query failed for %s; using last scan", host.name, exc_info=True)
+        pending = host.pending_updates()
+        result.update({
+            "source": "last_scan",
+            "note": "The host could not be queried live; these packages are from the last scheduled scan.",
+            "count": len(pending),
+            "security_count": len(host.security_updates()),
+            "packages": [{"package": p.package_name, "current": p.current_version, "available": p.available_version,
+                          "severity": p.severity, "discovered_at": p.discovered_at.isoformat() if p.discovered_at else None}
+                         for p in pending],
+        })
+    job = _apply_job_summary(host.id)
+    if job:
+        result["apply_job"] = job
+    return json.dumps(result)
+
+
+def _handle_manage_host_updates(tool_input, user):
+    """refresh (apt-get update via API), apply (SSH dist-upgrade job) or cancel, as routes/hosts.py does."""
+    from auth.audit import log_action
+    from models import db
+
+    action = tool_input.get("action")
+    if action not in _HOST_UPDATE_ACTIONS:
+        return json.dumps({"error": f"Invalid action: {action}"})
+    host, err = _host_for_tool(tool_input)
+    if err:
+        return json.dumps(err)
+
+    if action == "refresh":
+        from routes.hosts import _get_client_and_node
+        client, node_name = _get_client_and_node(host)
+        if host.is_pbs:
+            upid = client.refresh_apt_cache()
+        else:
+            if not node_name:
+                return json.dumps({"error": "Could not determine the node name"})
+            upid = client.refresh_apt_cache(node_name)
+        log_action("host_refresh_updates", "host", resource_id=host.id, resource_name=host.name,
+                   details={"via": "ai_assistant"})
+        db.session.commit()
+        return json.dumps({"success": True, "task": upid,
+                           "message": f"apt-get update started on {host.name}; call get_host_updates in a moment "
+                                      "for the refreshed list."})
+
+    from routes.hosts import _apply_jobs, _apply_lock
+
+    if action == "cancel":
+        with _apply_lock:
+            job = _apply_jobs.get(host.id)
+            if not job or not job.get("running"):
+                return json.dumps({"success": False, "message": "No update job is running on this host."})
+            job["cancelled"] = True
+        log_action("host_apply_updates_cancel", "host", resource_id=host.id, resource_name=host.name,
+                   details={"via": "ai_assistant"})
+        db.session.commit()
+        return json.dumps({"success": True, "message": f"Cancellation requested for the update job on {host.name}; "
+                                                       "apt stops at the next safe point."})
+
+    # apply
+    if not host.ssh_credential:
+        return json.dumps({"error": f"No SSH credential is configured for {host.name}; updates can only be applied "
+                                    "over SSH. Set one on the host page."})
+    with _apply_lock:
+        existing = _apply_jobs.get(host.id)
+        if existing and existing.get("running"):
+            return json.dumps({"error": "An update job is already running for this host; check get_host_updates."})
+
+    if not tool_input.get("confirm"):
+        pending = host.pending_updates()
+        kind = "PBS" if host.is_pbs else "PVE"
+        summary = (f"This will run 'apt-get dist-upgrade' over SSH on {kind} host '{host.name}' "
+                   f"({len(pending)} package(s) pending at the last scan, {len(host.security_updates())} security). "
+                   "Kernel or Proxmox package upgrades may require a reboot afterwards; the job can be cancelled "
+                   "but packages already unpacking will finish.")
+        return _confirmation_required("manage_host_updates", summary, host_id=host.id, host=host.name, action="apply")
+
+    from flask import current_app
+
+    from routes.hosts import _run_apply, _threading
+    with _apply_lock:
+        existing = _apply_jobs.get(host.id)
+        if existing and existing.get("running"):
+            return json.dumps({"error": "An update job is already running for this host; check get_host_updates."})
+        _apply_jobs[host.id] = {"log": [], "running": True, "success": None, "cancelled": False}
+    _threading.Thread(target=_run_apply, args=(host.id, current_app._get_current_object()), daemon=True).start()
+    log_action("host_apply_updates", "host", resource_id=host.id, resource_name=host.name,
+               details={"via": "ai_assistant"})
+    db.session.commit()
+    return json.dumps({"success": True,
+                       "message": f"Update job started on {host.name}. Call get_host_updates to follow its "
+                                  "progress (apply_job.running / success / log_tail)."})
+
+
+# ---- IPMI / Redfish BMC (mirrors routes/ipmi.py) ----
+
+_IPMI_POWER_ACTIONS = ("on", "off", "reset", "cycle", "graceful_shutdown")
+_IPMI_HARD_ACTIONS = ("off", "reset", "cycle")
+
+
+def _ipmi_snapshot(host, include_event_log=False, event_limit=20):
+    """Health snapshot (and optionally SEL entries) for one IPMI-enabled host, BMC session closed after."""
+    from routes.ipmi import _redfish_session
+    entry = {"host_id": host.id, "name": host.name, "ipmi_address": host.ipmi_address, "reachable": False}
+    with _redfish_session(host) as client:
+        if not client:
+            entry["error"] = "IPMI is enabled but not fully configured (address, username or password missing)"
+            return entry
+        try:
+            snap = client.get_health_snapshot()
+        except Exception:
+            logger.warning("AI IPMI: snapshot failed for %s", host.name, exc_info=True)
+            snap = None
+        if not snap:
+            entry["error"] = "The BMC did not answer"
+            return entry
+        entry.update({
+            "reachable": True,
+            "power_state": snap.get("power_state"),
+            "health": snap.get("health"),
+            "state": snap.get("state"),
+            "health_issues": snap.get("health_issues") or [],
+            "system": {k: snap.get(k) for k in ("manufacturer", "model", "serial", "bios_version", "hostname")},
+            "memory_gb": snap.get("total_memory_gb"),
+            "processors": {"count": snap.get("processor_count"), "model": snap.get("processor_model")},
+            "cpu_temp_c": snap.get("cpu_temp"),
+            "system_temp_c": snap.get("system_temp"),
+            "power_consumed_watts": snap.get("total_watts"),
+            "temperatures": [{"name": t.get("name"), "celsius": t.get("reading_celsius"), "health": t.get("health"),
+                              "critical_at": t.get("upper_threshold_critical")} for t in snap.get("temperatures") or []],
+            "fans": [{"name": f.get("name"), "reading": f.get("reading_rpm"), "units": f.get("units"),
+                      "health": f.get("health")} for f in snap.get("fans") or []],
+            "power_supplies": [{"name": p.get("name"), "health": p.get("health"), "state": p.get("state"),
+                                "output_watts": p.get("power_output_watts"),
+                                "capacity_watts": p.get("power_capacity_watts")}
+                               for p in snap.get("power_supplies") or []],
+        })
+        if include_event_log:
+            try:
+                entries = client.get_sel_entries(limit=event_limit) or []
+            except Exception:
+                logger.warning("AI IPMI: SEL fetch failed for %s", host.name, exc_info=True)
+                entries = []
+            entry["event_log"] = [{"created": e.get("created"), "severity": e.get("severity"),
+                                   "message": e.get("message"), "sensor_type": e.get("sensor_type")}
+                                  for e in entries]
+    return entry
+
+
+def _handle_get_ipmi_status(tool_input, user):
+    from models import ProxmoxHost
+    host_id = tool_input.get("host_id")
+    include_log = bool(tool_input.get("include_event_log"))
+    try:
+        event_limit = max(1, min(int(tool_input.get("event_limit") or 20), 100))
+    except (TypeError, ValueError):
+        event_limit = 20
+    if host_id:
+        host = ProxmoxHost.query.get(host_id)
+        if not host:
+            return json.dumps({"error": "Host not found"})
+        if not host.ipmi_enabled:
+            return json.dumps({"error": f"IPMI is not enabled for host '{host.name}'"})
+        return json.dumps(_ipmi_snapshot(host, include_log, event_limit))
+    hosts = ProxmoxHost.query.filter_by(ipmi_enabled=True).all()
+    if not hosts:
+        return json.dumps({"count": 0, "hosts": [], "note": "No host has IPMI enabled"})
+    return json.dumps({"count": len(hosts), "hosts": [_ipmi_snapshot(h) for h in hosts]})
+
+
+def _handle_control_ipmi_power(tool_input, user):
+    """BMC power actions, mirroring routes/ipmi.py::power_action (two-phase confirm added)."""
+    from auth.audit import log_action
+    from models import ProxmoxHost, db
+    from routes.ipmi import _redfish_session
+
+    action = tool_input.get("action")
+    if action not in _IPMI_POWER_ACTIONS:
+        return json.dumps({"error": f"Invalid action: {action}"})
+    host = ProxmoxHost.query.get(tool_input.get("host_id") or 0)
+    if not host:
+        return json.dumps({"error": "Host not found"})
+    if not host.ipmi_enabled:
+        return json.dumps({"error": f"IPMI is not enabled for host '{host.name}'"})
+
+    if not tool_input.get("confirm"):
+        power_state = "unknown"
+        with _redfish_session(host) as client:
+            if client:
+                try:
+                    info = client.get_system_info()
+                    power_state = (info or {}).get("power_state") or "unknown"
+                except Exception:
+                    logger.debug("AI IPMI: could not read power state for %s", host.name, exc_info=True)
+        summary = (f"This will send BMC power action '{action}' to physical host '{host.name}' "
+                   f"(BMC {host.ipmi_address}); its power state is currently {power_state}.")
+        if action in _IPMI_HARD_ACTIONS:
+            summary += (f" WARNING: '{action}' cuts power without an OS shutdown, taking down every VM and "
+                        "container on this host; prefer 'graceful_shutdown' unless the host is unresponsive.")
+        return _confirmation_required("control_ipmi_power", summary, host_id=host.id, host=host.name,
+                                      action=action, current_power_state=power_state)
+
+    with _redfish_session(host) as client:
+        if not client:
+            return json.dumps({"error": "IPMI is enabled but not fully configured for this host"})
+        ok, msg = client.power_action(action)
+    if not ok:
+        logger.warning("AI IPMI power %s failed for host %s: %s", action, host.id, msg)
+        return json.dumps({"success": False,
+                           "message": f"The BMC rejected the power {action} command; details are in the server log."})
+    log_action(f"ipmi_power_{action}", "host", resource_id=host.id, resource_name=host.name,
+               details={"ipmi_address": host.ipmi_address, "via": "ai_assistant"})
+    db.session.commit()
+    return json.dumps({"success": True, "message": f"Power {action} command sent to {host.name}."})
+
+
 # ---- Tool registry ----
 
 TOOL_REGISTRY = {
@@ -961,6 +1408,121 @@ TOOL_REGISTRY = {
         },
         "required_permission": "can_view_hosts",
         "handler": _handle_get_host_status,
+    },
+    "list_unifi_devices": {
+        "description": (
+            "List UniFi network devices (access points, switches, gateways) with online state, model, firmware, "
+            "uptime, CPU/memory/temperature, connected client count, uplink and radio utilisation."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "required_permission": "can_view_unifi",
+        "handler": _handle_list_unifi_devices,
+    },
+    "list_unifi_clients": {
+        "description": (
+            "Find devices on the network as UniFi sees them: hostname, IP, MAC, network/VLAN, wired or wireless, "
+            "which AP or switch (and port) they are on, SSID, signal, last seen, blocked/guest flags, and the "
+            "matching guest here when a VM/CT has that MAC. Filter with query (substring of hostname, IP, MAC, "
+            "network, SSID or vendor). include_offline adds clients seen in the last 30 days."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Case-insensitive substring to match"},
+                "include_offline": {"type": "boolean", "description": "Also list clients not currently connected"},
+            },
+            "required": [],
+        },
+        "required_permission": "can_view_unifi",
+        "handler": _handle_list_unifi_clients,
+    },
+    "get_unifi_health": {
+        "description": (
+            "UniFi site health: per-subsystem status (wan, lan, wlan, vpn) with device and client counts, WAN IP, "
+            "ISP, latency, uptime and last speedtest, plus the configured networks/VLANs and SSIDs."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "required_permission": "can_view_unifi",
+        "handler": _handle_get_unifi_health,
+    },
+    "get_host_updates": {
+        "description": (
+            "Pending apt package updates on a Proxmox PVE or PBS host (the node itself, not its guests), queried "
+            "live with severity, falling back to the last scheduled scan if the host is unreachable. Also reports "
+            "the state of a running or finished update job (running, success, log tail)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "integer", "description": "The host ID (from get_host_status)"},
+            },
+            "required": ["host_id"],
+        },
+        "required_permission": "can_view_hosts",
+        "handler": _handle_get_host_updates,
+    },
+    "manage_host_updates": {
+        "description": (
+            "Node apt maintenance on a PVE/PBS host. 'refresh' runs apt-get update through the Proxmox API and "
+            "needs no confirmation. 'apply' runs apt-get dist-upgrade over SSH as a background job: state-changing, "
+            "so the first call returns a confirmation-required preview and only a second call with "
+            "\"confirm\": true starts it. 'cancel' stops a running apply job."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "integer", "description": "The host ID (from get_host_status)"},
+                "action": {"type": "string", "enum": list(_HOST_UPDATE_ACTIONS), "description": "What to do"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "apply only: set to true only after the user has explicitly confirmed.",
+                },
+            },
+            "required": ["host_id", "action"],
+        },
+        "required_permission": "can_manage_hosts",
+        "handler": _handle_manage_host_updates,
+    },
+    "get_ipmi_status": {
+        "description": (
+            "Out-of-band hardware status from a host's BMC (IPMI/Redfish): physical power state, overall health "
+            "and any failing subsystems, model/serial/BIOS, CPU and board temperatures, fans, power supplies and "
+            "power draw. Without host_id, every IPMI-enabled host is summarised. include_event_log adds the "
+            "System Event Log for one host."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "integer", "description": "One host (from get_host_status); omit for all"},
+                "include_event_log": {"type": "boolean", "description": "Also return recent SEL entries (host_id only)"},
+                "event_limit": {"type": "integer", "description": "How many SEL entries (default 20, max 100)"},
+            },
+            "required": [],
+        },
+        "required_permission": "can_view_ipmi",
+        "handler": _handle_get_ipmi_status,
+    },
+    "control_ipmi_power": {
+        "description": (
+            "Physical power control of a host through its BMC: on, graceful_shutdown, off, reset, cycle. "
+            "State-changing: the first call returns a confirmation-required preview (with the current power state) "
+            "without doing anything; call again with \"confirm\": true after the user approves. off/reset/cycle "
+            "are hard actions that take down every guest on the host."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "integer", "description": "The host ID (from get_host_status)"},
+                "action": {"type": "string", "enum": list(_IPMI_POWER_ACTIONS), "description": "The power action"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Set to true only after the user has explicitly confirmed the action.",
+                },
+            },
+            "required": ["host_id", "action"],
+        },
+        "required_permission": "can_manage_ipmi",
+        "handler": _handle_control_ipmi_power,
     },
 }
 
