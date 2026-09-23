@@ -5,6 +5,33 @@ from datetime import datetime, timedelta, timezone
 logger = logging.getLogger(__name__)
 
 
+def _fmt_bytes(n):
+    """Render a byte count for the model (and the user) as e.g. '1.5 GiB'."""
+    try:
+        n = float(n or 0)
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
+def _pct(used, total):
+    return round(used / total * 100, 1) if total else None
+
+
+def _usage(used, total):
+    """{used, total, percent} in bytes plus a human-readable summary string."""
+    used = used or 0
+    total = total or 0
+    entry = {"used_bytes": used, "total_bytes": total, "percent": _pct(used, total)}
+    entry["human"] = f"{_fmt_bytes(used)} of {_fmt_bytes(total)}" + (
+        f" ({entry['percent']}%)" if entry["percent"] is not None else "")
+    return entry
+
+
 def _serialize_guest(guest):
     """Serialize a Guest model to a dict for Claude."""
     return {
@@ -14,6 +41,7 @@ def _serialize_guest(guest):
         "ip": guest.ip_address,
         "status": guest.status,
         "power_state": guest.power_state,
+        "lock": guest.lock_reason,
         "host": guest.proxmox_host.name if guest.proxmox_host else None,
         "vmid": guest.vmid,
         "pending_updates": len(guest.pending_updates()),
@@ -185,18 +213,153 @@ def _handle_list_audit_logs(tool_input, user):
     ])
 
 
+def _live_guest(guest, user):
+    """Resolve (client, node) for a guest's live Proxmox data, or an error dict."""
+    if not guest:
+        return None, None, {"error": "Guest not found"}
+    if not user.may_access_guest(guest):
+        return None, None, {"error": "Access denied"}
+    if not guest.proxmox_host or not guest.vmid:
+        return None, None, {"error": "Guest is not linked to a Proxmox host, so no live data is available"}
+    from clients.proxmox_api import ProxmoxClient
+    client = ProxmoxClient(guest.proxmox_host)
+    node = client.find_guest_node(guest.vmid)
+    if not node:
+        return None, None, {"error": f"Guest VMID {guest.vmid} was not found on host '{guest.proxmox_host.name}'"}
+    return client, node, None
+
+
+def _handle_get_guest_resource_usage(tool_input, user):
+    """Live CPU / memory / disk / network figures straight from the Proxmox API."""
+    from models import Guest
+    guest = Guest.query.get(tool_input["guest_id"])
+    client, node, err = _live_guest(guest, user)
+    if err:
+        return json.dumps(err)
+    data = client.get_guest_current(node, guest.vmid, guest.guest_type)
+    if not data:
+        return json.dumps({"error": "Proxmox did not return a status record for this guest"})
+
+    result = {
+        "guest_id": guest.id,
+        "name": guest.name,
+        "vmid": guest.vmid,
+        "type": guest.guest_type,
+        "host": guest.proxmox_host.name,
+        "node": node,
+        "status": data.get("status", "unknown"),
+        "uptime_seconds": data.get("uptime", 0),
+        "cpu_percent": round((data.get("cpu") or 0) * 100, 1),
+        "cpu_cores": data.get("cpus"),
+        "memory": _usage(data.get("mem"), data.get("maxmem")),
+        "disk": _usage(data.get("disk"), data.get("maxdisk")),
+        "network_in_bytes_total": data.get("netin", 0),
+        "network_out_bytes_total": data.get("netout", 0),
+    }
+    if data.get("maxswap"):
+        result["swap"] = _usage(data.get("swap"), data.get("maxswap"))
+    if data.get("lock"):
+        result["lock"] = data["lock"]
+    if result["status"] != "running":
+        result["note"] = "Guest is not running; usage figures are zero."
+    return json.dumps(result)
+
+
+def _handle_get_guest_performance_history(tool_input, user):
+    """Summarise Proxmox RRD history (avg / peak CPU and memory) for a guest."""
+    from models import Guest
+    guest = Guest.query.get(tool_input["guest_id"])
+    client, node, err = _live_guest(guest, user)
+    if err:
+        return json.dumps(err)
+    timeframe = tool_input.get("timeframe", "day")
+    if timeframe not in ("hour", "day", "week", "month", "year"):
+        return json.dumps({"error": f"Invalid timeframe: {timeframe}"})
+    rows = [r for r in (client.get_rrd_data(node, guest.vmid, guest.guest_type, timeframe=timeframe) or [])
+            if r.get("cpu") is not None or r.get("mem") is not None]
+    if not rows:
+        return json.dumps({"guest_id": guest.id, "name": guest.name, "timeframe": timeframe,
+                           "samples": 0, "note": "No performance history available"})
+
+    cpu = [(r.get("cpu") or 0) * 100 for r in rows]
+    mem = [r.get("mem") or 0 for r in rows]
+    maxmem = max((r.get("maxmem") or 0) for r in rows)
+    peak_idx = max(range(len(mem)), key=mem.__getitem__)
+    peak_at = rows[peak_idx].get("time")
+    return json.dumps({
+        "guest_id": guest.id,
+        "name": guest.name,
+        "timeframe": timeframe,
+        "samples": len(rows),
+        "cpu_percent": {"average": round(sum(cpu) / len(cpu), 1), "peak": round(max(cpu), 1)},
+        "memory": {
+            "total_bytes": maxmem,
+            "average": _usage(sum(mem) / len(mem), maxmem),
+            "peak": _usage(max(mem), maxmem),
+            "peak_at": datetime.fromtimestamp(peak_at, tz=timezone.utc).isoformat() if peak_at else None,
+        },
+        "network_average_bytes_per_second": {
+            "in": round(sum((r.get("netin") or 0) for r in rows) / len(rows)),
+            "out": round(sum((r.get("netout") or 0) for r in rows) / len(rows)),
+        },
+    })
+
+
+def _live_host_status(host):
+    """Live node status (and storage pools for PVE) for one host. Raises on failure."""
+    if host.is_pbs:
+        from clients.pbs_client import PBSClient
+        return PBSClient(host).get_node_status(), None
+    from clients.proxmox_api import ProxmoxClient
+    client = ProxmoxClient(host)
+    node_name = client.get_local_node_name()
+    if not node_name:
+        return None, None
+    return client.get_node_status(node_name), client.get_node_storage(node_name)
+
+
 def _handle_get_host_status(tool_input, user):
     from models import ProxmoxHost
-    hosts = ProxmoxHost.query.all()
+    host_id = tool_input.get("host_id")
+    hosts = ProxmoxHost.query.filter_by(id=host_id).all() if host_id else ProxmoxHost.query.all()
+    if host_id and not hosts:
+        return json.dumps({"error": "Host not found"})
     result = []
     for host in hosts:
-        result.append({
+        entry = {
             "id": host.id,
             "name": host.name,
             "hostname": host.hostname,
             "type": host.host_type,
             "guest_count": len(host.guests),
-        })
+            "online": False,
+        }
+        try:
+            status, storages = _live_host_status(host)
+        except Exception:
+            logger.warning("AI host status: live query failed for %s", host.name, exc_info=True)
+            status, storages = None, None
+        if status:
+            entry["online"] = True
+            entry["cpu_percent"] = status.get("cpu_usage")
+            entry["cpu_threads"] = status.get("cpu_threads")
+            entry["loadavg"] = status.get("loadavg")
+            entry["memory"] = _usage(status.get("memory_used"), status.get("memory_total"))
+            entry["swap"] = _usage(status.get("swap_used"), status.get("swap_total"))
+            entry["rootfs"] = _usage(status.get("rootfs_used"), status.get("rootfs_total"))
+            entry["uptime_seconds"] = status.get("uptime", 0)
+            entry["version"] = status.get("pveversion") or status.get("pbsversion") or ""
+        if storages:
+            entry["storage"] = [
+                {
+                    "name": st["name"],
+                    "type": st["type"],
+                    "active": bool(st.get("active")),
+                    **_usage(st.get("used"), st.get("total")),
+                }
+                for st in storages
+            ]
+        result.append(entry)
     return json.dumps(result)
 
 
@@ -236,6 +399,43 @@ TOOL_REGISTRY = {
         },
         "required_permission": None,
         "handler": _handle_get_guest_updates,
+    },
+    "get_guest_resource_usage": {
+        "description": (
+            "Get LIVE resource usage for a guest straight from Proxmox: current CPU %, memory used/total, "
+            "disk used/total, swap (containers), uptime and network totals. Use this whenever the user asks "
+            "how much memory, CPU or disk a VM or container is using right now."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+            },
+            "required": ["guest_id"],
+        },
+        "required_permission": None,
+        "handler": _handle_get_guest_resource_usage,
+    },
+    "get_guest_performance_history": {
+        "description": (
+            "Summarise a guest's recent performance from Proxmox history: average and peak CPU % and memory "
+            "over the last hour, day, week, month or year, with when memory peaked. Use for questions like "
+            "'has it been busy today' or 'did it run out of memory overnight'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+                "timeframe": {
+                    "type": "string",
+                    "enum": ["hour", "day", "week", "month", "year"],
+                    "description": "How far back to summarise (default: day)",
+                },
+            },
+            "required": ["guest_id"],
+        },
+        "required_permission": None,
+        "handler": _handle_get_guest_performance_history,
     },
     "list_services": {
         "description": "List all monitored services across all accessible guests, with their current status.",
@@ -293,10 +493,16 @@ TOOL_REGISTRY = {
         "handler": _handle_list_audit_logs,
     },
     "get_host_status": {
-        "description": "List all Proxmox hosts with their type and guest counts.",
+        "description": (
+            "List Proxmox PVE/PBS hosts with LIVE node status: online/offline, CPU %, load average, memory, "
+            "swap and root filesystem usage, uptime, version, and (PVE) every storage pool's usage and whether "
+            "it is active. Pass host_id to query one host."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "host_id": {"type": "integer", "description": "Optional: only this host (from a previous listing)"},
+            },
             "required": [],
         },
         "required_permission": "can_view_hosts",

@@ -29,7 +29,15 @@ def build_system_prompt(user, page_context=None):
         "explicit approval. Only after the user approves should you call the tool again with "
         "\"confirm\": true. Never set confirm=true on your own initiative.",
         "",
-        "Keep responses concise and actionable. Use markdown formatting for readability.",
+        "Guests have two identifiers: the tool's own guest ID (used by every guest_id parameter) and the "
+        "Proxmox VMID (what 'CT 103' or 'VM 133' refers to). Resolve names and VMIDs with list_guests first. "
+        "list_guests and get_guest_details report the last package scan stored in the database; for live "
+        "CPU, memory, disk or uptime call get_guest_resource_usage (now) or get_guest_performance_history "
+        "(averages and peaks), and get_host_status for a host's own resources and storage pools. Byte values "
+        "come with a ready-made 'human' string; quote that rather than raw bytes.",
+        "",
+        "Keep responses concise and actionable. The chat panel renders only headings, bold, italics, inline "
+        "code, fenced code blocks and '- ' bullet lists; it does not render tables, so use bullets instead.",
     ]
 
     # Add permission context

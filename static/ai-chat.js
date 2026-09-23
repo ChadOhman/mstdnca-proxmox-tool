@@ -139,7 +139,21 @@
         return bubble;
     }
 
+    // Tool calls whose result has not arrived yet, in call order. A tool_result
+    // event is appended to the matching call's block instead of a second block.
+    var pendingToolCalls = [];
+
     function addToolCall(name, input, result) {
+        if (result !== null && result !== undefined && input === null) {
+            for (var p = 0; p < pendingToolCalls.length; p++) {
+                if (pendingToolCalls[p].name === name) {
+                    var pending = pendingToolCalls.splice(p, 1)[0];
+                    pending.pre.textContent += formatToolResult(result);
+                    return pending.wrapper;
+                }
+            }
+        }
+
         var wrapper = document.createElement('div');
         wrapper.className = 'mb-2 ms-2';
 
@@ -160,19 +174,22 @@
 
         var content = '';
         if (input) content += 'Input: ' + JSON.stringify(input, null, 2) + '\n\n';
-        if (result) {
-            try {
-                content += 'Result: ' + JSON.stringify(JSON.parse(result), null, 2);
-            } catch(e) {
-                content += 'Result: ' + result;
-            }
-        }
+        if (result) content += formatToolResult(result);
         pre.textContent = content;
         details.appendChild(pre);
         wrapper.appendChild(details);
         messagesEl.appendChild(wrapper);
         messagesEl.scrollTop = messagesEl.scrollHeight;
+        if (!result) pendingToolCalls.push({name: name, pre: pre, wrapper: wrapper});
         return wrapper;
+    }
+
+    function formatToolResult(result) {
+        try {
+            return 'Result: ' + JSON.stringify(JSON.parse(result), null, 2);
+        } catch(e) {
+            return 'Result: ' + result;
+        }
     }
 
     function setInputEnabled(enabled) {
@@ -193,6 +210,7 @@
         chatInput.style.height = 'auto';
 
         addMessage('user', message);
+        pendingToolCalls = [];
         var assistantBubble = addStreamingBubble();
         var fullText = '';
 

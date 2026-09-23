@@ -141,6 +141,11 @@ def chat():
                 for event in client.stream_chat(messages, system_prompt=system_prompt,
                                                 tools=tools if tools else None):
                     if event["type"] == "text":
+                        if not round_text and full_text and not full_text.endswith("\n"):
+                            # A new round after a tool call: separate it from the
+                            # previous round's text instead of gluing sentences together.
+                            full_text += "\n\n"
+                            yield f"data: {json.dumps({'type': 'text', 'content': '\n\n'})}\n\n"
                         round_text += event["content"]
                         yield f"data: {json.dumps(event)}\n\n"
 
