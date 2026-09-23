@@ -119,7 +119,10 @@ def _revocation_reason(app, user_id, session_hash):
                 if record is None or record.revoked:
                     return "session_revoked"
     except Exception:
-        logger.debug("Terminal revocation re-check failed", exc_info=True)
+        # Fail closed: a re-check that cannot reach the database must not
+        # leave a possibly-revoked root shell open.
+        logger.warning("Terminal revocation re-check failed; closing the session", exc_info=True)
+        return "recheck_failed"
     return None
 
 
@@ -685,6 +688,7 @@ def _ws_follow(ws, guest_id, session_id):
 
     term_session = None
     send_q = None
+    _closed = threading.Event()
 
     try:
         if not ws_user.is_authenticated:
@@ -733,6 +737,33 @@ def _ws_follow(ws, guest_id, session_id):
 
         logger.info(f"Follower {ws_user.username} joined session {session_id} on {guest.name}")
 
+        # Re-check revocation for the follower too: before_request never runs
+        # again on a live WebSocket, and the operator's watchdog above does not
+        # cover followers. A revoked or deactivated follower loses the feed.
+        _wd_app = current_app._get_current_object()
+        _wd_user_id = ws_user.id
+        _wd_raw_sid = session.get(SESSION_KEY)
+        _wd_session_hash = _hash_session_id(_wd_raw_sid) if _wd_raw_sid else None
+
+        def _follower_watchdog():
+            while not _closed.wait(_REVOCATION_CHECK_INTERVAL):
+                reason = _revocation_reason(_wd_app, _wd_user_id, _wd_session_hash)
+                if reason:
+                    logger.warning("Closing follower feed for session %s: %s", session_id, reason)
+                    try:
+                        send_q.put_nowait(json.dumps({
+                            "type": "error", "data": "Your access was revoked — feed closed.",
+                        }))
+                    except Exception:
+                        pass
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    break
+
+        threading.Thread(target=_follower_watchdog, daemon=True).start()
+
         # Keep the connection alive; discard any input from the follower
         while True:
             try:
@@ -746,6 +777,7 @@ def _ws_follow(ws, guest_id, session_id):
     except Exception as e:
         logger.error(f"Follow session error for guest {guest_id}: {e}", exc_info=True)
     finally:
+        _closed.set()
         if send_q is not None:
             try:
                 send_q.put_nowait(None)  # sentinel — stop _follower_sender

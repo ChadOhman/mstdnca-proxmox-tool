@@ -1155,10 +1155,11 @@ def mastodon_account_maintenance(account_id):
         build_modify_command(
             username, action, email=email, confirm=confirm, user=user_setting, app_dir=app_dir_setting
         )
-    except ValueError as exc:
+    except ValueError:
         # Our own validator text, but keep exception strings out of JSON
-        # (CodeQL py/stack-trace-exposure); the detail goes to the log.
-        logger.warning("Maintenance input rejected for %s on account %s: %s", action, account_id, exc)
+        # (CodeQL py/stack-trace-exposure) and out of the log too: the
+        # message repeats the submitted value, which is a personal email.
+        logger.warning("Maintenance input rejected for %s on account %s", action, account_id)
         return jsonify({"ok": False, "error": INVALID_INPUT_MESSAGE}), 400
 
     try:

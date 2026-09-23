@@ -1647,6 +1647,29 @@ def guest_unifi_stats(guest_id):
 # Real-time collaboration
 # ---------------------------------------------------------------------------
 
+# How often a long-lived SSE stream re-checks that its user is still active
+# and its session unrevoked (before_request never runs again for it).
+_STREAM_RECHECK_SECONDS = 60
+
+
+def _stream_authorized(user_id, session_hash):
+    """Whether a live stream's user may keep it. Fails closed on any error."""
+    from models import User, UserSession
+    try:
+        user = db.session.get(User, user_id)
+        if user is None or not user.is_active:
+            return False
+        if session_hash:
+            record = UserSession.query.filter_by(session_id_hash=session_hash).first()
+            if record is None or record.revoked:
+                return False
+    except Exception:
+        logger.warning("Collaboration stream revocation re-check failed for user %s; closing", user_id,
+                       exc_info=True)
+        return False
+    return True
+
+
 @bp.route("/collab/stream")
 @login_required
 def collab_stream():
@@ -1686,18 +1709,7 @@ def collab_stream():
     _session_hash = _hash_session_id(_raw_sid) if _raw_sid else None
 
     def _still_authorized():
-        from models import User, UserSession
-        try:
-            user = db.session.get(User, user_id)
-            if user is None or not user.is_active:
-                return False
-            if _session_hash:
-                record = UserSession.query.filter_by(session_id_hash=_session_hash).first()
-                if record is None or record.revoked:
-                    return False
-        except Exception:
-            logger.debug("Collaboration stream revocation re-check failed", exc_info=True)
-        return True
+        return _stream_authorized(user_id, _session_hash)
 
     @stream_with_context
     def generate():
@@ -1707,6 +1719,10 @@ def collab_stream():
             import json as _json
             snapshot = collab_hub.get_online_users(viewer_is_admin=is_admin, viewer_tag_ids=tag_ids)
             yield f"data: {_json.dumps({'type': 'presence', 'users': snapshot})}\n\n"
+            # Re-check on a wall clock, not only when the queue is idle: with a
+            # steady event flow (presence heartbeats from other users) the idle
+            # branch never runs and a revoked user would keep the stream.
+            last_check = time.monotonic()
             while True:
                 try:
                     event = event_queue.get(timeout=25)
@@ -1714,11 +1730,13 @@ def collab_stream():
                         break
                     yield f"data: {_json.dumps(event)}\n\n"
                 except queue.Empty:
+                    yield ": keepalive\n\n"   # prevent proxy timeouts
+                if time.monotonic() - last_check >= _STREAM_RECHECK_SECONDS:
+                    last_check = time.monotonic()
                     if not _still_authorized():
                         logger.info("Closing collaboration stream for user %s: access revoked", user_id)
                         yield f"data: {_json.dumps({'type': 'revoked'})}\n\n"
                         break
-                    yield ": keepalive\n\n"   # prevent proxy timeouts
         except GeneratorExit:
             pass
         finally:

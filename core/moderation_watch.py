@@ -504,6 +504,15 @@ def _prune(now):
         ModerationAlert.acknowledged_at < cutoff,
     ).delete(synchronize_session=False)
 
+    # Alerts nobody acknowledged used to live forever, each carrying a post
+    # excerpt and URL. They follow the moderation log's retention setting.
+    from core.scheduler import interval_setting
+    unacked_cutoff = now - timedelta(days=interval_setting("moderation_log_retention_days"))
+    ModerationAlert.query.filter(
+        ModerationAlert.acknowledged_at.is_(None),
+        ModerationAlert.created_at < unacked_cutoff,
+    ).delete(synchronize_session=False)
+
     db.session.commit()
 
 

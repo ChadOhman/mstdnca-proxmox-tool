@@ -342,14 +342,15 @@ class TestMetricsEndpoint:
         resp = client.get("/metrics", headers={"Authorization": "Bearer test-secret-token"})
         assert resp.status_code == 200
 
-    def test_metrics_endpoint_auth_query_param(self, app, client):
-        """Query param token auth should work."""
+    def test_metrics_endpoint_query_param_rejected(self, app, client):
+        """A token in the query string is not accepted (it would land in access
+        logs and proxies); the generated prometheus.yml sends a Bearer header."""
         with app.app_context():
             from models import Setting, db
             Setting.set("prometheus_auth_token", "test-secret-token")
             db.session.commit()
         resp = client.get("/metrics?token=test-secret-token")
-        assert resp.status_code == 200
+        assert resp.status_code == 401
 
     def test_metrics_endpoint_wrong_token(self, app, client):
         """Wrong token should be rejected."""

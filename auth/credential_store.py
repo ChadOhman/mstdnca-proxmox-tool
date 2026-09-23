@@ -32,32 +32,47 @@ class CredentialDecryptError(CredentialStoreError):
 def _ciphertext_exists() -> bool:
     """True when the database already holds secrets encrypted with some key.
 
-    Returns False when the question cannot be answered (no app context, tables
-    not created yet, database unreachable) -- a fresh install must still be able
-    to generate its first key.
-    """
-    try:
-        from flask import has_app_context
-        if not has_app_context():
-            return False
-        from models import Credential, ProxmoxHost, db
+    Checks every place ciphertext lives: credential passwords/keys and sudo
+    passwords, host passwords/tokens, and Setting rows holding Fernet tokens
+    (UniFi, Jibri, Mastodon/PeerTube/bot tokens, GitHub token, Discord webhooks,
+    the Prometheus scrape token).
 
-        has_credential = db.session.query(
-            Credential.query.filter(Credential.encrypted_value.isnot(None)).exists()
-        ).scalar()
-        if has_credential:
-            return True
-        return bool(db.session.query(
-            ProxmoxHost.query.filter(
-                db.or_(
+    Returns False only when there is no app context or the tables do not exist
+    yet -- a fresh install must still be able to generate its first key. Any
+    other failure answers True: refusing to mint a key is recoverable, silently
+    orphaning every stored secret is not.
+    """
+    from flask import has_app_context
+    if not has_app_context():
+        return False
+    try:
+        from sqlalchemy.exc import OperationalError, ProgrammingError
+
+        from models import Credential, ProxmoxHost, Setting, db
+
+        def _any(query):
+            return bool(db.session.query(query.exists()).scalar())
+
+        try:
+            return (
+                _any(Credential.query.filter(db.or_(
+                    Credential.encrypted_value.isnot(None),
+                    Credential.encrypted_sudo_password.isnot(None),
+                )))
+                or _any(ProxmoxHost.query.filter(db.or_(
                     ProxmoxHost.encrypted_password.isnot(None),
                     ProxmoxHost.api_token_secret.isnot(None),
-                )
-            ).exists()
-        ).scalar())
+                    ProxmoxHost.ipmi_password.isnot(None),
+                )))
+                or _any(Setting.query.filter(Setting.value.like("gAAAAA%")))
+            )
+        except (OperationalError, ProgrammingError):
+            logger.debug("Tables not created yet; treating the database as empty", exc_info=True)
+            return False
     except Exception:
-        logger.debug("Could not check for existing ciphertext before key generation", exc_info=True)
-        return False
+        logger.warning("Could not check for existing ciphertext before key generation; "
+                       "refusing to generate one", exc_info=True)
+        return True
 
 
 def _get_or_create_key():
