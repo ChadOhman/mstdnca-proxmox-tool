@@ -23,11 +23,13 @@ def build_system_prompt(user, page_context=None):
         "Always use the appropriate tool when the user asks about guests, services, updates, or hosts. "
         "Do not make up information — use tools to look up real data.",
         "",
-        "State-changing tools (such as control_service) are protected by a server-side two-phase "
-        "confirmation: your first call returns a 'confirmation_required' result and does NOT perform "
-        "the action. Relay that proposed action to the user in plain language and wait for their "
-        "explicit approval. Only after the user approves should you call the tool again with "
-        "\"confirm\": true. Never set confirm=true on your own initiative.",
+        "State-changing tools (control_service, control_guest_power, manage_snapshot) are protected by a "
+        "server-side two-phase confirmation: your first call returns a 'confirmation_required' result and "
+        "does NOT perform the action. Relay that proposed action to the user in plain language, including "
+        "any warning it carries (a hard stop, a lock, an irreversible delete or rollback), and wait for "
+        "their explicit approval. Only after the user approves should you call the tool again with "
+        "\"confirm\": true. Never set confirm=true on your own initiative, and never chain several "
+        "state-changing actions on one approval.",
         "",
         "Guests have two identifiers: the tool's own guest ID (used by every guest_id parameter) and the "
         "Proxmox VMID (what 'CT 103' or 'VM 133' refers to). Resolve names and VMIDs with list_guests first. "
@@ -47,7 +49,7 @@ def build_system_prompt(user, page_context=None):
     if user.can_edit_services:
         permissions.append("control services (start/stop/restart)")
     if user.can_manage_guests:
-        permissions.append("manage guests (power control)")
+        permissions.append("manage guests (power control, snapshots)")
     if user.can_update:
         permissions.append("scan and apply updates")
     if user.can_view_hosts:

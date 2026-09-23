@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -305,6 +306,174 @@ def _handle_get_guest_performance_history(tool_input, user):
     })
 
 
+_POWER_ACTIONS = ("start", "shutdown", "stop", "reboot")
+_SNAPSHOT_ACTIONS = ("create", "delete", "rollback")
+# Proxmox snapshot names: a letter, then letters/digits/-/_ (kept short so the
+# model cannot smuggle anything odd into an API path segment).
+_SNAPNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+
+
+def _confirmation_required(tool, summary, **pending):
+    """Two-phase gate shared by the state-changing guest tools (see control_service)."""
+    return json.dumps({
+        "status": "confirmation_required",
+        "message": (
+            f"{summary} No action has been taken. To proceed, call {tool} again "
+            "with the same arguments plus \"confirm\": true."
+        ),
+        "pending_action": {"tool": tool, **pending},
+    })
+
+
+def _linked_guest(guest, user):
+    """DB-only checks shared by the guest action tools: exists, accessible, linked."""
+    if not guest:
+        return {"error": "Guest not found"}
+    if not user.may_access_guest(guest):
+        return {"error": "Access denied"}
+    if not guest.proxmox_host or not guest.vmid:
+        return {"error": "Guest is not linked to a Proxmox host"}
+    return None
+
+
+def _handle_control_guest_power(tool_input, user):
+    """start / shutdown / stop / reboot a guest, mirroring routes/guests.py::power_action."""
+    from auth.audit import log_action
+    from models import Guest, db
+
+    action = tool_input.get("action")
+    if action not in _POWER_ACTIONS:
+        return json.dumps({"error": f"Invalid action: {action}"})
+    guest = Guest.query.get(tool_input["guest_id"])
+    err = _linked_guest(guest, user)
+    if err:
+        return json.dumps(err)
+
+    if not tool_input.get("confirm"):
+        summary = (f"This will {action} '{guest.name}' ({guest.guest_type.upper()} {guest.vmid} on "
+                   f"{guest.proxmox_host.name}); it is currently {guest.power_state}.")
+        if guest.lock_reason:
+            summary += f" WARNING: the guest is locked ({guest.lock_reason})."
+        if action == "stop":
+            summary += " 'stop' is a hard power-off; prefer 'shutdown' unless the guest is unresponsive."
+        return _confirmation_required("control_guest_power", summary, guest_id=guest.id, guest=guest.name,
+                                      action=action, current_power_state=guest.power_state)
+
+    from clients.proxmox_api import ProxmoxClient
+    client = ProxmoxClient(guest.proxmox_host)
+    node = client.find_guest_node(guest.vmid) or guest.proxmox_host.name
+    ok, msg = getattr(client, f"{action}_guest")(node, guest.vmid, guest.guest_type)
+    if not ok:
+        logger.warning("AI power %s failed for guest %s: %s", action, guest.id, msg)
+        return json.dumps({"success": False,
+                           "message": f"Proxmox rejected the {action} command; details are in the server log."})
+
+    # Same optimistic state update as the human route.
+    if action == "start":
+        guest.power_state = "running"
+    elif action in ("shutdown", "stop"):
+        guest.power_state = "stopped"
+    if action == "reboot":
+        guest.reboot_required = False
+    log_action("guest_power", "guest", resource_id=guest.id, resource_name=guest.name,
+               details={"action": action, "via": "ai_assistant"})
+    db.session.commit()
+    return json.dumps({"success": True, "message": f"{action.capitalize()} command sent to {guest.name}."})
+
+
+def _handle_list_snapshots(tool_input, user):
+    from models import Guest
+    guest = Guest.query.get(tool_input["guest_id"])
+    client, node, err = _live_guest(guest, user)
+    if err:
+        return json.dumps(err)
+    snapshots = client.list_snapshots(node, guest.vmid, guest.guest_type)
+    return json.dumps({
+        "guest_id": guest.id,
+        "name": guest.name,
+        "snapshots_supported": bool(client.guest_supports_snapshot(node, guest.vmid, guest.guest_type)),
+        "count": len(snapshots),
+        "snapshots": [
+            {
+                "name": s.get("name"),
+                "description": s.get("description", ""),
+                "created_at": (datetime.fromtimestamp(s["snaptime"], tz=timezone.utc).isoformat()
+                               if s.get("snaptime") else None),
+                "parent": s.get("parent"),
+                "includes_ram": bool(s.get("vmstate")),
+            }
+            for s in snapshots
+        ],
+    })
+
+
+def _handle_manage_snapshot(tool_input, user):
+    """create / delete / rollback a snapshot, mirroring the routes/guests.py snapshot views."""
+    from auth.audit import log_action
+    from models import Guest, db
+
+    action = tool_input.get("action")
+    if action not in _SNAPSHOT_ACTIONS:
+        return json.dumps({"error": f"Invalid action: {action}"})
+    guest = Guest.query.get(tool_input["guest_id"])
+    err = _linked_guest(guest, user)
+    if err:
+        return json.dumps(err)
+
+    snapname = (tool_input.get("snapname") or "").strip()
+    if action == "create" and not snapname:
+        snapname = f"manual-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    if not snapname:
+        return json.dumps({"error": "snapname is required"})
+    if not _SNAPNAME_RE.match(snapname):
+        return json.dumps({"error": "Invalid snapshot name: start with a letter, then letters, digits, "
+                                    "'-' or '_' only, at most 40 characters"})
+    description = (tool_input.get("description") or "").strip()
+
+    if not tool_input.get("confirm"):
+        summaries = {
+            "create": f"This will create snapshot '{snapname}' of '{guest.name}'.",
+            "delete": f"This will permanently delete snapshot '{snapname}' of '{guest.name}'. This cannot be undone.",
+            "rollback": (f"This will roll '{guest.name}' back to snapshot '{snapname}', discarding every change "
+                         "made since it was taken. This cannot be undone."),
+        }
+        pending = {"guest_id": guest.id, "guest": guest.name, "action": action, "snapname": snapname}
+        if action == "create":
+            pending["description"] = description
+        return _confirmation_required("manage_snapshot", summaries[action], **pending)
+
+    client, node, err = _live_guest(guest, user)
+    if err:
+        return json.dumps(err)
+    if action == "create":
+        if not client.guest_supports_snapshot(node, guest.vmid, guest.guest_type):
+            return json.dumps({"error": "This guest's storage does not support snapshots"})
+        ok, result = client.create_snapshot(node, guest.vmid, guest.guest_type, snapname, description)
+        job_type, audit_action = "snapshot", "guest_snapshot_create"
+    elif action == "delete":
+        ok, result = client.delete_snapshot(node, guest.vmid, guest.guest_type, snapname)
+        job_type, audit_action = "snapshot_delete", "guest_snapshot_delete"
+    else:
+        ok, result = client.rollback_snapshot(node, guest.vmid, guest.guest_type, snapname)
+        job_type, audit_action = "rollback", "guest_snapshot_rollback"
+    if not ok:
+        logger.warning("AI snapshot %s failed for guest %s: %s", action, guest.id, result)
+        return json.dumps({"success": False,
+                           "message": f"Proxmox rejected the snapshot {action}; details are in the server log."})
+
+    log_action(audit_action, "guest", resource_id=guest.id, resource_name=guest.name,
+               details={"snapname": snapname, "via": "ai_assistant"})
+    db.session.commit()
+    # Register the Proxmox task so the guest page's task tracker follows it.
+    from routes.api import start_proxmox_job
+    start_proxmox_job(guest, job_type, result, node)
+    return json.dumps({
+        "success": True,
+        "message": f"Snapshot {action} of '{snapname}' started on {guest.name}; Proxmox is running it as a task.",
+        "task": result,
+    })
+
+
 def _live_host_status(host):
     """Live node status (and storage pools for PVE) for one host. Raises on failure."""
     if host.is_pbs:
@@ -436,6 +605,66 @@ TOOL_REGISTRY = {
         },
         "required_permission": None,
         "handler": _handle_get_guest_performance_history,
+    },
+    "control_guest_power": {
+        "description": (
+            "Start, gracefully shut down, force-stop or reboot a VM or container. State-changing: the first "
+            "call returns a confirmation-required preview without doing anything; call again with "
+            "\"confirm\": true after the user approves. Prefer 'shutdown' over 'stop' (hard power-off)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+                "action": {"type": "string", "enum": list(_POWER_ACTIONS), "description": "The power action"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Set to true only after the user has explicitly confirmed the action.",
+                },
+            },
+            "required": ["guest_id", "action"],
+        },
+        "required_permission": "can_manage_guests",
+        "handler": _handle_control_guest_power,
+    },
+    "list_snapshots": {
+        "description": "List a guest's Proxmox snapshots (name, description, when taken, parent, whether RAM was included).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+            },
+            "required": ["guest_id"],
+        },
+        "required_permission": None,
+        "handler": _handle_list_snapshots,
+    },
+    "manage_snapshot": {
+        "description": (
+            "Create, delete or roll back to a Proxmox snapshot of a guest. State-changing: the first call returns "
+            "a confirmation-required preview without doing anything; call again with \"confirm\": true after the "
+            "user approves. Delete and rollback are irreversible. For create, snapname defaults to "
+            "manual-<timestamp>."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+                "action": {"type": "string", "enum": list(_SNAPSHOT_ACTIONS), "description": "What to do"},
+                "snapname": {
+                    "type": "string",
+                    "description": "Snapshot name (required for delete/rollback; optional for create)",
+                },
+                "description": {"type": "string", "description": "Optional description for a new snapshot"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Set to true only after the user has explicitly confirmed the action.",
+                },
+            },
+            "required": ["guest_id", "action"],
+        },
+        "required_permission": "can_manage_guests",
+        "handler": _handle_manage_snapshot,
     },
     "list_services": {
         "description": "List all monitored services across all accessible guests, with their current status.",
