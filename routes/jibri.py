@@ -7,6 +7,7 @@ from flask_login import login_required
 
 from apps.utils import JobTracker, _validate_abs_path, _validate_shell_param
 from auth.audit import log_action
+from core.guest_scope import resolve_guest_selection
 from models import Guest, Setting, db
 
 
@@ -40,6 +41,13 @@ def _require_login():
     if not current_user.can_update:
         flash("'Apply Updates' permission required.", "error")
         return redirect(url_for("dashboard.index"))
+
+
+@bp.before_request
+def _require_configured_guest_scope():
+    """Refuse state-changing requests when a configured target guest is outside the user's tags."""
+    from core.guest_scope import require_configured_guest_scope
+    return require_configured_guest_scope(('jibri_guest_id',), "jibri.manage_page")
 
 
 def _get_jibri_settings():
@@ -121,7 +129,11 @@ def save():
         flash(str(e), "error")
         return redirect(url_for("jibri.manage_page"))
 
-    Setting.set("jibri_guest_id", request.form.get("jibri_guest_id", "").strip())
+    jibri_guest_id, err = resolve_guest_selection(request.form.get("jibri_guest_id", ""), "jibri_guest_id", "Jibri guest")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("jibri.manage_page"))
+    Setting.set("jibri_guest_id", jibri_guest_id)
     Setting.set("jibri_recording_dir", recording_dir)
 
     protection_type = request.form.get("jibri_protection_type", "snapshot")

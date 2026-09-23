@@ -14,6 +14,7 @@ from apps.utils import (
     _validate_username,
 )
 from auth.audit import log_action
+from core.guest_scope import resolve_guest_selection
 from models import Guest, Setting, db
 
 
@@ -45,6 +46,13 @@ def _require_login():
     if not current_user.can_update:
         flash("'Apply Updates' permission required.", "error")
         return redirect(url_for("dashboard.index"))
+
+
+@bp.before_request
+def _require_configured_guest_scope():
+    """Refuse state-changing requests when a configured target guest is outside the user's tags."""
+    from core.guest_scope import require_configured_guest_scope
+    return require_configured_guest_scope(('peertube_guest_id', 'peertube_db_guest_id'), "peertube.upgrade_page")
 
 
 def _get_peertube_settings():
@@ -131,8 +139,16 @@ def save():
         flash(str(e), "error")
         return redirect(url_for("peertube.upgrade_page"))
 
-    Setting.set("peertube_guest_id", request.form.get("peertube_guest_id", "").strip())
-    Setting.set("peertube_db_guest_id", request.form.get("peertube_db_guest_id", "").strip())
+    peertube_guest_id, err = resolve_guest_selection(request.form.get("peertube_guest_id", ""), "peertube_guest_id", "PeerTube guest")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("peertube.upgrade_page"))
+    Setting.set("peertube_guest_id", peertube_guest_id)
+    peertube_db_guest_id, err = resolve_guest_selection(request.form.get("peertube_db_guest_id", ""), "peertube_db_guest_id", "PeerTube database guest")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("peertube.upgrade_page"))
+    Setting.set("peertube_db_guest_id", peertube_db_guest_id)
     Setting.set("peertube_user", user)
     Setting.set("peertube_db_name", db_name)
     Setting.set("peertube_dir", peertube_dir)

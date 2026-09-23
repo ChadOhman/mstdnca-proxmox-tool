@@ -16,6 +16,7 @@ from flask_login import current_user, login_required
 from apps.utils import _validate_http_url, _validate_no_control_chars
 from auth.audit import log_action
 from core.errors import describe_exception
+from core.guest_scope import resolve_guest_selection
 from models import ExporterInstance, Guest, HostExporterInstance, ProxmoxHost, Setting, Tag, db
 
 # Longest value accepted for an exporter environment variable (DSNs and URIs).
@@ -78,6 +79,13 @@ def _require_login():
     if not current_user.can_update:
         flash("'Apply Updates' permission required.", "error")
         return redirect(url_for("dashboard.index"))
+
+
+@bp.before_request
+def _require_configured_guest_scope():
+    """Refuse state-changing requests when a configured target guest is outside the user's tags."""
+    from core.guest_scope import require_configured_guest_scope
+    return require_configured_guest_scope(('prometheus_guest_id',), "prometheus_app.manage")
 
 
 def _require_guest_access(guest):
@@ -198,7 +206,11 @@ def save():
         flash(str(e), "error")
         return redirect(url_for("prometheus_app.manage"))
 
-    Setting.set("prometheus_guest_id", request.form.get("prometheus_guest_id", "").strip())
+    prometheus_guest_id, err = resolve_guest_selection(request.form.get("prometheus_guest_id", ""), "prometheus_guest_id", "Prometheus guest")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("prometheus_app.manage"))
+    Setting.set("prometheus_guest_id", prometheus_guest_id)
     Setting.set("prometheus_url", prometheus_url)
     if auth_token:
         # Blank submission keeps the currently stored token — the field is
@@ -1029,6 +1041,18 @@ def _parse_mastodon_guest_id(raw):
         return None, f"Mastodon guest id is not a valid integer: {raw!r}"
 
 
+def _mastodon_guest_scope_error(guest_id):
+    """Error text when the current user may not act on the Mastodon guest.
+
+    The exporter routes run root commands on that guest, so the caller must
+    be allowed to act on it (tag scope), not just hold ``can_update``.
+    """
+    guest = db.session.get(Guest, guest_id)
+    if guest is None or not current_user.may_access_guest(guest):
+        return "You don't have permission to access the configured Mastodon guest."
+    return None
+
+
 @bp.route("/mastodon-exporter/enable", methods=["POST"])
 def mastodon_exporter_enable():
     from flask import current_app
@@ -1043,6 +1067,8 @@ def mastodon_exporter_enable():
     # Parse and validate every input *before* flipping the job to running: a bad
     # port used to raise after the flag was set, wedging the job forever.
     guest_id, err = _parse_mastodon_guest_id(mastodon_guest_id)
+    if err is None:
+        err = _mastodon_guest_scope_error(guest_id)
     if err:
         flash(err, "error")
         return redirect(url_for("prometheus_app.manage"))
@@ -1094,6 +1120,8 @@ def mastodon_exporter_disable():
         return redirect(url_for("prometheus_app.manage"))
 
     guest_id, err = _parse_mastodon_guest_id(mastodon_guest_id)
+    if err is None:
+        err = _mastodon_guest_scope_error(guest_id)
     if err:
         flash(err, "error")
         return redirect(url_for("prometheus_app.manage"))
@@ -1140,6 +1168,8 @@ def mastodon_exporter_reconfigure():
         return redirect(url_for("prometheus_app.manage"))
 
     guest_id, err = _parse_mastodon_guest_id(mastodon_guest_id)
+    if err is None:
+        err = _mastodon_guest_scope_error(guest_id)
     if err:
         flash(err, "error")
         return redirect(url_for("prometheus_app.manage"))

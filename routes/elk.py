@@ -12,6 +12,7 @@ from apps.utils import (
     _validate_username,
 )
 from auth.audit import log_action
+from core.guest_scope import resolve_guest_selection
 from models import Guest, Setting, db
 
 
@@ -44,6 +45,13 @@ def _require_login():
     if not current_user.can_update:
         flash("'Apply Updates' permission required.", "error")
         return redirect(url_for("dashboard.index"))
+
+
+@bp.before_request
+def _require_configured_guest_scope():
+    """Refuse state-changing requests when a configured target guest is outside the user's tags."""
+    from core.guest_scope import require_configured_guest_scope
+    return require_configured_guest_scope(('elk_guest_id',), "elk.upgrade_page")
 
 
 def _get_elk_settings():
@@ -127,7 +135,11 @@ def save():
         flash(str(e), "error")
         return redirect(url_for("elk.upgrade_page"))
 
-    Setting.set("elk_guest_id", request.form.get("elk_guest_id", "").strip())
+    elk_guest_id, err = resolve_guest_selection(request.form.get("elk_guest_id", ""), "elk_guest_id", "Elk guest")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("elk.upgrade_page"))
+    Setting.set("elk_guest_id", elk_guest_id)
     Setting.set("elk_user", elk_user)
     Setting.set("elk_dir", elk_dir)
     Setting.set("elk_url", elk_url)

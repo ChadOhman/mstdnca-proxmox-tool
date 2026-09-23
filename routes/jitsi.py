@@ -13,6 +13,7 @@ from apps.utils import (
     _validate_ipv4,
 )
 from auth.audit import log_action
+from core.guest_scope import resolve_guest_selection
 from models import Guest, Setting, db
 
 
@@ -47,6 +48,13 @@ def _require_login():
     if not current_user.can_update:
         flash("'Apply Updates' permission required.", "error")
         return redirect(url_for("dashboard.index"))
+
+
+@bp.before_request
+def _require_configured_guest_scope():
+    """Refuse state-changing requests when a configured target guest is outside the user's tags."""
+    from core.guest_scope import require_configured_guest_scope
+    return require_configured_guest_scope(('jitsi_guest_id',), "jitsi.upgrade_page")
 
 
 def _get_jitsi_settings():
@@ -139,7 +147,11 @@ def save():
         flash(str(e), "error")
         return redirect(url_for("jitsi.upgrade_page"))
 
-    Setting.set("jitsi_guest_id", request.form.get("jitsi_guest_id", "").strip())
+    jitsi_guest_id, err = resolve_guest_selection(request.form.get("jitsi_guest_id", ""), "jitsi_guest_id", "Jitsi guest")
+    if err:
+        flash(err, "error")
+        return redirect(url_for("jitsi.upgrade_page"))
+    Setting.set("jitsi_guest_id", jitsi_guest_id)
     Setting.set("jitsi_hostname", hostname)
     cert_type = request.form.get("jitsi_cert_type", "self-signed")
     Setting.set("jitsi_cert_type",

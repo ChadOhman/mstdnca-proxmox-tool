@@ -39,13 +39,19 @@ class CollaborationHub:
 
     def connect(self, user_id: int, username: str, display_name: str,
                 page: str = "/", is_admin: bool = False,
-                tag_ids: set | list | None = None, can_moderate: bool = False) -> queue.Queue:
+                tag_ids: set | list | None = None, can_moderate: bool = False,
+                page_tag_ids: list | None = None) -> queue.Queue:
         """Register an SSE connection and return the event queue for this user.
 
         ``is_admin``/``tag_ids``/``can_moderate`` are captured here (while a
         request context still exists) so :meth:`broadcast` can filter
         guest-scoped and moderators-only events per recipient without
         touching the database on the fan-out path.
+
+        ``page_tag_ids`` is the tag set of the guest ``page`` is about (None
+        for pages that are not guest-specific, [] for an untagged guest); it
+        lets :meth:`get_online_users` hide that page from viewers whose tags
+        do not cover the guest.
         """
         q: queue.Queue = queue.Queue(maxsize=200)
         with self._lock:
@@ -53,6 +59,7 @@ class CollaborationHub:
                 "username": username,
                 "display_name": display_name or username,
                 "page": page,
+                "page_tag_ids": None if page_tag_ids is None else list(page_tag_ids),
                 "following": None,
                 "last_seen": time.time(),
                 "queue": q,
@@ -78,11 +85,13 @@ class CollaborationHub:
             self._users.pop(user_id)
         self._push_presence()
 
-    def update_presence(self, user_id: int, page: str, following: str | None = None):
+    def update_presence(self, user_id: int, page: str, following: str | None = None,
+                        page_tag_ids: list | None = None):
         """Update a user's current page, follow target, and last-seen timestamp."""
         with self._lock:
             if user_id in self._users:
                 self._users[user_id]["page"] = page
+                self._users[user_id]["page_tag_ids"] = None if page_tag_ids is None else list(page_tag_ids)
                 self._users[user_id]["following"] = following
                 self._users[user_id]["last_seen"] = time.time()
         self._push_presence()
@@ -124,22 +133,53 @@ class CollaborationHub:
             except queue.Full:
                 pass  # Slow consumer — drop rather than block
 
-    def get_online_users(self) -> list:
+    @staticmethod
+    def _page_visible(page_tag_ids, viewer_is_admin, viewer_tag_ids, is_self) -> bool:
+        if page_tag_ids is None or viewer_is_admin or is_self:
+            return True
+        return bool(set(page_tag_ids) & set(viewer_tag_ids or ()))
+
+    def get_online_users(self, viewer_is_admin: bool = True,
+                         viewer_tag_ids: set | list | None = None,
+                         viewer_id: int | None = None) -> list:
+        """Presence list as seen by one viewer.
+
+        Another user's page is replaced by "/" when it is about a guest the
+        viewer's tags do not cover, so ``/guests/<id>`` paths never reveal
+        guests across the tag boundary. The default arguments give the
+        unredacted (admin) view.
+        """
         now = time.time()
         with self._lock:
             return [
                 {
                     "username": u["username"],
                     "display_name": u["display_name"],
-                    "page": u["page"],
+                    "page": u["page"] if self._page_visible(
+                        u.get("page_tag_ids"), viewer_is_admin, viewer_tag_ids, uid == viewer_id,
+                    ) else "/",
                     "following": u.get("following"),
                 }
-                for u in self._users.values()
+                for uid, u in self._users.items()
                 if now - u["last_seen"] < _PRESENCE_TIMEOUT
             ]
 
     def _push_presence(self):
-        self.broadcast({"type": "presence", "users": self.get_online_users()})
+        """Send each connected user a presence list redacted for them."""
+        with self._lock:
+            targets = [
+                (uid, u.get("is_admin", False), u.get("tag_ids") or set(), u["queue"])
+                for uid, u in self._users.items()
+            ]
+        for uid, is_admin, tag_ids, q in targets:
+            event = {
+                "type": "presence",
+                "users": self.get_online_users(viewer_is_admin=is_admin, viewer_tag_ids=tag_ids, viewer_id=uid),
+            }
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                pass  # Slow consumer — drop rather than block
 
 
 # ---------------------------------------------------------------------------

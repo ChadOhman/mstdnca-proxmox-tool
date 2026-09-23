@@ -20,6 +20,7 @@ from models import (
     HostExporterInstance,
     ProxmoxHost,
     Role,
+    Setting,
     Tag,
     User,
     db,
@@ -587,3 +588,228 @@ class TestCollaborationFanOut:
 
         payload = mock_hub.broadcast.call_args[0][0]
         assert "moderators_only" not in payload
+
+
+# ---------------------------------------------------------------------------
+# App settings: guests chosen through *_guest_id settings (GHSA-hjq8 residual).
+# A can_update user could point an app at any guest and the install/upgrade
+# routes then ran root commands there.
+# ---------------------------------------------------------------------------
+
+_APP_GUEST_FIELDS = [
+    ("/elk/save", "elk_guest_id"),
+    ("/ghost/save", "ghost_guest_id"),
+    ("/jibri/save", "jibri_guest_id"),
+    ("/jitsi/save", "jitsi_guest_id"),
+    ("/mastodon/save", "mastodon_guest_id"),
+    ("/mastodon/save", "mastodon_db_guest_id"),
+    ("/peertube/save", "peertube_guest_id"),
+    ("/prometheus/save", "prometheus_guest_id"),
+]
+
+_APP_GUARDS = [
+    ("/elk/preflight", "elk_guest_id", "/elk/upgrade"),
+    ("/ghost/preflight", "ghost_guest_id", "/ghost/upgrade"),
+    ("/jibri/preflight", "jibri_guest_id", "/jibri/manage"),
+    ("/jitsi/preflight", "jitsi_guest_id", "/jitsi/upgrade"),
+    ("/mastodon/preflight", "mastodon_guest_id", "/mastodon/upgrade"),
+    ("/peertube/preflight", "peertube_guest_id", "/peertube/upgrade"),
+    ("/prometheus/preflight", "prometheus_guest_id", "/prometheus/manage"),
+    ("/unpoller/preflight", "prometheus_guest_id", "/unpoller/manage"),
+]
+
+_APP_GUEST_KEYS = sorted(
+    {k for _, k in _APP_GUEST_FIELDS} | {k for _, k, _ in _APP_GUARDS}
+    | {"mastodon_guest_id_2", "peertube_db_guest_id"}
+)
+
+
+@pytest.fixture()
+def clean_app_guest_settings(app):
+    """Clear every app's target-guest setting before and after the test.
+
+    Other test files leave *_guest_id pointing at guests they created (often
+    untagged), which would trip the configured-guest guard here in full-suite
+    order before the assertion under test is even reached.
+    """
+    def _clear():
+        with app.app_context():
+            for key in _APP_GUEST_KEYS:
+                Setting.set(key, "")
+
+    _clear()
+    yield
+    _clear()
+
+
+class TestAppSettingsGuestSelection:
+    @pytest.mark.parametrize("url, field", _APP_GUEST_FIELDS)
+    def test_foreign_guest_cannot_be_selected(self, app, client, scoped, clean_app_guest_settings, url, field):
+        _login(client, scoped["usernames"]["updater"])
+        resp = client.post(url, data={field: str(scoped["foreign_guest"])}, follow_redirects=True)
+        assert resp.status_code == 200
+        assert b"permission to select that guest" in resp.data
+        with app.app_context():
+            assert Setting.get(field, "") == ""
+
+    @pytest.mark.parametrize("url, field", _APP_GUEST_FIELDS)
+    def test_owned_guest_can_be_selected(self, app, client, scoped, clean_app_guest_settings, url, field):
+        _login(client, scoped["usernames"]["updater"])
+        resp = client.post(url, data={field: str(scoped["owned_guest"])}, follow_redirects=True)
+        assert resp.status_code == 200
+        assert b"permission to select" not in resp.data
+        with app.app_context():
+            assert Setting.get(field, "") == str(scoped["owned_guest"])
+
+    def test_unknown_guest_id_rejected(self, app, client, scoped, clean_app_guest_settings):
+        _login(client, scoped["usernames"]["updater"])
+        resp = client.post("/elk/save", data={"elk_guest_id": "999999"}, follow_redirects=True)
+        assert b"guest not found" in resp.data
+        with app.app_context():
+            assert Setting.get("elk_guest_id", "") == ""
+
+    def test_admin_tier_may_select_any_guest(self, app, auth_client, scoped, clean_app_guest_settings):
+        resp = auth_client.post("/elk/save", data={"elk_guest_id": str(scoped["foreign_guest"])},
+                                follow_redirects=True)
+        assert resp.status_code == 200
+        with app.app_context():
+            assert Setting.get("elk_guest_id", "") == str(scoped["foreign_guest"])
+
+
+class TestConfiguredGuestScopeGuard:
+    """Every POST on an app blueprint acts on its configured guest; a user
+    whose tags do not cover that guest must be refused even with can_update."""
+
+    @pytest.mark.parametrize("url, key, page", _APP_GUARDS)
+    def test_post_refused_when_target_guest_out_of_scope(
+        self, app, client, scoped, clean_app_guest_settings, url, key, page,
+    ):
+        with app.app_context():
+            Setting.set(key, str(scoped["foreign_guest"]))
+        _login(client, scoped["usernames"]["updater"])
+        resp = client.post(url, follow_redirects=False)
+        assert resp.status_code == 302
+        assert resp.headers["Location"].endswith(page)
+        resp = client.get(page)
+        assert b"permission to act on the configured target guest" in resp.data
+
+    def test_get_pages_still_render(self, app, client, scoped, clean_app_guest_settings):
+        with app.app_context():
+            Setting.set("elk_guest_id", str(scoped["foreign_guest"]))
+        _login(client, scoped["usernames"]["updater"])
+        assert client.get("/elk/upgrade").status_code == 200
+
+    def test_owned_target_is_not_blocked(self, app, client, scoped, clean_app_guest_settings):
+        with app.app_context():
+            Setting.set("elk_guest_id", str(scoped["owned_guest"]))
+        _login(client, scoped["usernames"]["updater"])
+        resp = client.post("/elk/save", data={"elk_guest_id": str(scoped["owned_guest"])},
+                           follow_redirects=True)
+        assert b"permission to act on the configured target guest" not in resp.data
+
+
+class TestMastodonExporterGuestScope:
+    def test_enable_refused_across_tags(self, app, client, scoped, clean_app_guest_settings):
+        with app.app_context():
+            Setting.set("mastodon_guest_id", str(scoped["foreign_guest"]))
+        _login(client, scoped["usernames"]["updater"])
+        with patch("routes.prometheus_app._threading.Thread") as mock_thread:
+            resp = client.post("/prometheus/mastodon-exporter/enable", follow_redirects=True)
+        assert resp.status_code == 200
+        assert b"permission to access the configured Mastodon guest" in resp.data
+        mock_thread.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# /api/scan-all
+# ---------------------------------------------------------------------------
+
+class TestScanAllTagScope:
+    def test_scan_all_only_targets_accessible_guests(self, app, client, scoped):
+        from routes import api as api_mod
+
+        _login(client, scoped["usernames"]["manager"])
+        try:
+            with patch("routes.api.threading.Thread") as mock_thread:
+                resp = client.post("/api/scan-all", follow_redirects=False)
+            assert resp.status_code == 302
+            mock_thread.assert_called_once()
+            _app, guest_ids = mock_thread.call_args.kwargs["args"]
+            assert guest_ids == [scoped["owned_guest"]]
+        finally:
+            with api_mod._bulk_scan_lock:
+                api_mod._bulk_scan["running"] = False
+
+
+# ---------------------------------------------------------------------------
+# Presence: other users' pages are redacted across the tag boundary
+# ---------------------------------------------------------------------------
+
+class TestPresenceRedaction:
+    @staticmethod
+    def _last_presence(q):
+        last = None
+        while not q.empty():
+            e = q.get_nowait()
+            if e.get("type") == "presence":
+                last = e
+        return {u["username"]: u["page"] for u in last["users"]}
+
+    def test_guest_page_hidden_from_viewers_outside_tags(self):
+        from core.collaboration import CollaborationHub
+
+        hub = CollaborationHub()
+        q_admin = hub.connect(1, "admin", "Admin", page="/", is_admin=True)
+        q_owner = hub.connect(2, "owner", "Owner", page="/", tag_ids={7})
+        q_other = hub.connect(3, "other", "Other", page="/", tag_ids={9})
+        hub.update_presence(1, "/guests/42", page_tag_ids=[7])
+
+        assert self._last_presence(q_admin)["admin"] == "/guests/42"
+        assert self._last_presence(q_owner)["admin"] == "/guests/42"
+        assert self._last_presence(q_other)["admin"] == "/"
+
+    def test_untagged_guest_page_is_admin_only(self):
+        from core.collaboration import CollaborationHub
+
+        hub = CollaborationHub()
+        q_admin = hub.connect(1, "admin", "Admin", page="/", is_admin=True)
+        q_owner = hub.connect(2, "owner", "Owner", page="/guests/5", tag_ids={7}, page_tag_ids=[])
+        assert self._last_presence(q_admin)["owner"] == "/guests/5"
+        hub.update_presence(2, "/guests/5", page_tag_ids=[])
+        assert self._last_presence(q_owner)["owner"] == "/guests/5"  # your own page is never hidden
+
+    def test_non_guest_pages_visible_to_everyone(self):
+        from core.collaboration import CollaborationHub
+
+        hub = CollaborationHub()
+        q_other = hub.connect(3, "other", "Other", page="/", tag_ids={9})
+        hub.connect(2, "owner", "Owner", page="/settings", tag_ids={7})
+        assert self._last_presence(q_other)["owner"] == "/settings"
+
+    def test_heartbeat_resolves_page_tags_for_guest_pages(self, app, client, scoped):
+        _login(client, scoped["usernames"]["viewer"])
+        with app.app_context():
+            guest = db.session.get(Guest, scoped["foreign_guest"])
+            expected = [t.id for t in guest.tags]
+        with patch("core.collaboration.collab_hub") as hub:
+            resp = client.post("/api/collab/presence",
+                               json={"page": f"/guests/{scoped['foreign_guest']}"})
+        assert resp.status_code == 200
+        assert hub.update_presence.call_args.kwargs["page_tag_ids"] == expected
+
+    def test_cursors_hidden_for_pages_outside_tags(self, client, scoped):
+        from core.collaboration import cursor_hub
+
+        _login(client, scoped["usernames"]["viewer"])
+        cursor_hub.update("_scoped_someone", "Someone", f"/guests/{scoped['foreign_guest']}", 1.0, 1.0, "#000")
+        cursor_hub.update("_scoped_other", "Other", f"/guests/{scoped['owned_guest']}", 1.0, 1.0, "#000")
+
+        resp = client.get(f"/api/collab/cursors?page=/guests/{scoped['foreign_guest']}")
+        assert resp.get_json()["cursors"] == []
+        resp = client.get(f"/api/collab/cursors?page=/guests/{scoped['owned_guest']}")
+        assert [c["username"] for c in resp.get_json()["cursors"]] == ["_scoped_other"]
+
+    def test_cursor_update_rejects_unsafe_page(self, client, scoped):
+        _login(client, scoped["usernames"]["viewer"])
+        resp = client.get("/api/collab/cursor?x_pct=1&y_pct=1&page=javascript:alert(1)")
+        assert resp.status_code == 400
