@@ -145,7 +145,11 @@ def chat():
                             # A new round after a tool call: separate it from the
                             # previous round's text instead of gluing sentences together.
                             full_text += "\n\n"
-                            yield f"data: {json.dumps({'type': 'text', 'content': '\n\n'})}\n\n"
+                            # Built outside the f-string: a backslash inside an f-string
+                            # expression is a SyntaxError before Python 3.12, and
+                            # setup.sh installs on Debian 12's Python 3.11.
+                            separator = json.dumps({"type": "text", "content": "\n\n"})
+                            yield f"data: {separator}\n\n"
                         round_text += event["content"]
                         yield f"data: {json.dumps(event)}\n\n"
 

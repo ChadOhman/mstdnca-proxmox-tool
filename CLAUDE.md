@@ -22,7 +22,7 @@ Single test: `FLASK_SECRET_KEY=dev-secret DATABASE_URL="sqlite:////tmp/mstdnca-d
 
 ## Lint / Style
 
-- Ruff: `line-length = 120`, `target-version = "py313"`
+- Ruff: `line-length = 120`, `target-version = "py311"` — deployments run Debian 12's Python 3.11 (setup.sh uses the distro `python3`), so no 3.12+ syntax even though CI runs 3.13
 - Rules: E, F, W, B (bugbear), S (bandit/security)
 - `routes/terminal.py` allows S602; `tests/**/*.py` allows S101
 
