@@ -286,7 +286,7 @@ class TestSudoWrap:
     def test_non_root_with_sudo_password_uses_sudo_S(self):
         client = _make_client(username="ubuntu", sudo_password="pass")
         result = client.sudo_wrap("apt-get upgrade")
-        assert result == "sudo -S sh -c 'apt-get upgrade'"
+        assert result == "sudo -S -p '' sh -c 'apt-get upgrade'"
 
     def test_single_quote_in_command_is_escaped(self):
         client = _make_client(username="ubuntu", sudo_password=None)

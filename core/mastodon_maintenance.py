@@ -19,9 +19,9 @@ succeeded), so a hostile input never causes an SSH attempt.
 Status actions have no REST API equivalent: Mastodon's Admin API can act on
 one account or one report, but "delete/mark-sensitive these specific reported
 statuses" is only exposed through the web admin UI, which drives
-``Admin::StatusBatchAction`` directly. :func:`build_status_action_script`
-generates the same Ruby the controller runs, executed via
-``bin/rails runner`` over SSH.
+``Admin::ModerationAction`` (Mastodon 4.6+; ``Admin::StatusBatchAction``
+before that) directly. :func:`build_status_action_script` generates the same
+Ruby the controller runs, executed via ``bin/rails runner`` over SSH.
 """
 
 import base64
@@ -58,9 +58,8 @@ MAX_OUTPUT_BYTES = 64 * 1024
 COMMAND_TIMEOUT = 180
 INVALID_INPUT_MESSAGE = "Invalid input for this maintenance action (username, email or Mastodon settings)"
 
-# Admin::StatusBatchAction#type values this app exposes (Mastodon supports more,
-# e.g. "nsfw"/"remove_from_reports", but only these two make sense for a
-# report-driven moderation workflow).
+# Admin::ModerationAction#type values (Admin::StatusBatchAction before
+# Mastodon 4.6) this app exposes -- the report-driven moderation actions.
 STATUS_ACTIONS = {"delete": "Delete", "mark_as_sensitive": "Mark as sensitive"}
 
 # Mastodon's own admin UI batches at most a page of statuses at a time; this
@@ -302,15 +301,33 @@ def build_status_action_script(action, status_ids, report_id, actor_account_id, 
     text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
     send_email_literal = "true" if send_email else "false"
 
+    # Mastodon 4.6 (mastodon/mastodon#37970) moved delete/mark_as_sensitive out
+    # of Admin::StatusBatchAction into Admin::ModerationAction, which always
+    # acts on *every* status (and, from 4.7, collection) on the report. Its
+    # private status_ids/collections readers are overridden on the instance so
+    # it only touches the statuses picked here, as StatusBatchAction did.
+    # Older releases (no ModerationAction) keep the StatusBatchAction path.
+    # Validation runs before save! because BaseAction#save! raises
+    # RecordInvalid with an untranslated message that hides the actual error.
     return (
         "require 'base64'\n"
         f"account = Account.find({int(actor_account_id)})\n"
         f"report = Report.find({int(report_id)})\n"
         f"ids = report.status_ids.map(&:to_s) & [{ids_literal}]\n"
         "raise 'none of the selected statuses belong to this report' if ids.empty?\n"
-        f"Admin::StatusBatchAction.new(type: '{action}', status_ids: ids, current_account: account, "
-        f"report_id: report.id, send_email_notification: {send_email_literal}, "
-        f"text: Base64.strict_decode64('{text_b64}').force_encoding('UTF-8')).save!\n"
+        f"params = {{ type: '{action}', current_account: account, report_id: report.id, "
+        f"send_email_notification: {send_email_literal}, "
+        f"text: Base64.strict_decode64('{text_b64}').force_encoding('UTF-8') }}\n"
+        "if Admin.const_defined?(:ModerationAction)\n"
+        "  selected = report.status_ids & ids.map(&:to_i)\n"
+        "  action = Admin::ModerationAction.new(params)\n"
+        "  action.define_singleton_method(:status_ids) { selected }\n"
+        "  action.define_singleton_method(:collections) { [] }\n"
+        "else\n"
+        "  action = Admin::StatusBatchAction.new(params.merge(status_ids: ids))\n"
+        "end\n"
+        "raise \"Mastodon rejected the action: #{action.errors.full_messages.join(', ')}\" unless action.valid?\n"
+        "action.save!\n"
         'puts "OK #{ids.size}"\n'
     )
 

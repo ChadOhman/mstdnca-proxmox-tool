@@ -150,7 +150,9 @@ class SSHClient:
             return command
         escaped_cmd = command.replace("'", "'\\''")
         if self.sudo_password:
-            return f"sudo -S sh -c '{escaped_cmd}'"
+            # -p '' silences the "[sudo] password for X:" prompt, which sudo
+            # writes to stderr and would otherwise prefix the first error line.
+            return f"sudo -S -p '' sh -c '{escaped_cmd}'"
         return f"sudo -n sh -c '{escaped_cmd}'"
 
     def _feed_sudo_password(self, channel_stdin):
