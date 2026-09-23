@@ -20,8 +20,10 @@
         </button>
     </li>
     <li class="nav-item" role="presentation">
+        {# A real link (server-rendered log), not a pill -- but data-bs-target is
+           still needed so Bootstrap can hide #log-pane when a pill is clicked. #}
         <a class="nav-link{% if active_tab == 'log' %} active{% endif %}" id="log-tab"
-           href="{{ url_for('moderation.log') }}" role="tab"
+           href="{{ url_for('moderation.log') }}" data-bs-target="#log-pane" role="tab"
            aria-controls="log-pane" aria-selected="{{ 'true' if active_tab == 'log' else 'false' }}">
             <i class="bi bi-journal-text"></i> Activity log
         </a>
@@ -855,6 +857,24 @@ function safeHttpUrl(u) {
     if (typeof u !== 'string' || u.length > 2048) return '';
     return /^https?:\/\/[^\s"'<>\\]+$/i.test(u) ? escHtml(u) : '';
 }
+// The PeerTube/Mastodon pills switch client-side; keep the address bar in
+// step so a refresh or a copied link lands on the tab that is showing
+// (otherwise /moderation/log lingers after switching away from the log).
+(function() {
+    const tabUrls = {
+        'peertube-tab': {{ url_for('moderation.index') | tojson }},
+        'mastodon-tab': {{ url_for('moderation.index', tab='mastodon') | tojson }},
+    };
+    Object.keys(tabUrls).forEach(function(id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('shown.bs.tab', function() {
+            if (window.location.pathname + window.location.search !== tabUrls[id]) {
+                window.history.replaceState(null, '', tabUrls[id]);
+            }
+        });
+    });
+})();
 (function() {
     const logArea = document.getElementById('moderation-log-area');
     const logPre = document.getElementById('moderation-log');

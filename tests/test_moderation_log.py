@@ -7,6 +7,7 @@ which is gated by the same core/moderation_log.py::moderation_log_filter()
 definition used here.
 """
 
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -91,6 +92,27 @@ class TestModerationLogAccess:
             resp = moderator_client.get(path)
             assert resp.status_code == 200
             assert b'id="log-tab"' in resp.data
+
+    def test_log_tab_targets_its_pane_and_pills_sync_history(self, moderator_client):
+        """Switching from /moderation/log to a pill must hide the log pane and fix the URL.
+
+        Bootstrap's tab plugin only finds a sibling's pane via data-bs-target (or a
+        ``#hash`` href); a plain-URL href leaves #log-pane ``show active`` under the
+        newly shown pane.  The pills also need to rewrite the address bar, or the
+        page keeps claiming to be /moderation/log after switching away.
+        """
+        resp = moderator_client.get("/moderation/log")
+        assert resp.status_code == 200
+        html = resp.data.decode()
+
+        log_link = re.search(r'<a class="nav-link[^"]*" id="log-tab"[^>]*>', html)
+        assert log_link, "activity log tab link missing"
+        assert 'data-bs-target="#log-pane"' in log_link.group(0)
+        assert "data-bs-toggle" not in log_link.group(0), "log tab must stay a real link"
+
+        assert "'shown.bs.tab'" in html and "history.replaceState" in html
+        assert "'peertube-tab': \"/moderation/\"" in html
+        assert "'mastodon-tab': \"/moderation/?tab=mastodon\"" in html
 
 
 class TestModerationLogIpVisibility:
