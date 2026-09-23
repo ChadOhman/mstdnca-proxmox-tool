@@ -4,7 +4,9 @@ Blueprint exposing a /metrics endpoint in Prometheus text exposition format.
 Prometheus scrapes this endpoint at its configured interval.  Authentication is
 optional — controlled by the ``prometheus_auth_token`` setting.  If a token is
 set, the request must include it as a Bearer token in the Authorization header
-or as a ``token`` query parameter.
+(which is how the generated prometheus.yml sends it). A ``token`` query
+parameter used to be accepted as well, but query strings land in access logs,
+proxies and browser history, so it no longer is.
 """
 
 import hmac
@@ -26,15 +28,11 @@ def metrics():
     # Optional bearer token authentication (token is stored encrypted at rest)
     expected_token = get_secret_setting("prometheus_auth_token", "")
     if expected_token:
-        # Check Authorization header first, then query param
+        # Bearer header only: never read the token from the query string.
         auth_header = request.headers.get("Authorization", "")
-        token = None
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-        else:
-            token = request.args.get("token", "")
+        token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
 
-        if not hmac.compare_digest(token or "", expected_token):
+        if not hmac.compare_digest(token, expected_token):
             return Response("Unauthorized", status=401, content_type="text/plain")
     else:
         # No token configured — require session login

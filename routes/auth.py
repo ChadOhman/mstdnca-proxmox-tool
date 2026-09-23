@@ -14,7 +14,7 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from auth.audit import log_action
 from auth.jwt_auth import credential_epoch
 from auth.local_network import _get_client_ip as _client_ip
-from auth.session_manager import SESSION_KEY, revoke_current_session, start_session
+from auth.session_manager import SESSION_KEY, _hash_session_id, revoke_current_session, start_session
 from core.local_redirect import resolve_local_url
 from models import User, UserSession, db
 
@@ -297,12 +297,20 @@ def change_password():
             # set_password() also stamps tokens_valid_after, which invalidates
             # every JWT and every remember cookie issued before this moment.
             current_user.set_password(new_pw)
+            # Sign the account out everywhere else, as the admin reset path
+            # does: every other tracked browser session is revoked; this one
+            # keeps working because it just proved the old password.
+            raw_sid = session.get(SESSION_KEY)
+            keep_hash = _hash_session_id(raw_sid) if raw_sid else None
+            for record in UserSession.query.filter_by(user_id=current_user.id, revoked=False).all():
+                if record.session_id_hash != keep_hash:
+                    record.revoked = True
             log_action("password_change", "user", resource_id=current_user.id, resource_name=current_user.username)
             db.session.commit()
             if was_forced:
                 _remove_initial_admin_password_file()
-            flash("Password changed. Saved logins and API tokens issued earlier have been invalidated.",
-                  "success")
+            flash("Password changed. Other browser sessions were signed out, and saved logins and API "
+                  "tokens issued earlier have been invalidated.", "success")
             response = redirect(url_for("dashboard.index"))
             # Keep this browser's "remember me" working: it just proved the old
             # password, so re-stamp its marker past the new invalidation point.

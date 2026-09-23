@@ -92,9 +92,12 @@ def init_session_tracking(app):
         raw_id = session.get(SESSION_KEY)
         if not raw_id:
             # Authenticated without a tracked session id.  Every auth path in the
-            # app (login form, Cloudflare Access, local-network bypass) calls
-            # start_session(), so this only happens for a cookie minted before
-            # tracking existed; leave it alone rather than logging the user out.
+            # app (login form, remember-me restore, Cloudflare Access,
+            # local-network bypass) calls start_session(), so this is a cookie
+            # minted before tracking existed or one whose tracking key was
+            # stripped.  Such a session never appears on the Sessions page and
+            # can never be revoked, so end it and require a fresh login.
+            logout_user()
             return
 
         record = UserSession.query.filter_by(session_id_hash=_hash_session_id(raw_id)).first()

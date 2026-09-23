@@ -167,10 +167,17 @@ echo "[2/5] Creating CT $CTID ($HOSTNAME)..."
 echo "  Storage: $STORAGE, Memory: ${MEMORY}MB, Disk: ${DISK}GB, Cores: $CORES"
 echo "  Network: $NET_CONFIG"
 
-# Generate a random root password for the CT if not provided
+# Generate a random root password for the CT if not provided. It is saved to a
+# 0600 file on this host rather than printed: console output is captured by
+# terminal scrollback, shell history, and provisioning logs.
 if [ -z "$CT_ROOT_PASS" ]; then
     CT_ROOT_PASS=$(openssl rand -base64 12)
 fi
+CT_PASS_FILE="/root/.mstdnca-ct-${CTID}-root-password"
+( umask 077; printf '%s\n' "$CT_ROOT_PASS" > "$CT_PASS_FILE" )
+
+# NOTE: `pct create` only accepts the password as an argument (no stdin or
+# environment form), so it is briefly visible in the process list on this host.
 
 pct create "$CTID" "$TEMPLATE" \
     --hostname "$HOSTNAME" \
@@ -244,7 +251,7 @@ WEB_URL="http://${CT_IP}:5000"
 
 # Write details to CT notes in Proxmox. The root password is deliberately NOT
 # included here — Proxmox CT descriptions are visible to anyone with read
-# access to the datacenter view, so it is printed to the console below only.
+# access to the datacenter view; it lives in $CT_PASS_FILE on this host.
 NOTES="Mastodon Canada Administration Tool
 ==================================
 CT ID: $CTID
@@ -255,7 +262,7 @@ App Password: generated on first start (read with: cat /var/lib/mstdnca/initial-
 App Directory: /opt/mstdnca
 Data Directory: /var/lib/mstdnca
 Provisioned: $(date '+%Y-%m-%d %H:%M:%S')
-(CT root password was shown once in the provisioning console output.)"
+(CT root password: $CT_PASS_FILE on the Proxmox host, mode 0600.)"
 
 pct set "$CTID" --description "$NOTES" 2>/dev/null || true
 
@@ -266,12 +273,12 @@ echo "============================================"
 echo ""
 echo " CT ID:         $CTID"
 echo " Hostname:      $HOSTNAME"
-echo " Root Password: $CT_ROOT_PASS"
+echo " Root Password: saved to $CT_PASS_FILE (mode 0600)"
 if [ -n "$CT_IP" ]; then
     echo " Web UI:        ${WEB_URL}"
 fi
 echo " App Username:  admin"
-echo " App Password:  generated on first start (run 'journalctl -u mstdnca-proxmox-tool' in the CT to view it)"
+echo " App Password:  generated on first start (read with: pct exec $CTID -- cat /var/lib/mstdnca/initial-admin-password)"
 echo ""
 echo " IMPORTANT: Change the generated app password after first login!"
 echo " NOTE: All details have been saved to the CT notes in Proxmox."
