@@ -857,6 +857,128 @@ def _handle_manage_host_updates(tool_input, user):
                                   "progress (apply_job.running / success / log_tail)."})
 
 
+# ---- IPMI / Redfish BMC (mirrors routes/ipmi.py) ----
+
+_IPMI_POWER_ACTIONS = ("on", "off", "reset", "cycle", "graceful_shutdown")
+_IPMI_HARD_ACTIONS = ("off", "reset", "cycle")
+
+
+def _ipmi_snapshot(host, include_event_log=False, event_limit=20):
+    """Health snapshot (and optionally SEL entries) for one IPMI-enabled host, BMC session closed after."""
+    from routes.ipmi import _redfish_session
+    entry = {"host_id": host.id, "name": host.name, "ipmi_address": host.ipmi_address, "reachable": False}
+    with _redfish_session(host) as client:
+        if not client:
+            entry["error"] = "IPMI is enabled but not fully configured (address, username or password missing)"
+            return entry
+        try:
+            snap = client.get_health_snapshot()
+        except Exception:
+            logger.warning("AI IPMI: snapshot failed for %s", host.name, exc_info=True)
+            snap = None
+        if not snap:
+            entry["error"] = "The BMC did not answer"
+            return entry
+        entry.update({
+            "reachable": True,
+            "power_state": snap.get("power_state"),
+            "health": snap.get("health"),
+            "state": snap.get("state"),
+            "health_issues": snap.get("health_issues") or [],
+            "system": {k: snap.get(k) for k in ("manufacturer", "model", "serial", "bios_version", "hostname")},
+            "memory_gb": snap.get("total_memory_gb"),
+            "processors": {"count": snap.get("processor_count"), "model": snap.get("processor_model")},
+            "cpu_temp_c": snap.get("cpu_temp"),
+            "system_temp_c": snap.get("system_temp"),
+            "power_consumed_watts": snap.get("total_watts"),
+            "temperatures": [{"name": t.get("name"), "celsius": t.get("reading_celsius"), "health": t.get("health"),
+                              "critical_at": t.get("upper_threshold_critical")} for t in snap.get("temperatures") or []],
+            "fans": [{"name": f.get("name"), "reading": f.get("reading_rpm"), "units": f.get("units"),
+                      "health": f.get("health")} for f in snap.get("fans") or []],
+            "power_supplies": [{"name": p.get("name"), "health": p.get("health"), "state": p.get("state"),
+                                "output_watts": p.get("power_output_watts"),
+                                "capacity_watts": p.get("power_capacity_watts")}
+                               for p in snap.get("power_supplies") or []],
+        })
+        if include_event_log:
+            try:
+                entries = client.get_sel_entries(limit=event_limit) or []
+            except Exception:
+                logger.warning("AI IPMI: SEL fetch failed for %s", host.name, exc_info=True)
+                entries = []
+            entry["event_log"] = [{"created": e.get("created"), "severity": e.get("severity"),
+                                   "message": e.get("message"), "sensor_type": e.get("sensor_type")}
+                                  for e in entries]
+    return entry
+
+
+def _handle_get_ipmi_status(tool_input, user):
+    from models import ProxmoxHost
+    host_id = tool_input.get("host_id")
+    include_log = bool(tool_input.get("include_event_log"))
+    try:
+        event_limit = max(1, min(int(tool_input.get("event_limit") or 20), 100))
+    except (TypeError, ValueError):
+        event_limit = 20
+    if host_id:
+        host = ProxmoxHost.query.get(host_id)
+        if not host:
+            return json.dumps({"error": "Host not found"})
+        if not host.ipmi_enabled:
+            return json.dumps({"error": f"IPMI is not enabled for host '{host.name}'"})
+        return json.dumps(_ipmi_snapshot(host, include_log, event_limit))
+    hosts = ProxmoxHost.query.filter_by(ipmi_enabled=True).all()
+    if not hosts:
+        return json.dumps({"count": 0, "hosts": [], "note": "No host has IPMI enabled"})
+    return json.dumps({"count": len(hosts), "hosts": [_ipmi_snapshot(h) for h in hosts]})
+
+
+def _handle_control_ipmi_power(tool_input, user):
+    """BMC power actions, mirroring routes/ipmi.py::power_action (two-phase confirm added)."""
+    from auth.audit import log_action
+    from models import ProxmoxHost, db
+    from routes.ipmi import _redfish_session
+
+    action = tool_input.get("action")
+    if action not in _IPMI_POWER_ACTIONS:
+        return json.dumps({"error": f"Invalid action: {action}"})
+    host = ProxmoxHost.query.get(tool_input.get("host_id") or 0)
+    if not host:
+        return json.dumps({"error": "Host not found"})
+    if not host.ipmi_enabled:
+        return json.dumps({"error": f"IPMI is not enabled for host '{host.name}'"})
+
+    if not tool_input.get("confirm"):
+        power_state = "unknown"
+        with _redfish_session(host) as client:
+            if client:
+                try:
+                    info = client.get_system_info()
+                    power_state = (info or {}).get("power_state") or "unknown"
+                except Exception:
+                    logger.debug("AI IPMI: could not read power state for %s", host.name, exc_info=True)
+        summary = (f"This will send BMC power action '{action}' to physical host '{host.name}' "
+                   f"(BMC {host.ipmi_address}); its power state is currently {power_state}.")
+        if action in _IPMI_HARD_ACTIONS:
+            summary += (f" WARNING: '{action}' cuts power without an OS shutdown, taking down every VM and "
+                        "container on this host; prefer 'graceful_shutdown' unless the host is unresponsive.")
+        return _confirmation_required("control_ipmi_power", summary, host_id=host.id, host=host.name,
+                                      action=action, current_power_state=power_state)
+
+    with _redfish_session(host) as client:
+        if not client:
+            return json.dumps({"error": "IPMI is enabled but not fully configured for this host"})
+        ok, msg = client.power_action(action)
+    if not ok:
+        logger.warning("AI IPMI power %s failed for host %s: %s", action, host.id, msg)
+        return json.dumps({"success": False,
+                           "message": f"The BMC rejected the power {action} command; details are in the server log."})
+    log_action(f"ipmi_power_{action}", "host", resource_id=host.id, resource_name=host.name,
+               details={"ipmi_address": host.ipmi_address, "via": "ai_assistant"})
+    db.session.commit()
+    return json.dumps({"success": True, "message": f"Power {action} command sent to {host.name}."})
+
+
 # ---- Tool registry ----
 
 TOOL_REGISTRY = {
@@ -1135,6 +1257,47 @@ TOOL_REGISTRY = {
         },
         "required_permission": "can_manage_hosts",
         "handler": _handle_manage_host_updates,
+    },
+    "get_ipmi_status": {
+        "description": (
+            "Out-of-band hardware status from a host's BMC (IPMI/Redfish): physical power state, overall health "
+            "and any failing subsystems, model/serial/BIOS, CPU and board temperatures, fans, power supplies and "
+            "power draw. Without host_id, every IPMI-enabled host is summarised. include_event_log adds the "
+            "System Event Log for one host."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "integer", "description": "One host (from get_host_status); omit for all"},
+                "include_event_log": {"type": "boolean", "description": "Also return recent SEL entries (host_id only)"},
+                "event_limit": {"type": "integer", "description": "How many SEL entries (default 20, max 100)"},
+            },
+            "required": [],
+        },
+        "required_permission": "can_view_ipmi",
+        "handler": _handle_get_ipmi_status,
+    },
+    "control_ipmi_power": {
+        "description": (
+            "Physical power control of a host through its BMC: on, graceful_shutdown, off, reset, cycle. "
+            "State-changing: the first call returns a confirmation-required preview (with the current power state) "
+            "without doing anything; call again with \"confirm\": true after the user approves. off/reset/cycle "
+            "are hard actions that take down every guest on the host."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "integer", "description": "The host ID (from get_host_status)"},
+                "action": {"type": "string", "enum": list(_IPMI_POWER_ACTIONS), "description": "The power action"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Set to true only after the user has explicitly confirmed the action.",
+                },
+            },
+            "required": ["host_id", "action"],
+        },
+        "required_permission": "can_manage_ipmi",
+        "handler": _handle_control_ipmi_power,
     },
 }
 

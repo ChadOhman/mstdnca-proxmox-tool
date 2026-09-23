@@ -41,7 +41,10 @@ def build_system_prompt(user, page_context=None):
         "use the list_unifi_* and get_unifi_health tools; list_unifi_clients links a client back to its "
         "guest here when the MAC matches. For the Proxmox nodes' own apt packages use get_host_updates; "
         "manage_host_updates 'apply' is state-changing and follows the same two-phase confirmation as the "
-        "other state-changing tools, while 'refresh' only runs apt-get update and needs no confirmation.",
+        "other state-changing tools, while 'refresh' only runs apt-get update and needs no confirmation. "
+        "get_ipmi_status reads a host's BMC (physical power state, temperatures, fans, PSUs, event log) and "
+        "control_ipmi_power is the two-phase-confirmed physical power switch; its hard actions (off, reset, "
+        "cycle) take down every guest on the host, so relay that warning verbatim.",
         "",
         "Keep responses concise and actionable. The chat panel renders only headings, bold, italics, inline "
         "code, fenced code blocks and '- ' bullet lists; it does not render tables, so use bullets instead.",
@@ -65,6 +68,10 @@ def build_system_prompt(user, page_context=None):
         permissions.append("search audit logs")
     if user.can_view_unifi:
         permissions.append("view network devices and clients")
+    if user.can_view_ipmi:
+        permissions.append("read hosts' BMC hardware status (IPMI)")
+    if user.can_manage_ipmi:
+        permissions.append("physical host power control through IPMI")
 
     if permissions:
         parts.append("")
