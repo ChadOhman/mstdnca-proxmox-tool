@@ -1,8 +1,36 @@
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
+
+
+def _fmt_bytes(n):
+    """Render a byte count for the model (and the user) as e.g. '1.5 GiB'."""
+    try:
+        n = float(n or 0)
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
+def _pct(used, total):
+    return round(used / total * 100, 1) if total else None
+
+
+def _usage(used, total):
+    """{used, total, percent} in bytes plus a human-readable summary string."""
+    used = used or 0
+    total = total or 0
+    entry = {"used_bytes": used, "total_bytes": total, "percent": _pct(used, total)}
+    entry["human"] = f"{_fmt_bytes(used)} of {_fmt_bytes(total)}" + (
+        f" ({entry['percent']}%)" if entry["percent"] is not None else "")
+    return entry
 
 
 def _serialize_guest(guest):
@@ -14,6 +42,7 @@ def _serialize_guest(guest):
         "ip": guest.ip_address,
         "status": guest.status,
         "power_state": guest.power_state,
+        "lock": guest.lock_reason,
         "host": guest.proxmox_host.name if guest.proxmox_host else None,
         "vmid": guest.vmid,
         "pending_updates": len(guest.pending_updates()),
@@ -185,18 +214,321 @@ def _handle_list_audit_logs(tool_input, user):
     ])
 
 
+def _live_guest(guest, user):
+    """Resolve (client, node) for a guest's live Proxmox data, or an error dict."""
+    if not guest:
+        return None, None, {"error": "Guest not found"}
+    if not user.may_access_guest(guest):
+        return None, None, {"error": "Access denied"}
+    if not guest.proxmox_host or not guest.vmid:
+        return None, None, {"error": "Guest is not linked to a Proxmox host, so no live data is available"}
+    from clients.proxmox_api import ProxmoxClient
+    client = ProxmoxClient(guest.proxmox_host)
+    node = client.find_guest_node(guest.vmid)
+    if not node:
+        return None, None, {"error": f"Guest VMID {guest.vmid} was not found on host '{guest.proxmox_host.name}'"}
+    return client, node, None
+
+
+def _handle_get_guest_resource_usage(tool_input, user):
+    """Live CPU / memory / disk / network figures straight from the Proxmox API."""
+    from models import Guest
+    guest = Guest.query.get(tool_input["guest_id"])
+    client, node, err = _live_guest(guest, user)
+    if err:
+        return json.dumps(err)
+    data = client.get_guest_current(node, guest.vmid, guest.guest_type)
+    if not data:
+        return json.dumps({"error": "Proxmox did not return a status record for this guest"})
+
+    result = {
+        "guest_id": guest.id,
+        "name": guest.name,
+        "vmid": guest.vmid,
+        "type": guest.guest_type,
+        "host": guest.proxmox_host.name,
+        "node": node,
+        "status": data.get("status", "unknown"),
+        "uptime_seconds": data.get("uptime", 0),
+        "cpu_percent": round((data.get("cpu") or 0) * 100, 1),
+        "cpu_cores": data.get("cpus"),
+        "memory": _usage(data.get("mem"), data.get("maxmem")),
+        "disk": _usage(data.get("disk"), data.get("maxdisk")),
+        "network_in_bytes_total": data.get("netin", 0),
+        "network_out_bytes_total": data.get("netout", 0),
+    }
+    if data.get("maxswap"):
+        result["swap"] = _usage(data.get("swap"), data.get("maxswap"))
+    if data.get("lock"):
+        result["lock"] = data["lock"]
+    if result["status"] != "running":
+        result["note"] = "Guest is not running; usage figures are zero."
+    return json.dumps(result)
+
+
+def _handle_get_guest_performance_history(tool_input, user):
+    """Summarise Proxmox RRD history (avg / peak CPU and memory) for a guest."""
+    from models import Guest
+    guest = Guest.query.get(tool_input["guest_id"])
+    client, node, err = _live_guest(guest, user)
+    if err:
+        return json.dumps(err)
+    timeframe = tool_input.get("timeframe", "day")
+    if timeframe not in ("hour", "day", "week", "month", "year"):
+        return json.dumps({"error": f"Invalid timeframe: {timeframe}"})
+    rows = [r for r in (client.get_rrd_data(node, guest.vmid, guest.guest_type, timeframe=timeframe) or [])
+            if r.get("cpu") is not None or r.get("mem") is not None]
+    if not rows:
+        return json.dumps({"guest_id": guest.id, "name": guest.name, "timeframe": timeframe,
+                           "samples": 0, "note": "No performance history available"})
+
+    cpu = [(r.get("cpu") or 0) * 100 for r in rows]
+    mem = [r.get("mem") or 0 for r in rows]
+    maxmem = max((r.get("maxmem") or 0) for r in rows)
+    peak_idx = max(range(len(mem)), key=mem.__getitem__)
+    peak_at = rows[peak_idx].get("time")
+    return json.dumps({
+        "guest_id": guest.id,
+        "name": guest.name,
+        "timeframe": timeframe,
+        "samples": len(rows),
+        "cpu_percent": {"average": round(sum(cpu) / len(cpu), 1), "peak": round(max(cpu), 1)},
+        "memory": {
+            "total_bytes": maxmem,
+            "average": _usage(sum(mem) / len(mem), maxmem),
+            "peak": _usage(max(mem), maxmem),
+            "peak_at": datetime.fromtimestamp(peak_at, tz=timezone.utc).isoformat() if peak_at else None,
+        },
+        "network_average_bytes_per_second": {
+            "in": round(sum((r.get("netin") or 0) for r in rows) / len(rows)),
+            "out": round(sum((r.get("netout") or 0) for r in rows) / len(rows)),
+        },
+    })
+
+
+_POWER_ACTIONS = ("start", "shutdown", "stop", "reboot")
+_SNAPSHOT_ACTIONS = ("create", "delete", "rollback")
+# Proxmox snapshot names: a letter, then letters/digits/-/_ (kept short so the
+# model cannot smuggle anything odd into an API path segment).
+_SNAPNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+
+
+def _confirmation_required(tool, summary, **pending):
+    """Two-phase gate shared by the state-changing guest tools (see control_service)."""
+    return json.dumps({
+        "status": "confirmation_required",
+        "message": (
+            f"{summary} No action has been taken. To proceed, call {tool} again "
+            "with the same arguments plus \"confirm\": true."
+        ),
+        "pending_action": {"tool": tool, **pending},
+    })
+
+
+def _linked_guest(guest, user):
+    """DB-only checks shared by the guest action tools: exists, accessible, linked."""
+    if not guest:
+        return {"error": "Guest not found"}
+    if not user.may_access_guest(guest):
+        return {"error": "Access denied"}
+    if not guest.proxmox_host or not guest.vmid:
+        return {"error": "Guest is not linked to a Proxmox host"}
+    return None
+
+
+def _handle_control_guest_power(tool_input, user):
+    """start / shutdown / stop / reboot a guest, mirroring routes/guests.py::power_action."""
+    from auth.audit import log_action
+    from models import Guest, db
+
+    action = tool_input.get("action")
+    if action not in _POWER_ACTIONS:
+        return json.dumps({"error": f"Invalid action: {action}"})
+    guest = Guest.query.get(tool_input["guest_id"])
+    err = _linked_guest(guest, user)
+    if err:
+        return json.dumps(err)
+
+    if not tool_input.get("confirm"):
+        summary = (f"This will {action} '{guest.name}' ({guest.guest_type.upper()} {guest.vmid} on "
+                   f"{guest.proxmox_host.name}); it is currently {guest.power_state}.")
+        if guest.lock_reason:
+            summary += f" WARNING: the guest is locked ({guest.lock_reason})."
+        if action == "stop":
+            summary += " 'stop' is a hard power-off; prefer 'shutdown' unless the guest is unresponsive."
+        return _confirmation_required("control_guest_power", summary, guest_id=guest.id, guest=guest.name,
+                                      action=action, current_power_state=guest.power_state)
+
+    from clients.proxmox_api import ProxmoxClient
+    client = ProxmoxClient(guest.proxmox_host)
+    node = client.find_guest_node(guest.vmid) or guest.proxmox_host.name
+    ok, msg = getattr(client, f"{action}_guest")(node, guest.vmid, guest.guest_type)
+    if not ok:
+        logger.warning("AI power %s failed for guest %s: %s", action, guest.id, msg)
+        return json.dumps({"success": False,
+                           "message": f"Proxmox rejected the {action} command; details are in the server log."})
+
+    # Same optimistic state update as the human route.
+    if action == "start":
+        guest.power_state = "running"
+    elif action in ("shutdown", "stop"):
+        guest.power_state = "stopped"
+    if action == "reboot":
+        guest.reboot_required = False
+    log_action("guest_power", "guest", resource_id=guest.id, resource_name=guest.name,
+               details={"action": action, "via": "ai_assistant"})
+    db.session.commit()
+    return json.dumps({"success": True, "message": f"{action.capitalize()} command sent to {guest.name}."})
+
+
+def _handle_list_snapshots(tool_input, user):
+    from models import Guest
+    guest = Guest.query.get(tool_input["guest_id"])
+    client, node, err = _live_guest(guest, user)
+    if err:
+        return json.dumps(err)
+    snapshots = client.list_snapshots(node, guest.vmid, guest.guest_type)
+    return json.dumps({
+        "guest_id": guest.id,
+        "name": guest.name,
+        "snapshots_supported": bool(client.guest_supports_snapshot(node, guest.vmid, guest.guest_type)),
+        "count": len(snapshots),
+        "snapshots": [
+            {
+                "name": s.get("name"),
+                "description": s.get("description", ""),
+                "created_at": (datetime.fromtimestamp(s["snaptime"], tz=timezone.utc).isoformat()
+                               if s.get("snaptime") else None),
+                "parent": s.get("parent"),
+                "includes_ram": bool(s.get("vmstate")),
+            }
+            for s in snapshots
+        ],
+    })
+
+
+def _handle_manage_snapshot(tool_input, user):
+    """create / delete / rollback a snapshot, mirroring the routes/guests.py snapshot views."""
+    from auth.audit import log_action
+    from models import Guest, db
+
+    action = tool_input.get("action")
+    if action not in _SNAPSHOT_ACTIONS:
+        return json.dumps({"error": f"Invalid action: {action}"})
+    guest = Guest.query.get(tool_input["guest_id"])
+    err = _linked_guest(guest, user)
+    if err:
+        return json.dumps(err)
+
+    snapname = (tool_input.get("snapname") or "").strip()
+    if action == "create" and not snapname:
+        snapname = f"manual-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    if not snapname:
+        return json.dumps({"error": "snapname is required"})
+    if not _SNAPNAME_RE.match(snapname):
+        return json.dumps({"error": "Invalid snapshot name: start with a letter, then letters, digits, "
+                                    "'-' or '_' only, at most 40 characters"})
+    description = (tool_input.get("description") or "").strip()
+
+    if not tool_input.get("confirm"):
+        summaries = {
+            "create": f"This will create snapshot '{snapname}' of '{guest.name}'.",
+            "delete": f"This will permanently delete snapshot '{snapname}' of '{guest.name}'. This cannot be undone.",
+            "rollback": (f"This will roll '{guest.name}' back to snapshot '{snapname}', discarding every change "
+                         "made since it was taken. This cannot be undone."),
+        }
+        pending = {"guest_id": guest.id, "guest": guest.name, "action": action, "snapname": snapname}
+        if action == "create":
+            pending["description"] = description
+        return _confirmation_required("manage_snapshot", summaries[action], **pending)
+
+    client, node, err = _live_guest(guest, user)
+    if err:
+        return json.dumps(err)
+    if action == "create":
+        if not client.guest_supports_snapshot(node, guest.vmid, guest.guest_type):
+            return json.dumps({"error": "This guest's storage does not support snapshots"})
+        ok, result = client.create_snapshot(node, guest.vmid, guest.guest_type, snapname, description)
+        job_type, audit_action = "snapshot", "guest_snapshot_create"
+    elif action == "delete":
+        ok, result = client.delete_snapshot(node, guest.vmid, guest.guest_type, snapname)
+        job_type, audit_action = "snapshot_delete", "guest_snapshot_delete"
+    else:
+        ok, result = client.rollback_snapshot(node, guest.vmid, guest.guest_type, snapname)
+        job_type, audit_action = "rollback", "guest_snapshot_rollback"
+    if not ok:
+        logger.warning("AI snapshot %s failed for guest %s: %s", action, guest.id, result)
+        return json.dumps({"success": False,
+                           "message": f"Proxmox rejected the snapshot {action}; details are in the server log."})
+
+    log_action(audit_action, "guest", resource_id=guest.id, resource_name=guest.name,
+               details={"snapname": snapname, "via": "ai_assistant"})
+    db.session.commit()
+    # Register the Proxmox task so the guest page's task tracker follows it.
+    from routes.api import start_proxmox_job
+    start_proxmox_job(guest, job_type, result, node)
+    return json.dumps({
+        "success": True,
+        "message": f"Snapshot {action} of '{snapname}' started on {guest.name}; Proxmox is running it as a task.",
+        "task": result,
+    })
+
+
+def _live_host_status(host):
+    """Live node status (and storage pools for PVE) for one host. Raises on failure."""
+    if host.is_pbs:
+        from clients.pbs_client import PBSClient
+        return PBSClient(host).get_node_status(), None
+    from clients.proxmox_api import ProxmoxClient
+    client = ProxmoxClient(host)
+    node_name = client.get_local_node_name()
+    if not node_name:
+        return None, None
+    return client.get_node_status(node_name), client.get_node_storage(node_name)
+
+
 def _handle_get_host_status(tool_input, user):
     from models import ProxmoxHost
-    hosts = ProxmoxHost.query.all()
+    host_id = tool_input.get("host_id")
+    hosts = ProxmoxHost.query.filter_by(id=host_id).all() if host_id else ProxmoxHost.query.all()
+    if host_id and not hosts:
+        return json.dumps({"error": "Host not found"})
     result = []
     for host in hosts:
-        result.append({
+        entry = {
             "id": host.id,
             "name": host.name,
             "hostname": host.hostname,
             "type": host.host_type,
             "guest_count": len(host.guests),
-        })
+            "online": False,
+        }
+        try:
+            status, storages = _live_host_status(host)
+        except Exception:
+            logger.warning("AI host status: live query failed for %s", host.name, exc_info=True)
+            status, storages = None, None
+        if status:
+            entry["online"] = True
+            entry["cpu_percent"] = status.get("cpu_usage")
+            entry["cpu_threads"] = status.get("cpu_threads")
+            entry["loadavg"] = status.get("loadavg")
+            entry["memory"] = _usage(status.get("memory_used"), status.get("memory_total"))
+            entry["swap"] = _usage(status.get("swap_used"), status.get("swap_total"))
+            entry["rootfs"] = _usage(status.get("rootfs_used"), status.get("rootfs_total"))
+            entry["uptime_seconds"] = status.get("uptime", 0)
+            entry["version"] = status.get("pveversion") or status.get("pbsversion") or ""
+        if storages:
+            entry["storage"] = [
+                {
+                    "name": st["name"],
+                    "type": st["type"],
+                    "active": bool(st.get("active")),
+                    **_usage(st.get("used"), st.get("total")),
+                }
+                for st in storages
+            ]
+        result.append(entry)
     return json.dumps(result)
 
 
@@ -236,6 +568,103 @@ TOOL_REGISTRY = {
         },
         "required_permission": None,
         "handler": _handle_get_guest_updates,
+    },
+    "get_guest_resource_usage": {
+        "description": (
+            "Get LIVE resource usage for a guest straight from Proxmox: current CPU %, memory used/total, "
+            "disk used/total, swap (containers), uptime and network totals. Use this whenever the user asks "
+            "how much memory, CPU or disk a VM or container is using right now."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+            },
+            "required": ["guest_id"],
+        },
+        "required_permission": None,
+        "handler": _handle_get_guest_resource_usage,
+    },
+    "get_guest_performance_history": {
+        "description": (
+            "Summarise a guest's recent performance from Proxmox history: average and peak CPU % and memory "
+            "over the last hour, day, week, month or year, with when memory peaked. Use for questions like "
+            "'has it been busy today' or 'did it run out of memory overnight'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+                "timeframe": {
+                    "type": "string",
+                    "enum": ["hour", "day", "week", "month", "year"],
+                    "description": "How far back to summarise (default: day)",
+                },
+            },
+            "required": ["guest_id"],
+        },
+        "required_permission": None,
+        "handler": _handle_get_guest_performance_history,
+    },
+    "control_guest_power": {
+        "description": (
+            "Start, gracefully shut down, force-stop or reboot a VM or container. State-changing: the first "
+            "call returns a confirmation-required preview without doing anything; call again with "
+            "\"confirm\": true after the user approves. Prefer 'shutdown' over 'stop' (hard power-off)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+                "action": {"type": "string", "enum": list(_POWER_ACTIONS), "description": "The power action"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Set to true only after the user has explicitly confirmed the action.",
+                },
+            },
+            "required": ["guest_id", "action"],
+        },
+        "required_permission": "can_manage_guests",
+        "handler": _handle_control_guest_power,
+    },
+    "list_snapshots": {
+        "description": "List a guest's Proxmox snapshots (name, description, when taken, parent, whether RAM was included).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+            },
+            "required": ["guest_id"],
+        },
+        "required_permission": None,
+        "handler": _handle_list_snapshots,
+    },
+    "manage_snapshot": {
+        "description": (
+            "Create, delete or roll back to a Proxmox snapshot of a guest. State-changing: the first call returns "
+            "a confirmation-required preview without doing anything; call again with \"confirm\": true after the "
+            "user approves. Delete and rollback are irreversible. For create, snapname defaults to "
+            "manual-<timestamp>."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "guest_id": {"type": "integer", "description": "The ID of the guest (from list_guests, not the VMID)"},
+                "action": {"type": "string", "enum": list(_SNAPSHOT_ACTIONS), "description": "What to do"},
+                "snapname": {
+                    "type": "string",
+                    "description": "Snapshot name (required for delete/rollback; optional for create)",
+                },
+                "description": {"type": "string", "description": "Optional description for a new snapshot"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Set to true only after the user has explicitly confirmed the action.",
+                },
+            },
+            "required": ["guest_id", "action"],
+        },
+        "required_permission": "can_manage_guests",
+        "handler": _handle_manage_snapshot,
     },
     "list_services": {
         "description": "List all monitored services across all accessible guests, with their current status.",
@@ -293,10 +722,16 @@ TOOL_REGISTRY = {
         "handler": _handle_list_audit_logs,
     },
     "get_host_status": {
-        "description": "List all Proxmox hosts with their type and guest counts.",
+        "description": (
+            "List Proxmox PVE/PBS hosts with LIVE node status: online/offline, CPU %, load average, memory, "
+            "swap and root filesystem usage, uptime, version, and (PVE) every storage pool's usage and whether "
+            "it is active. Pass host_id to query one host."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "host_id": {"type": "integer", "description": "Optional: only this host (from a previous listing)"},
+            },
             "required": [],
         },
         "required_permission": "can_view_hosts",

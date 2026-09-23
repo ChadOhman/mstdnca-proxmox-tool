@@ -333,6 +333,21 @@ class ProxmoxClient:
             logger.warning("CT status lookup failed for CT %s on %s: %s", vmid, node, e)
             return None, f"CT status lookup failed: {describe_exception(e)}"
 
+    def get_guest_current(self, node, vmid, guest_type):
+        """Return the guest's current status record (status, cpu, mem, disk, uptime, ...).
+
+        This is the raw ``status/current`` payload: ``mem``/``maxmem``, ``disk``/
+        ``maxdisk``, ``netin``/``netout`` are bytes, ``cpu`` is a 0-1 fraction,
+        ``uptime`` is seconds. Returns None when the lookup fails.
+        """
+        try:
+            if guest_type == "vm":
+                return self.api.nodes(node).qemu(vmid).status.current.get()
+            return self.api.nodes(node).lxc(vmid).status.current.get()
+        except Exception as e:
+            logger.debug(f"Could not get current status for {guest_type}/{vmid}: {e}")
+            return None
+
     def get_guest_status(self, node, vmid, guest_type):
         """Get current power status of a guest. Returns status string or 'unknown'."""
         try:
