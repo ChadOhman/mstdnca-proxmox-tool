@@ -36,7 +36,10 @@ def build_system_prompt(user, page_context=None):
         "list_guests and get_guest_details report the last package scan stored in the database; for live "
         "CPU, memory, disk or uptime call get_guest_resource_usage (now) or get_guest_performance_history "
         "(averages and peaks), and get_host_status for a host's own resources and storage pools. Byte values "
-        "come with a ready-made 'human' string; quote that rather than raw bytes.",
+        "come with a ready-made 'human' string; quote that rather than raw bytes. For anything about the "
+        "physical network (which switch or AP a machine is on, Wi-Fi signal, WAN status, unknown devices) "
+        "use the list_unifi_* and get_unifi_health tools; list_unifi_clients links a client back to its "
+        "guest here when the MAC matches.",
         "",
         "Keep responses concise and actionable. The chat panel renders only headings, bold, italics, inline "
         "code, fenced code blocks and '- ' bullet lists; it does not render tables, so use bullets instead.",

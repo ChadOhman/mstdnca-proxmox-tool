@@ -532,6 +532,179 @@ def _handle_get_host_status(tool_input, user):
     return json.dumps(result)
 
 
+# ---- UniFi lookups (read-only; scoped exactly like routes/unifi.py) ----
+
+_UNIFI_DEVICE_STATES = {0: "offline", 1: "online", 2: "pending adoption", 4: "upgrading",
+                        5: "provisioning", 6: "heartbeat missed", 7: "adopting", 9: "isolated"}
+_UNIFI_MAX_CLIENTS = 100
+
+
+def _unifi_client():
+    """(client, None) when UniFi is enabled and configured, else (None, error dict)."""
+    from models import Setting
+    if Setting.get("unifi_enabled", "false") != "true":
+        return None, {"error": "UniFi integration is not enabled"}
+    from routes.unifi import _get_unifi_client
+    client = _get_unifi_client()
+    if not client:
+        return None, {"error": "UniFi controller is not configured (Settings > UniFi)"}
+    return client, None
+
+
+def _unifi_scope(items, user):
+    """Apply the site subnet filter and the user's tag-linked network restriction, as the UniFi pages do."""
+    from models import Setting
+    from routes.unifi import _filter_by_subnet, _get_accessible_networks
+    items = _filter_by_subnet(items, "ip", Setting.get("unifi_filter_subnet", ""))
+    networks = _get_accessible_networks(user)
+    if networks is not None:
+        items = [c for c in items if c.get("network", "") in networks]
+    return items
+
+
+def _iso_from_epoch(value):
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).isoformat() if value else None
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _serialize_unifi_device(d):
+    uplink = d.get("uplink") or {}
+    state = d.get("state", 0)
+    return {
+        "name": d.get("name"),
+        "mac": d.get("mac"),
+        "ip": d.get("ip"),
+        "model": d.get("model"),
+        "type": d.get("type"),
+        "state": _UNIFI_DEVICE_STATES.get(state, f"state {state}"),
+        "adopted": bool(d.get("adopted")),
+        "version": d.get("version"),
+        "uptime_seconds": d.get("uptime", 0),
+        "cpu_percent": d.get("cpu"),
+        "memory_percent": d.get("mem"),
+        "temperature_c": d.get("temperature"),
+        "connected_clients": d.get("num_sta", 0),
+        "uplink": {"type": uplink.get("type"), "speed_mbps": uplink.get("speed")},
+        "ports_up": sum(1 for p in d.get("port_table") or [] if p.get("up")),
+        "radios": [{"radio": r.get("radio"), "channel": r.get("channel"), "clients": r.get("num_sta"),
+                    "utilisation_percent": r.get("cu_total")} for r in d.get("radio_table") or []],
+    }
+
+
+def _serialize_unifi_client(c, device_names, guest_by_mac):
+    mac = (c.get("mac") or "").lower()
+    via_mac = ((c.get("ap_mac") or c.get("sw_mac")) or "").lower()
+    guest = guest_by_mac.get(mac)
+    entry = {
+        "hostname": c.get("hostname"),
+        "ip": c.get("ip"),
+        "mac": mac,
+        "network": c.get("network"),
+        "connection": "wired" if c.get("is_wired") else "wireless",
+        "connected_to": device_names.get(via_mac) or via_mac or None,
+        "switch_port": c.get("sw_port"),
+        "ssid": c.get("essid"),
+        "signal_dbm": c.get("signal"),
+        "satisfaction_percent": c.get("satisfaction"),
+        "uptime_seconds": c.get("uptime", 0),
+        "last_seen": _iso_from_epoch(c.get("last_seen")),
+        "blocked": bool(c.get("blocked")),
+        "is_guest": bool(c.get("is_guest")),
+        "vendor": c.get("oui") or None,
+    }
+    if guest is not None:
+        entry["guest_id"] = guest.id
+        entry["guest_name"] = guest.name
+    return entry
+
+
+def _handle_list_unifi_devices(tool_input, user):
+    client, err = _unifi_client()
+    if err:
+        return json.dumps(err)
+    from models import Setting
+    from routes.unifi import _filter_by_subnet
+    devices = _filter_by_subnet(client.get_devices() or [], "ip", Setting.get("unifi_filter_subnet", ""))
+    devices.sort(key=lambda d: (d.get("name") or "").lower())
+    return json.dumps({"count": len(devices), "devices": [_serialize_unifi_device(d) for d in devices]})
+
+
+def _handle_list_unifi_clients(tool_input, user):
+    client, err = _unifi_client()
+    if err:
+        return json.dumps(err)
+    from models import Guest
+
+    clients = client.get_clients() or []
+    if tool_input.get("include_offline"):
+        seen = {(c.get("mac") or "").lower() for c in clients}
+        for c in client.get_all_clients(within=720) or []:
+            if (c.get("mac") or "").lower() not in seen:
+                c["offline"] = True
+                clients.append(c)
+    clients = _unifi_scope(clients, user)
+
+    query = (tool_input.get("query") or "").strip().lower()
+    if query:
+        fields = ("hostname", "ip", "mac", "network", "essid", "oui")
+        clients = [c for c in clients if any(query in str(c.get(f) or "").lower() for f in fields)]
+
+    device_names = {(d.get("mac") or "").lower(): d.get("name") for d in client.get_devices() or []}
+    macs = [(c.get("mac") or "").lower() for c in clients if c.get("mac")]
+    guest_by_mac = {}
+    if macs:
+        for g in Guest.query.filter(Guest.mac_address.isnot(None)).all():
+            if g.mac_address.lower() in macs and user.may_access_guest(g):
+                guest_by_mac[g.mac_address.lower()] = g
+
+    clients.sort(key=lambda c: (bool(c.get("offline")), (c.get("hostname") or "").lower()))
+    total = len(clients)
+    clients = clients[:_UNIFI_MAX_CLIENTS]
+    result = []
+    for c in clients:
+        entry = _serialize_unifi_client(c, device_names, guest_by_mac)
+        if c.get("offline"):
+            entry["online"] = False
+        result.append(entry)
+    return json.dumps({"count": total, "truncated": total > len(result), "clients": result})
+
+
+def _handle_get_unifi_health(tool_input, user):
+    client, err = _unifi_client()
+    if err:
+        return json.dumps(err)
+    subsystems = {}
+    for sub in client.get_site_health() or []:
+        name = sub.get("subsystem")
+        if not name:
+            continue
+        entry = {"status": sub.get("status")}
+        for key in ("num_user", "num_guest", "num_iot", "num_ap", "num_sw", "num_gw", "num_adopted",
+                    "num_disconnected", "num_pending"):
+            if sub.get(key) is not None:
+                entry[key] = sub[key]
+        if name.startswith("wan"):
+            gw_stats = sub.get("gw_system-stats") or sub.get("gw_system_stats") or {}
+            entry["wan_ip"] = sub.get("wan_ip") or sub.get("gw") or sub.get("ip")
+            entry["isp"] = sub.get("isp_name") or sub.get("isp_organization") or sub.get("ISP")
+            entry["latency_ms"] = next((sub[k] for k in ("latency", "internet_latency", "wan1_latency",
+                                                          "latency_average") if sub.get(k)), None)
+            entry["uptime_seconds"] = sub.get("uptime") or sub.get("wan_uptime") or gw_stats.get("uptime")
+            entry["speedtest_download_mbps"] = sub.get("speedtest_lastrun_download") or sub.get("xput_down")
+            entry["speedtest_upload_mbps"] = sub.get("speedtest_lastrun_upload") or sub.get("xput_up")
+        subsystems[name] = entry
+    return json.dumps({
+        "subsystems": subsystems,
+        "networks": [{"name": n.get("name"), "purpose": n.get("purpose"), "vlan": n.get("vlan")}
+                     for n in client.get_networks() or []],
+        "wlans": [{"name": w.get("name"), "enabled": bool(w.get("enabled", True)), "security": w.get("security"),
+                   "band": w.get("wlan_band"), "is_guest": bool(w.get("is_guest"))}
+                  for w in client.get_wlan_conf() or []],
+    })
+
+
 # ---- Tool registry ----
 
 TOOL_REGISTRY = {
@@ -736,6 +909,42 @@ TOOL_REGISTRY = {
         },
         "required_permission": "can_view_hosts",
         "handler": _handle_get_host_status,
+    },
+    "list_unifi_devices": {
+        "description": (
+            "List UniFi network devices (access points, switches, gateways) with online state, model, firmware, "
+            "uptime, CPU/memory/temperature, connected client count, uplink and radio utilisation."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "required_permission": "can_view_unifi",
+        "handler": _handle_list_unifi_devices,
+    },
+    "list_unifi_clients": {
+        "description": (
+            "Find devices on the network as UniFi sees them: hostname, IP, MAC, network/VLAN, wired or wireless, "
+            "which AP or switch (and port) they are on, SSID, signal, last seen, blocked/guest flags, and the "
+            "matching guest here when a VM/CT has that MAC. Filter with query (substring of hostname, IP, MAC, "
+            "network, SSID or vendor). include_offline adds clients seen in the last 30 days."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Case-insensitive substring to match"},
+                "include_offline": {"type": "boolean", "description": "Also list clients not currently connected"},
+            },
+            "required": [],
+        },
+        "required_permission": "can_view_unifi",
+        "handler": _handle_list_unifi_clients,
+    },
+    "get_unifi_health": {
+        "description": (
+            "UniFi site health: per-subsystem status (wan, lan, wlan, vpn) with device and client counts, WAN IP, "
+            "ISP, latency, uptime and last speedtest, plus the configured networks/VLANs and SSIDs."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "required_permission": "can_view_unifi",
+        "handler": _handle_get_unifi_health,
     },
 }
 
