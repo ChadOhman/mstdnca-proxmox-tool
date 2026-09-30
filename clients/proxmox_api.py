@@ -325,6 +325,9 @@ class ProxmoxClient:
     # runs the command detached with its output in a per-run file inside the
     # guest and tails that file with short guest-execs.
     GUEST_EXEC_POLL_FAILURES = 5
+    # QGA runs as root, so /run (root-only tmpfs, cleared on reboot) holds the
+    # per-run files; /tmp would be shared with every user in the guest.
+    GUEST_EXEC_DIR = "/run"
 
     def exec_guest_agent_streaming(self, node, vmid, command, callback, timeout=1800,
                                    stop_fn=None, poll_interval=2):
@@ -339,7 +342,7 @@ class ProxmoxClient:
         reported through ``callback``.
         """
         token = secrets.token_hex(6)
-        base = f"/tmp/lambnet-exec-{token}"
+        base = f"{self.GUEST_EXEC_DIR}/lambnet-exec-{token}"
         log_f, rc_f, pid_f, script_f = f"{base}.log", f"{base}.rc", f"{base}.pid", f"{base}.sh"
         script = (
             "#!/bin/sh\n"
