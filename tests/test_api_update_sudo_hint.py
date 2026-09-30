@@ -7,6 +7,7 @@ should not bother running the upgrade once apt-get update has already been
 refused for that reason.
 """
 import routes.api as api_mod
+from core.scanner import apt_upgrade_command
 from models import Credential, Guest, db
 
 SUDO_REFUSAL = (
@@ -116,7 +117,7 @@ def test_ordinary_apt_failure_has_no_hint(app, monkeypatch):
         job = _run(app, monkeypatch, guest_id, "_sh-guest-plain", FakeSSH)
         assert job.success is False
         # A non-sudo failure of apt-get update still lets the upgrade run, as before.
-        assert commands == ["apt-get update", "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"]
+        assert commands == ["apt-get update", apt_upgrade_command()]
         assert "[Hint]" not in job.log
     finally:
         _cleanup(app, guest_id, cred_id)

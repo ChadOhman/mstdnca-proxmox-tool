@@ -6,7 +6,7 @@ is not proof that every pending package was installed.  apply_updates re-reads
 """
 from unittest.mock import MagicMock, patch
 
-from core.scanner import apply_updates
+from core.scanner import apply_updates, apt_upgrade_command
 from models import Credential, Guest, ProxmoxHost, UpdatePackage, db
 
 
@@ -153,7 +153,7 @@ class TestApplyUpdatesAgentPath:
             assert len(upgrade_calls) == 1
             # The env-var prefix is not a program name — it must go through a shell.
             assert upgrade_calls[0].startswith("sh -c ")
-            assert "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y" in upgrade_calls[0]
+            assert apt_upgrade_command() in upgrade_calls[0]
 
     def test_agent_kept_back_packages_stay_pending(self, app):
         guest_id = _make_guest(app, "agentkeptback", ["curl", "vim"],

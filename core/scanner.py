@@ -563,6 +563,32 @@ APT_CHECK_CMD = "apt-get update -qq 2>/dev/null && apt-get -s upgrade 2>/dev/nul
 APT_LIST_CMD = "apt list --upgradable 2>/dev/null"
 APT_SECURITY_CMD = "apt-get -s upgrade 2>/dev/null | grep -i security"
 
+# dpkg conffile prompts ("Configuration file ... Y/I/N/O/D/Z ?") are asked by
+# dpkg itself, not debconf, so DEBIAN_FRONTEND=noninteractive alone does not
+# stop them.  Over SSH or the guest agent nobody can answer, and the job hangs
+# until its timeout.  --force-confdef takes dpkg's default where one exists and
+# --force-confold keeps the locally modified file otherwise, which is what an
+# operator pressing Enter at the prompt would get.
+APT_NONINTERACTIVE_OPTS = (
+    "-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+)
+
+# A job killed mid-install (the timeout above, a dropped SSH session, a guest
+# reboot) leaves dpkg "interrupted", and every later apt-get run refuses with
+# "you must manually run 'dpkg --configure -a'".  Finish that configuration
+# first, with the same conffile policy; it is a no-op when nothing is pending.
+DPKG_REPAIR_CMD = "DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confdef --force-confold"
+
+
+def apt_upgrade_command(dist_upgrade=False):
+    """Return the unattended apt upgrade command used by every apply path.
+
+    Repairs an interrupted dpkg before upgrading.  Contains no quotes, so
+    callers may wrap it in ``sh -c '...'`` as-is.
+    """
+    verb = "dist-upgrade" if dist_upgrade else "upgrade"
+    return f"{DPKG_REPAIR_CMD} && DEBIAN_FRONTEND=noninteractive apt-get {verb} -y {APT_NONINTERACTIVE_OPTS}"
+
 
 def parse_upgradable(output):
     """Parse 'apt list --upgradable' output into package dicts."""
@@ -2389,7 +2415,7 @@ import sys
 try:
     from argostranslate import package as _pkg
     def _norm(v): return str(v).replace('_', '.').strip().lower() if v else ''
-    print(json.dumps({'type': 'status', 'message': 'Updating package index\u2026'}), flush=True)
+    print(json.dumps({'type': 'status', 'message': 'Updating package index\\u2026'}), flush=True)
     _pkg.update_package_index()
     _avail = {(p.from_code, p.to_code): p for p in _pkg.get_available_packages()}
     _to_update = []
@@ -2739,7 +2765,7 @@ def _reconcile_applied_updates(guest, upgradable_output):
 
 def apply_updates(guest, dist_upgrade=False):
     """Apply pending updates to a guest."""
-    cmd = "DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y" if dist_upgrade else "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
+    cmd = apt_upgrade_command(dist_upgrade)
 
     logger.info(f"Applying updates to {guest.name} (dist_upgrade={dist_upgrade})...")
 

@@ -8,6 +8,7 @@ from flask_login import current_user, login_required
 from auth.audit import log_action
 from auth.credential_store import encrypt
 from clients.proxmox_api import ProxmoxClient
+from core.scanner import apt_upgrade_command
 from models import AuditLog, Credential, Guest, HostUpdatePackage, ProxmoxHost, Tag, db
 
 # In-memory state for SSH-based apt apply jobs
@@ -753,7 +754,7 @@ def _run_apply(host_id, app_ctx):
                 success = False
             else:
                 client = SSHClient.from_credential(host.hostname, credential_model)
-                cmd = "DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade 2>&1"
+                cmd = f"{apt_upgrade_command(dist_upgrade=True)} 2>&1"
                 exit_code = client.execute_streaming(cmd, _append, timeout=1800, stop_fn=_stop_fn)
                 success = exit_code == 0
         except Exception as e:

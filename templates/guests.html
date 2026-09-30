@@ -40,10 +40,24 @@
             </button>
         </form>
         {% if current_user.can_update %}
+        {#- The bulk update follows the tag dropdown above: only guests in the
+            selected scope are targeted, so the button and confirm name it. -#}
+        {%- if current_tag == '__my_tags__' %}
+            {%- set update_scope = 'guests in My Tags' %}
+        {%- elif current_tag %}
+            {%- set update_scope = 'guests tagged "' ~ current_tag ~ '"' %}
+        {%- else %}
+            {%- set update_scope = 'ALL guests' %}
+        {%- endif %}
         <form method="post" action="/api/apply-all" class="d-inline"
-              data-confirm="Apply OS updates to ALL guests that have updates available? Guests are updated one at a time.">
+              data-confirm="Apply OS updates to {{ update_scope }} that have updates available? Guests are updated one at a time.">
+            <input type="hidden" name="tag" value="{{ current_tag or '' }}">
             <button type="submit" class="btn btn-outline-warning">
-                <i class="bi bi-cloud-download"></i> Update All Guests
+                <i class="bi bi-cloud-download"></i>
+                {%- if current_tag == '__my_tags__' %} Update My Guests
+                {%- elif current_tag %} Update {{ current_tag }} Guests
+                {%- else %} Update All Guests
+                {%- endif %}
             </button>
         </form>
         {% endif %}
