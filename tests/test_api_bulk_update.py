@@ -116,6 +116,89 @@ class TestApplyAllTargetSelection:
             _cleanup_guests(app, g_ok, g_utd, g_stopped, g_nopkg)
             _reset_bulk()
 
+    def test_tag_filter_scopes_targets(self, app, auth_client, monkeypatch):
+        """The guests page posts its active tag; only guests with that tag are updated."""
+        g_prod = _make_guest(app, "_bulk-g-tag-prod", pending=1, tag_names=["_bulk-prod"])
+        g_lab = _make_guest(app, "_bulk-g-tag-lab", pending=1, tag_names=["_bulk-lab"])
+        g_untagged = _make_guest(app, "_bulk-g-tag-none", pending=1)
+        _reset_bulk()
+        monkeypatch.setattr(api_mod, "_run_bulk_update", lambda *a, **k: None)
+        try:
+            resp = auth_client.post("/api/apply-all", data={"tag": "_bulk-prod"},
+                                    follow_redirects=False)
+            assert resp.status_code == 302
+            assert "/api/apply-all/progress" in resp.headers["Location"]
+            with _bulk_update_lock:
+                assert {i["name"] for i in _bulk_update["items"]} == {"_bulk-g-tag-prod"}
+            with app.app_context():
+                row = (AuditLog.query.filter_by(action="guest_update_all")
+                       .order_by(AuditLog.id.desc()).first())
+                assert row.details["tag"] == "_bulk-prod"
+                assert row.details["targets"] == 1
+        finally:
+            _cleanup_guests(app, g_prod, g_lab, g_untagged)
+            _reset_bulk()
+
+    def test_empty_tag_filter_targets_every_guest(self, app, auth_client, monkeypatch):
+        """'All Tags' posts an empty tag and keeps the original behaviour."""
+        g_prod = _make_guest(app, "_bulk-g-all-prod", pending=1, tag_names=["_bulk-prod"])
+        g_untagged = _make_guest(app, "_bulk-g-all-none", pending=1)
+        _reset_bulk()
+        monkeypatch.setattr(api_mod, "_run_bulk_update", lambda *a, **k: None)
+        try:
+            auth_client.post("/api/apply-all", data={"tag": ""}, follow_redirects=False)
+            with _bulk_update_lock:
+                names = {i["name"] for i in _bulk_update["items"]}
+            assert {"_bulk-g-all-prod", "_bulk-g-all-none"} <= names
+        finally:
+            _cleanup_guests(app, g_prod, g_untagged)
+            _reset_bulk()
+
+    def test_my_tags_filter_uses_the_users_own_tags(self, app, client, monkeypatch):
+        """'My Tags' resolves against the *caller's* tags, not a literal tag name."""
+        g_mine = _make_guest(app, "_bulk-g-mine", pending=1, tag_names=["_bulk-mine"])
+        g_other = _make_guest(app, "_bulk-g-other", pending=1, tag_names=["_bulk-other"])
+        with app.app_context():
+            # Tag-scoped operator: may update, sees only guests carrying its tags.
+            role = Role.query.filter(Role.can_update.is_(True), Role.level < 3).first()
+            assert role is not None
+            u = User(username="_bulk_mytags_op", display_name="Op", role_id=role.id)
+            u.set_password("OperatorPass123!")
+            u.allowed_tags.append(Tag.query.filter_by(name="_bulk-mine").one())
+            db.session.add(u)
+            db.session.commit()
+        _reset_bulk()
+        monkeypatch.setattr(api_mod, "_run_bulk_update", lambda *a, **k: None)
+        client.post("/login", data={"username": "_bulk_mytags_op", "password": "OperatorPass123!"})
+        try:
+            resp = client.post("/api/apply-all", data={"tag": "__my_tags__"}, follow_redirects=False)
+            assert resp.status_code == 302
+            with _bulk_update_lock:
+                assert {i["name"] for i in _bulk_update["items"]} == {"_bulk-g-mine"}
+        finally:
+            with app.app_context():
+                u = User.query.filter_by(username="_bulk_mytags_op").first()
+                if u:
+                    u.allowed_tags.clear()
+                    db.session.delete(u)
+                    db.session.commit()
+            _cleanup_guests(app, g_mine, g_other)
+            _reset_bulk()
+
+    def test_no_matching_tag_redirects_with_scoped_message(self, app, auth_client, monkeypatch):
+        g = _make_guest(app, "_bulk-g-tag-miss", pending=1, tag_names=["_bulk-prod"])
+        _reset_bulk()
+        monkeypatch.setattr(api_mod, "_run_bulk_update", lambda *a, **k: None)
+        try:
+            resp = auth_client.post("/api/apply-all", data={"tag": "_bulk-nomatch"},
+                                    follow_redirects=True)
+            assert b"_bulk-nomatch" in resp.data
+            with _bulk_update_lock:
+                assert _bulk_update["running"] is False
+        finally:
+            _cleanup_guests(app, g)
+            _reset_bulk()
+
     def test_no_eligible_guests_redirects_to_guests(self, app, auth_client, monkeypatch):
         g = _make_guest(app, "_bulk-g-none", status="up-to-date",
                         power_state="running", pending=0)

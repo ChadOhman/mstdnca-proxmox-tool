@@ -10,7 +10,7 @@ from flask_login import current_user, login_required
 
 from auth.audit import log_action
 from core.notifier import send_update_notification
-from core.scanner import scan_guest
+from core.scanner import apt_upgrade_command, scan_guest
 from models import Guest, ProxmoxHost, Setting, Tag, db
 
 logger = logging.getLogger(__name__)
@@ -133,11 +133,7 @@ def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None)
             job.finish(False)
             return
 
-        cmd = (
-            "DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y"
-            if dist_upgrade
-            else "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
-        )
+        cmd = apt_upgrade_command(dist_upgrade)
 
         try:
             # SSH path — preferred for updates (streaming output, long timeout support).
@@ -807,11 +803,20 @@ def apply_all():
 
     dist_upgrade = request.form.get("dist_upgrade") == "1"
 
+    # The guests page posts its active tag dropdown value so "Update All" acts
+    # on the guests the operator is looking at, using the same filter semantics
+    # as routes/guests.py: '__my_tags__' -> the user's own tags, a name -> that
+    # tag, '' (or absent) -> every guest.
+    tag_filter = (request.form.get("tag") or "").strip()
+
     # Only enabled, running guests flagged with updates available.
-    candidates = (Guest.query
-                  .filter_by(enabled=True, status="updates-available", power_state="running")
-                  .order_by(Guest.name)
-                  .all())
+    query = Guest.query.filter_by(enabled=True, status="updates-available", power_state="running")
+    if tag_filter == "__my_tags__":
+        user_tag_names = [t.name for t in current_user.allowed_tags]
+        query = query.filter(Guest.tags.any(Tag.name.in_(user_tag_names)))
+    elif tag_filter:
+        query = query.filter(Guest.tags.any(Tag.name == tag_filter))
+    candidates = query.order_by(Guest.name).all()
 
     targets = []
     for guest in candidates:
@@ -823,7 +828,9 @@ def apply_all():
         targets.append(guest)
 
     if not targets:
-        flash("No guests with pending updates are available to update.", "info")
+        scope = (" in your tags" if tag_filter == "__my_tags__"
+                 else f" tagged '{tag_filter}'" if tag_filter else "")
+        flash(f"No guests{scope} with pending updates are available to update.", "info")
         return redirect(url_for("guests.index"))
 
     items = [{"guest_id": g.id, "name": g.name, "state": "pending", "reason": None} for g in targets]
@@ -847,7 +854,7 @@ def apply_all():
         log_action("guest_update", "guest", resource_id=guest.id, resource_name=guest.name,
                    details={"dist_upgrade": dist_upgrade, "bulk": True})
     log_action("guest_update_all", "system", resource_name="all guests",
-               details={"targets": len(targets), "dist_upgrade": dist_upgrade})
+               details={"targets": len(targets), "dist_upgrade": dist_upgrade, "tag": tag_filter or None})
     db.session.commit()
 
     from flask import current_app
