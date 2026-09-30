@@ -257,13 +257,27 @@ def _run_update_background(app, guest_id, dist_upgrade=False, initiated_by=None)
 
                     if node:
                         # Run update + upgrade as a single command to avoid guest agent
-                        # channel issues (broken pipe) between sequential exec calls
-                        combined = f"sh -c 'apt-get update && {cmd}'"
-                        job.append(f"$ apt-get update && {cmd}\n")
-                        stdout, err = client.exec_guest_agent(node, guest.vmid, combined, timeout=600)
+                        # channel issues (broken pipe) between sequential exec calls.
+                        # Streamed via a log file in the guest: plain guest-exec only
+                        # returns output once the process exits, which made a long
+                        # apt run indistinguishable from a hang.
+                        combined = f"apt-get update && {cmd}"
+                        job.append(f"$ {combined}\n")
+                        exit_code = client.exec_guest_agent_streaming(
+                            node, guest.vmid, combined, job.append, timeout=1800,
+                            stop_fn=lambda: job.cancel_requested,
+                        )
+                        if job.cancel_requested:
+                            job.append("\n[Cancelled by user]\n")
+                            job.finish(False)
+                            return
+                        if exit_code == 0:
+                            err = None
+                        elif exit_code is None:
+                            err = "The command did not complete (see above)."
+                        else:
+                            err = f"apt exited with code {exit_code}."
                         if err is None:
-                            if stdout:
-                                job.append(stdout)
                             job.append("\n\nUpdates applied successfully.\n")
                             # Check reboot-required via guest agent
                             from core.scanner import check_reboot_required

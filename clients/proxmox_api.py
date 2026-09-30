@@ -1,4 +1,6 @@
+import base64
 import logging
+import secrets
 import threading
 import time
 
@@ -316,6 +318,124 @@ class ProxmoxClient:
         except Exception as e:
             logger.warning("Guest agent exec failed for VM %s on %s: %s", vmid, node, e)
             return None, f"Guest agent exec failed: {describe_exception(e)}"
+
+    # QGA's guest-exec hands stdout back only once the process has exited, so
+    # a long apt run looks frozen in the UI, and a slow one is reported as a
+    # timeout while apt is still running in the guest.  The streaming variant
+    # runs the command detached with its output in a per-run file inside the
+    # guest and tails that file with short guest-execs.
+    GUEST_EXEC_POLL_FAILURES = 5
+    # QGA runs as root, so /run (root-only tmpfs, cleared on reboot) holds the
+    # per-run files; /tmp would be shared with every user in the guest.
+    GUEST_EXEC_DIR = "/run"
+
+    def exec_guest_agent_streaming(self, node, vmid, command, callback, timeout=1800,
+                                   stop_fn=None, poll_interval=2):
+        """Run a shell snippet in the guest and stream its combined output.
+
+        ``command`` runs under ``sh`` with stdin from /dev/null, so nothing in
+        it can block on a prompt.  ``callback`` receives output as it appears.
+        Returns the exit code, or None when the command could not be launched,
+        ``stop_fn`` asked for cancellation (the process group is sent SIGTERM),
+        polling kept failing, or ``timeout`` seconds passed (the process is
+        left running and the message names the log file).  Every failure is
+        reported through ``callback``.
+        """
+        token = secrets.token_hex(6)
+        base = f"{self.GUEST_EXEC_DIR}/lambnet-exec-{token}"
+        log_f, rc_f, pid_f, script_f = f"{base}.log", f"{base}.rc", f"{base}.pid", f"{base}.sh"
+        script = (
+            "#!/bin/sh\n"
+            f"echo $$ > {pid_f}\n"
+            f"( {command} ) < /dev/null > {log_f} 2>&1\n"
+            f"echo $? > {rc_f}\n"
+        )
+        b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        # base64 keeps the launcher free of quotes whatever ``command`` holds;
+        # setsid gives the script its own process group so cancel can kill
+        # apt and dpkg along with it.
+        launch = (
+            f"sh -c 'echo {b64} | base64 -d > {script_f} && : > {log_f} && "
+            f"(setsid sh {script_f} < /dev/null > /dev/null 2>&1 &)'"
+        )
+        _, err = self.exec_guest_agent(node, vmid, launch, timeout=60)
+        if err is not None:
+            callback(f"\n[Agent Error] Could not start the command in the guest: {err}\n")
+            return None
+
+        # rc is read before the size so that, once rc exists, the size covers
+        # the complete log; tail|head then returns exactly bytes [offset, size).
+        def _poll_cmd(offset):
+            return (
+                f"sh -c 'R=$(cat {rc_f} 2>/dev/null); S=$(wc -c < {log_f}); "
+                f"echo LAMBNET_RC=$R; echo LAMBNET_SIZE=$S; "
+                f"[ \"$S\" -gt {offset} ] && tail -c +{offset + 1} {log_f} | head -c $((S - {offset}))'"
+            )
+
+        offset = 0
+        failures = 0
+        deadline = time.monotonic() + timeout
+        while True:
+            if stop_fn and stop_fn():
+                self.exec_guest_agent(
+                    node, vmid, f"sh -c 'kill -TERM -- -$(cat {pid_f}) 2>/dev/null'", timeout=30)
+                callback("\n[Cancelled: sent SIGTERM to the process group in the guest]\n")
+                self._guest_exec_cleanup(node, vmid, base)
+                return None
+
+            out, err = self.exec_guest_agent(node, vmid, _poll_cmd(offset), timeout=60)
+            parsed = self._parse_guest_exec_poll(out) if err is None else None
+            if parsed is None:
+                failures += 1
+                if failures >= self.GUEST_EXEC_POLL_FAILURES:
+                    callback(
+                        f"\n[Agent Error] Lost contact with the guest agent while the command was running "
+                        f"({err or 'unreadable poll output'}). The command may still be running in the guest; "
+                        f"its output is in {log_f}.\n"
+                    )
+                    return None
+                time.sleep(poll_interval)
+                continue
+            failures = 0
+
+            rc, size, chunk = parsed
+            if chunk:
+                callback(chunk)
+            offset = max(offset, size)
+            if rc is not None:
+                self._guest_exec_cleanup(node, vmid, base)
+                return rc
+
+            if time.monotonic() >= deadline:
+                callback(
+                    f"\n[Timeout] Still running after {timeout}s; left running in the guest. "
+                    f"Its output continues in {log_f}.\n"
+                )
+                return None
+            time.sleep(poll_interval)
+
+    @staticmethod
+    def _parse_guest_exec_poll(out):
+        """Split a poll's output into (exit code or None, log size, new chunk); None if malformed."""
+        if not out or not out.startswith("LAMBNET_RC="):
+            return None
+        rc_line, sep, rest = out.partition("\n")
+        if not sep or not rest.startswith("LAMBNET_SIZE="):
+            return None
+        size_line, _, chunk = rest.partition("\n")
+        try:
+            size = int(size_line[len("LAMBNET_SIZE="):].strip() or 0)
+            rc_text = rc_line[len("LAMBNET_RC="):].strip()
+            rc = int(rc_text) if rc_text else None
+        except ValueError:
+            return None
+        return rc, size, chunk
+
+    def _guest_exec_cleanup(self, node, vmid, base):
+        try:
+            self.exec_guest_agent(node, vmid, f"sh -c 'rm -f {base}.sh {base}.log {base}.rc {base}.pid'", timeout=30)
+        except Exception:
+            logger.debug("Guest exec cleanup failed for %s", base, exc_info=True)
 
     def exec_ct_command(self, node, vmid, command):
         """Execute a command inside a CT via Proxmox API (pct exec equivalent)."""

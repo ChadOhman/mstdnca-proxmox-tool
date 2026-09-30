@@ -2808,13 +2808,17 @@ def apply_updates(guest, dist_upgrade=False):
                     node = g.get("node")
                     break
             if node:
-                client.exec_guest_agent(node, guest.vmid, "apt-get update -qq")
-                # The agent runs argv directly, so an env-var prefix ('VAR=x cmd')
-                # is not a program name — wrap it in a shell like _execute_command.
-                stdout, err = client.exec_guest_agent(
-                    node, guest.vmid, f"sh -c {shlex.quote(cmd)}"
+                # Streamed through a log file in the guest: plain guest-exec
+                # returns output only when the process exits and capped this
+                # run at its default 120 s, so a slow apt run was reported as
+                # a failure while it was still installing.  The snippet runs
+                # under sh, so the env-var prefix needs no extra wrapping.
+                chunks = []
+                exit_code = client.exec_guest_agent_streaming(
+                    node, guest.vmid, f"apt-get update -qq && {cmd}", chunks.append, timeout=1800
                 )
-                if err is None:
+                output = "".join(chunks)
+                if exit_code == 0:
                     recheck_out, recheck_err = client.exec_guest_agent(
                         node, guest.vmid, "apt list --upgradable"
                     )
@@ -2825,8 +2829,10 @@ def apply_updates(guest, dist_upgrade=False):
                         check_reboot_required(guest)
                     except Exception:
                         pass
-                    return True, stdout
-                return False, err
+                    return True, output
+                if exit_code is None:
+                    return False, output or "The command did not complete"
+                return False, output or f"Exit code {exit_code}"
         except Exception as e:
             return False, str(e)
 

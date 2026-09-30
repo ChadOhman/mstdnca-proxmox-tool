@@ -131,41 +131,87 @@ class TestApplyUpdatesKeptBack:
 
 
 class TestApplyUpdatesAgentPath:
-    def test_agent_command_is_wrapped_in_sh_c(self, app):
+    def test_agent_run_is_streamed_with_a_long_timeout(self, app):
         guest_id = _make_guest(app, "agentpath", ["curl", "vim"],
                                connection_method="agent", guest_type="vm")
         client = MagicMock()
-        client.get_all_guests.return_value = [{"vmid": 9009, "node": "pve1"}]
         client.exec_guest_agent.return_value = ("Listing...\n", None)
+
+        def _stream(node, vmid, command, callback, timeout=None, stop_fn=None):
+            callback("Reading package lists...\n")
+            callback("done\n")
+            return 0
+
+        client.exec_guest_agent_streaming.side_effect = _stream
 
         with app.app_context():
             guest = Guest.query.get(guest_id)
             client.get_all_guests.return_value = [{"vmid": guest.vmid, "node": "pve1"}]
             with patch("core.scanner.ProxmoxClient", return_value=client), \
                  patch("core.scanner.check_reboot_required"):
-                ok, _ = apply_updates(guest)
+                ok, out = apply_updates(guest)
 
             assert ok is True
-            upgrade_calls = [
-                c.args[2] for c in client.exec_guest_agent.call_args_list
-                if "apt-get upgrade" in c.args[2]
-            ]
-            assert len(upgrade_calls) == 1
-            # The env-var prefix is not a program name — it must go through a shell.
-            assert upgrade_calls[0].startswith("sh -c ")
-            assert apt_upgrade_command() in upgrade_calls[0]
+            assert out == "Reading package lists...\ndone\n"
+            (call,) = client.exec_guest_agent_streaming.call_args_list
+            node, vmid, command, _cb = call.args
+            assert (node, vmid) == ("pve1", guest.vmid)
+            # update + upgrade as one shell snippet; the client wraps it in sh itself
+            assert command == f"apt-get update -qq && {apt_upgrade_command()}"
+            # a whole apt run, not the 120 s default of a plain guest-exec
+            assert call.kwargs["timeout"] == 1800
+            # nothing but the post-upgrade recheck goes through plain guest-exec
+            assert [c.args[2] for c in client.exec_guest_agent.call_args_list] == ["apt list --upgradable"]
+
+    def test_agent_nonzero_exit_keeps_packages_pending(self, app):
+        guest_id = _make_guest(app, "agentfail", ["curl"],
+                               connection_method="agent", guest_type="vm")
+        client = MagicMock()
+
+        def _stream(node, vmid, command, callback, timeout=None, stop_fn=None):
+            callback("E: dpkg was interrupted\n")
+            return 100
+
+        client.exec_guest_agent_streaming.side_effect = _stream
+
+        with app.app_context():
+            guest = Guest.query.get(guest_id)
+            client.get_all_guests.return_value = [{"vmid": guest.vmid, "node": "pve1"}]
+            with patch("core.scanner.ProxmoxClient", return_value=client), \
+                 patch("core.scanner.check_reboot_required"):
+                ok, err = apply_updates(guest)
+
+            assert ok is False
+            assert "dpkg was interrupted" in err
+            assert guest.updates[0].status == "pending"
+            assert not client.exec_guest_agent.called
+
+    def test_agent_incomplete_run_is_a_failure(self, app):
+        """A timeout or lost agent returns None: report it, never mark applied."""
+        guest_id = _make_guest(app, "agentnone", ["curl"],
+                               connection_method="agent", guest_type="vm")
+        client = MagicMock()
+        client.exec_guest_agent_streaming.return_value = None
+
+        with app.app_context():
+            guest = Guest.query.get(guest_id)
+            client.get_all_guests.return_value = [{"vmid": guest.vmid, "node": "pve1"}]
+            with patch("core.scanner.ProxmoxClient", return_value=client), \
+                 patch("core.scanner.check_reboot_required"):
+                ok, err = apply_updates(guest)
+
+            assert ok is False
+            assert "did not complete" in err
+            assert guest.updates[0].status == "pending"
 
     def test_agent_kept_back_packages_stay_pending(self, app):
         guest_id = _make_guest(app, "agentkeptback", ["curl", "vim"],
                                connection_method="agent", guest_type="vm")
         client = MagicMock()
-
-        def _exec(node, vmid, cmd):
-            if "apt list --upgradable" in cmd:
-                return ("Listing...\nvim/stable 2.0 amd64 [upgradable from: 1.0]\n", None)
-            return ("", None)
-
-        client.exec_guest_agent.side_effect = _exec
+        client.exec_guest_agent_streaming.return_value = 0
+        client.exec_guest_agent.return_value = (
+            "Listing...\nvim/stable 2.0 amd64 [upgradable from: 1.0]\n", None
+        )
 
         with app.app_context():
             guest = Guest.query.get(guest_id)
