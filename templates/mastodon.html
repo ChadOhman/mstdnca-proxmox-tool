@@ -302,7 +302,7 @@
                             <i class="bi bi-arrow-repeat"></i> Check for Updates
                         </button>
                     </form>
-                    {% if settings.guest_id %}
+                    {% if settings.guest_id and current_user.is_admin %}
                     <form method="post" action="/mastodon/follow-account" id="followForm"
                           class="d-flex gap-1 align-items-center" onsubmit="return startFollow(event)">
                         <input type="text" class="form-control form-control-sm font-monospace" name="account"

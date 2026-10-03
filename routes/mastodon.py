@@ -476,8 +476,19 @@ def detect_versions():
     return redirect(url_for("mastodon.upgrade_page"))
 
 
+def _follow_admin_denied():
+    """Mass-follow touches every local account, so it is admin-tier only (not just can_update)."""
+    from flask_login import current_user
+    if not current_user.is_admin:
+        return jsonify({"error": "Administrator access is required to mass-follow an account."}), 403
+    return None
+
+
 @bp.route("/follow-account/status")
 def follow_account_status():
+    denied = _follow_admin_denied()
+    if denied:
+        return denied
     return jsonify({
         "running": _follow_job["running"],
         "success": _follow_job["success"],
@@ -500,6 +511,10 @@ def follow_account():
     from flask import current_app
 
     from apps.mastodon import _RBENV_PATH, _validate_shell_param
+
+    denied = _follow_admin_denied()
+    if denied:
+        return denied
 
     account = (request.form.get("account") or "announcements").strip()
     if not re.match(r'^[A-Za-z0-9_]{1,30}$', account):

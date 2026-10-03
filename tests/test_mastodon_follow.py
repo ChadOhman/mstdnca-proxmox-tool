@@ -184,3 +184,56 @@ class TestMastodonFollowAccount:
         resp = auth_client.post("/mastodon/follow-account", data={"account": "announcements"})
         assert resp.status_code == 400
         assert rm._follow_job["running"] is False
+
+
+@pytest.fixture()
+def operator_client(app):
+    """An operator: has can_update (so the Mastodon page loads) but is not admin-tier."""
+    from models import Role, User, db
+    with app.app_context():
+        role = Role.query.filter_by(name="operator").first()
+        assert role.can_update is True  # guard: passes the blueprint gate
+        user = User(username="_follow_operator", display_name="Follow Operator", role_id=role.id)
+        user.set_password("test-only-OperatorPass123!")
+        db.session.add(user)
+        db.session.commit()
+    with app.test_client() as c:
+        c.post("/login", data={"username": "_follow_operator", "password": "test-only-OperatorPass123!"},
+               follow_redirects=False)
+        yield c
+    with app.app_context():
+        User.query.filter_by(username="_follow_operator").delete()
+        db.session.commit()
+
+
+class TestMastodonFollowAdminOnly:
+    def test_non_admin_post_forbidden_and_not_started(self, app, operator_client):
+        import clients.ssh_client as sshmod
+        import routes.mastodon as rm
+        _setup_settings(app)
+        _reset_job(rm)
+        # Neutralise the tag-scope gate (it 302s first when guest 1 exists) so this proves the admin gate.
+        with patch("core.guest_scope.configured_guests_out_of_scope", return_value=[]), \
+             patch.object(rm._threading, "Thread", _ImmediateThread), \
+             patch.object(sshmod.SSHClient, "from_credential") as mock_ssh:
+            resp = operator_client.post("/mastodon/follow-account", data={"account": "announcements"})
+        assert resp.status_code == 403
+        assert rm._follow_job["running"] is False
+        assert rm._follow_job["log"] == []
+        mock_ssh.assert_not_called()
+
+    def test_non_admin_status_forbidden(self, app, operator_client):
+        import routes.mastodon as rm
+        rm._follow_job.update({"running": False, "success": True, "log": ["secret\n"]})
+        try:
+            resp = operator_client.get("/mastodon/follow-account/status")
+            assert resp.status_code == 403
+            assert b"secret" not in resp.data
+        finally:
+            _reset_job(rm)
+
+    def test_non_admin_does_not_see_button(self, app, operator_client):
+        _setup_settings(app)
+        resp = operator_client.get("/mastodon/upgrade")
+        assert resp.status_code == 200
+        assert b'startFollow(event)' not in resp.data
