@@ -155,6 +155,7 @@ def create_app(test_config=None):
     app.config["GIT_BRANCH"] = git_branch
 
     # Register blueprints
+    from routes.active_users import bp as active_users_bp
     from routes.ai_chat import bp as ai_chat_bp
     from routes.api import bp as api_bp
     from routes.api_v1 import bp as api_v1_bp
@@ -203,6 +204,7 @@ def create_app(test_config=None):
     app.register_blueprint(api_bp, url_prefix="/api")
     app.register_blueprint(applications_bp, url_prefix="/applications")
     app.register_blueprint(moderation_bp, url_prefix="/moderation")
+    app.register_blueprint(active_users_bp, url_prefix="/active-users")
     app.register_blueprint(prometheus_metrics_bp)
     app.register_blueprint(prometheus_app_bp, url_prefix="/prometheus")
     app.register_blueprint(ipmi_bp, url_prefix="/ipmi")
