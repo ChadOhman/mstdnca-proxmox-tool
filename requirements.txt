@@ -13,7 +13,7 @@ paramiko==5.0.0
 # 46.0.7). paramiko 5.0.0 and PyJWT[crypto] 2.13.0 both accept cryptography 48.x.
 cryptography==50.0.1
 APScheduler==3.11.3
-Werkzeug==3.1.8
+Werkzeug==3.1.9
 PyJWT[crypto]==2.15.0
 gunicorn==26.2.0
 # gevent is the gunicorn worker class (see scripts/setup.sh ExecStart) and is

@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.exc import IntegrityError
 
 from auth.audit import log_action
-from core.mastodon_admin import parse_iso
+from core.mastodon_admin import MastodonAPIError, parse_iso
 
 logger = logging.getLogger(__name__)
 
@@ -537,31 +537,40 @@ def _check_watched(client, now, result, sleep):
             result["deferred"] = True
             break
 
-        if watch.last_status_id is None:
-            # First time we've ever looked at this account: seed the cursor
-            # without alerting on pre-existing history.
-            statuses = client.account_statuses(watch.mastodon_account_id, limit=1)
-            if statuses:
-                watch.last_status_id = statuses[0]["id"]
-                acct = statuses[0].get("account_acct")
-                if acct:
-                    watch.acct = acct
-        else:
-            statuses = client.account_statuses(watch.mastodon_account_id, since_id=watch.last_status_id)
-            if statuses:
-                newest_id = statuses[0]["id"]  # newest-first
-                for status in reversed(statuses):  # oldest-first for alerting
-                    alert = record_alert(
-                        "watched_post",
-                        {"id": watch.mastodon_account_id, "acct": status.get("account_acct") or watch.acct},
-                        status,
-                    )
-                    if alert:
-                        result["alerts"]["watched_post"] += 1
-                    acct = status.get("account_acct")
-                    if acct:
-                        watch.acct = acct
-                watch.last_status_id = newest_id
+        try:
+            _poll_watch(client, watch, result)
+        except MastodonAPIError as exc:
+            if exc.http_status == 429:
+                # Let run_watch_poll set the back-off; nothing else should run.
+                raise
+            label = f"@{watch.acct} (account {watch.mastodon_account_id})"
+            if exc.http_status in (404, 410):
+                # The account was deleted or suspended out from under the watch.
+                # Mastodon will never answer for it again, so drop the watch rather
+                # than re-raising the same error on every poll. Left in place it would
+                # sort to the front of the queue forever and starve every other watch.
+                log_action(
+                    "mastodon_watch_remove",
+                    "mastodon_account",
+                    resource_name=watch.acct,
+                    details={
+                        "watch_id": watch.id,
+                        "account_id": watch.mastodon_account_id,
+                        "reason": "account no longer exists on the instance",
+                        "http_status": exc.http_status,
+                    },
+                    actor="moderation watch",
+                    audience="moderators",
+                )
+                db.session.delete(watch)
+                db.session.commit()
+                result["notices"].append(f"Removed watch on {label}: the account no longer exists")
+                result["watch_total"] -= 1
+                sleep(REQUEST_SPACING_SECONDS)
+                continue
+            # Any other failure is this account's problem, not the queue's: say
+            # which account, mark it checked so it rotates to the back, and move on.
+            result["errors"].append(f"check_watched {label}: {exc.message}")
 
         watch.last_checked_at = now
         checked += 1
@@ -569,6 +578,37 @@ def _check_watched(client, now, result, sleep):
         sleep(REQUEST_SPACING_SECONDS)
 
     result["checked"] = checked
+
+
+def _poll_watch(client, watch, result):
+    """Fetch one watched account's new statuses and raise alerts for them."""
+    if watch.last_status_id is None:
+        # First time we've ever looked at this account: seed the cursor
+        # without alerting on pre-existing history.
+        statuses = client.account_statuses(watch.mastodon_account_id, limit=1)
+        if statuses:
+            watch.last_status_id = statuses[0]["id"]
+            acct = statuses[0].get("account_acct")
+            if acct:
+                watch.acct = acct
+        return
+
+    statuses = client.account_statuses(watch.mastodon_account_id, since_id=watch.last_status_id)
+    if not statuses:
+        return
+    newest_id = statuses[0]["id"]  # newest-first
+    for status in reversed(statuses):  # oldest-first for alerting
+        alert = record_alert(
+            "watched_post",
+            {"id": watch.mastodon_account_id, "acct": status.get("account_acct") or watch.acct},
+            status,
+        )
+        if alert:
+            result["alerts"]["watched_post"] += 1
+        acct = status.get("account_acct")
+        if acct:
+            watch.acct = acct
+    watch.last_status_id = newest_id
 
 
 def _discover_new_accounts(client, now, result, settings):
@@ -768,6 +808,7 @@ def run_watch_poll(client, *, bot_client=None, now=None, sleep=time.sleep, log=N
         "bootstrapped": False,
         "backoff_until": None,
         "errors": [],
+        "notices": [],
         "rate_limit": None,
         "welcomed": 0,
         "status_limit": None,
@@ -838,6 +879,7 @@ def run_watch_poll(client, *, bot_client=None, now=None, sleep=time.sleep, log=N
         "bootstrapped": result["bootstrapped"],
         "backoff_until": result["backoff_until"],
         "errors": result["errors"],
+        "notices": result["notices"],
         "rate_limit": result["rate_limit"],
         "welcomed": result.get("welcomed", 0),
         "status_limit": result.get("status_limit"),
