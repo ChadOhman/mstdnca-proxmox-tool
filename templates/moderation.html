@@ -2127,6 +2127,9 @@ function safeHttpUrl(u) {
         if (lastRun.errors && lastRun.errors.length) {
             html += '<div class="alert alert-danger py-1 px-2 mt-2 mb-0 small">' + lastRun.errors.map(escHtml).join('<br>') + '</div>';
         }
+        if (lastRun.notices && lastRun.notices.length) {
+            html += '<div class="alert alert-warning py-1 px-2 mt-2 mb-0 small">' + lastRun.notices.map(escHtml).join('<br>') + '</div>';
+        }
         watchStatus.innerHTML = html;
     }
 

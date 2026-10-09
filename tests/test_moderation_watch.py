@@ -538,6 +538,95 @@ class TestCheckWatched:
             assert watch.last_checked_at is None
 
 
+    def _three_watches(self, db, ModerationWatch):
+        for key in ("w-a", "w-gone", "w-c"):
+            db.session.add(ModerationWatch(mastodon_account_id=key, acct=f"{key}@example.social",
+                                            last_status_id="1"))
+        db.session.commit()
+
+    def _client_failing_for(self, account_id, exc):
+        client = _client()
+
+        def _statuses(acct_id, **kwargs):
+            if acct_id == account_id:
+                raise exc
+            return []
+
+        client.account_statuses.side_effect = _statuses
+        return client
+
+    def test_404_removes_that_watch_and_checks_the_rest(self, app):
+        import core.moderation_watch as mw
+        from core.moderation_watch import run_watch_poll
+        from models import ModerationWatch, db
+
+        now = datetime.now(timezone.utc)
+        with app.app_context():
+            _disable_discover_and_silent(now)
+            self._three_watches(db, ModerationWatch)
+            client = self._client_failing_for(
+                "w-gone", MastodonAPIError("Mastodon API returned HTTP 404: not found - Record not found",
+                                           http_status=404))
+
+            result = run_watch_poll(client, now=now)
+
+            assert ModerationWatch.query.filter_by(mastodon_account_id="w-gone").first() is None
+            survivors = ModerationWatch.query.order_by(ModerationWatch.mastodon_account_id).all()
+            assert [w.mastodon_account_id for w in survivors] == ["w-a", "w-c"]
+            assert all(w.last_checked_at is not None for w in survivors)
+            assert result["checked"] == 2
+            assert result["watch_total"] == 2
+            assert result["errors"] == []
+            assert result["notices"] == [
+                "Removed watch on @w-gone@example.social (account w-gone): the account no longer exists"
+            ]
+            removals = [c for c in mw.log_action.call_args_list if c.args[0] == "mastodon_watch_remove"]
+            assert len(removals) == 1
+            kwargs = removals[0].kwargs
+            assert kwargs["resource_name"] == "w-gone@example.social"
+            assert kwargs["details"]["account_id"] == "w-gone"
+            assert kwargs["details"]["http_status"] == 404
+            assert kwargs["audience"] == "moderators"
+
+    def test_other_error_names_the_account_and_rotates_it(self, app):
+        from core.moderation_watch import run_watch_poll
+        from models import ModerationWatch, db
+
+        now = datetime.now(timezone.utc)
+        with app.app_context():
+            _disable_discover_and_silent(now)
+            self._three_watches(db, ModerationWatch)
+            client = self._client_failing_for("w-gone", MastodonAPIError("boom", http_status=500))
+
+            result = run_watch_poll(client, now=now)
+
+            assert ModerationWatch.query.count() == 3
+            assert all(w.last_checked_at is not None for w in ModerationWatch.query.all())
+            assert result["checked"] == 3
+            assert result["errors"] == ["check_watched @w-gone@example.social (account w-gone): boom"]
+            assert result["notices"] == []
+            assert result["backoff_until"] is None
+
+    def test_429_still_aborts_the_whole_poll(self, app):
+        from core.moderation_watch import run_watch_poll
+        from models import ModerationWatch, db
+
+        now = datetime.now(timezone.utc)
+        with app.app_context():
+            _disable_discover_and_silent(now)
+            self._three_watches(db, ModerationWatch)
+            client = self._client_failing_for(
+                "w-a", MastodonAPIError("rate limited", http_status=429, retry_after=30))
+
+            result = run_watch_poll(client, now=now)
+
+            assert result["backoff_until"] is not None
+            assert ModerationWatch.query.count() == 3
+            assert result["checked"] == 0
+            assert len(result["errors"]) == 1
+            assert result["errors"][0].startswith("check_watched: rate limited")
+
+
 # ---------------------------------------------------------------------------
 # run_watch_poll - silent login scan
 # ---------------------------------------------------------------------------
@@ -831,7 +920,7 @@ class TestPersistedResultShape:
             payload = json.loads(raw)
             assert set(payload.keys()) == {
                 "checked", "watch_total", "alerts", "deferred", "bootstrapped",
-                "backoff_until", "errors", "rate_limit", "welcomed", "status_limit",
+                "backoff_until", "errors", "notices", "rate_limit", "welcomed", "status_limit",
             }
             lowered = raw.lower()
             assert "email" not in lowered
