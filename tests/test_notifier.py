@@ -1564,7 +1564,7 @@ class TestSendUpgradeStartedNotification:
         assert any("Automatic" in v for v in values)
 
     def test_works_for_all_services(self, app):
-        for service in ["mastodon", "ghost", "peertube", "elk", "jitsi", "prometheus"]:
+        for service in ["mastodon", "ghost", "peertube", "elk", "harmony", "jitsi", "prometheus"]:
             with app.app_context():
                 self._enable(app, service)
 
@@ -1708,7 +1708,7 @@ class TestSendUpgradeResultNotification:
         assert "failed" in body["embeds"][0]["title"]
 
     def test_works_for_all_services(self, app):
-        for service in ["mastodon", "ghost", "peertube", "elk", "jitsi", "prometheus"]:
+        for service in ["mastodon", "ghost", "peertube", "elk", "harmony", "jitsi", "prometheus"]:
             with app.app_context():
                 self._enable(app, service)
 

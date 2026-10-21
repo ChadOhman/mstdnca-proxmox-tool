@@ -246,6 +246,21 @@ class TestSaveHandlersRejectHostileValues:
             ["elk_dir"], "/elk/upgrade",
         )
 
+    @pytest.mark.parametrize("value", HOSTILE)
+    def test_harmony_dir(self, app, auth_client, value):
+        _assert_rejected(
+            auth_client, app, "/harmony/save",
+            {"harmony_dir": f"/opt/{value}"},
+            ["harmony_dir"], "/harmony/upgrade",
+        )
+
+    def test_harmony_dir_rejects_root(self, app, auth_client):
+        _assert_rejected(
+            auth_client, app, "/harmony/save",
+            {"harmony_dir": "/"},
+            ["harmony_dir"], "/harmony/upgrade",
+        )
+
     def test_elk_dir_rejects_root(self, app, auth_client):
         _assert_rejected(
             auth_client, app, "/elk/save",

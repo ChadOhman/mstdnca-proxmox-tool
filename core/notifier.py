@@ -405,6 +405,37 @@ def send_elk_update_notification(current_version, new_version, release_url):
     return ok, msg
 
 
+def send_harmony_update_notification(current_version, new_version, release_url):
+    """Send notification about a new Harmony release."""
+    if Setting.get("discord_notify_harmony", "true") != "true":
+        return False, "Harmony notifications disabled"
+
+    auto_upgrade = Setting.get("harmony_auto_upgrade", "false") == "true"
+    note = "Auto-upgrade is enabled and will run shortly." if auto_upgrade else "Log in to MCAT to upgrade."
+
+    fields = [
+        {"name": "Current Version", "value": f"v{current_version or 'unknown'}", "inline": True},
+        {"name": "New Version", "value": f"v{new_version}", "inline": True},
+    ]
+    if release_url:
+        fields.append({"name": "Release Notes", "value": f"[View on GitHub]({release_url})", "inline": False})
+
+    embeds = [{
+        "title": f"\U0001f4ac Harmony update available: v{new_version}",
+        "description": note,
+        "color": _COLOR_YELLOW,
+        "fields": fields,
+        "footer": {"text": "Sent by Mastodon Canada Administration Tool"},
+    }]
+
+    ok, msg = _send_discord(embeds)
+    if ok:
+        logger.info(f"Harmony update notification sent for v{new_version}")
+    else:
+        logger.error(f"Failed to send Harmony update notification: {msg}")
+    return ok, msg
+
+
 def send_jitsi_update_notification(current_version, new_version, release_url):
     """Send notification about a new Jitsi Meet release."""
     if Setting.get("discord_notify_jitsi", "true") != "true":
@@ -437,7 +468,7 @@ def send_jitsi_update_notification(current_version, new_version, release_url):
 def send_upgrade_started_notification(service, version, trigger):
     """Send notification that an upgrade has been triggered.
 
-    service: "mastodon", "ghost", "peertube", "elk", or "jitsi"
+    service: "mastodon", "ghost", "peertube", "elk", "harmony", or "jitsi"
     version: target version string (may be empty if unknown)
     trigger: "manual" or "auto"
     """
@@ -446,7 +477,7 @@ def send_upgrade_started_notification(service, version, trigger):
         return False, f"{service} upgrade-started notifications disabled"
 
     label = service.capitalize()
-    _icons = {"mastodon": "\U0001f43b", "ghost": "\U0001f47b", "peertube": "\U0001f3ac", "elk": "\U0001f98c", "jitsi": "\U0001f4f9", "prometheus": "\U0001f4ca"}
+    _icons = {"mastodon": "\U0001f43b", "ghost": "\U0001f47b", "peertube": "\U0001f3ac", "elk": "\U0001f98c", "harmony": "\U0001f4ac", "jitsi": "\U0001f4f9", "prometheus": "\U0001f4ca"}
     icon = _icons.get(service, "\U0001f4e6")
     trigger_label = "Automatic" if trigger == "auto" else "Manual"
     version_str = f" to v{version}" if version else ""
@@ -486,7 +517,7 @@ def send_upgrade_result_notification(service, version, success, trigger):
         return False, f"{service} upgrade-result notifications disabled"
 
     label = service.capitalize()
-    _icons = {"mastodon": "\U0001f43b", "ghost": "\U0001f47b", "peertube": "\U0001f3ac", "elk": "\U0001f98c", "jitsi": "\U0001f4f9", "prometheus": "\U0001f4ca"}
+    _icons = {"mastodon": "\U0001f43b", "ghost": "\U0001f47b", "peertube": "\U0001f3ac", "elk": "\U0001f98c", "harmony": "\U0001f4ac", "jitsi": "\U0001f4f9", "prometheus": "\U0001f4ca"}
     icon = _icons.get(service, "\U0001f4e6")
     trigger_label = "Automatic" if trigger == "auto" else "Manual"
     version_str = f" to v{version}" if version else ""

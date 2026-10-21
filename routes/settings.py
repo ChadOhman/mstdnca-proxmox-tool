@@ -73,6 +73,9 @@ def _get_settings_dict():
         "discord_notify_elk": Setting.get("discord_notify_elk", "true"),
         "discord_notify_elk_upgrade_started": Setting.get("discord_notify_elk_upgrade_started", "true"),
         "discord_notify_elk_upgrade_result": Setting.get("discord_notify_elk_upgrade_result", "true"),
+        "discord_notify_harmony": Setting.get("discord_notify_harmony", "true"),
+        "discord_notify_harmony_upgrade_started": Setting.get("discord_notify_harmony_upgrade_started", "true"),
+        "discord_notify_harmony_upgrade_result": Setting.get("discord_notify_harmony_upgrade_result", "true"),
         "discord_notify_jitsi": Setting.get("discord_notify_jitsi", "true"),
         "discord_notify_jitsi_upgrade_started": Setting.get("discord_notify_jitsi_upgrade_started", "true"),
         "discord_notify_jitsi_upgrade_result": Setting.get("discord_notify_jitsi_upgrade_result", "true"),
@@ -209,6 +212,9 @@ def save_discord():
     notify_elk = "discord_notify_elk" in request.form
     notify_elk_upgrade_started = "discord_notify_elk_upgrade_started" in request.form
     notify_elk_upgrade_result = "discord_notify_elk_upgrade_result" in request.form
+    notify_harmony = "discord_notify_harmony" in request.form
+    notify_harmony_upgrade_started = "discord_notify_harmony_upgrade_started" in request.form
+    notify_harmony_upgrade_result = "discord_notify_harmony_upgrade_result" in request.form
     notify_jitsi = "discord_notify_jitsi" in request.form
     notify_jitsi_upgrade_started = "discord_notify_jitsi_upgrade_started" in request.form
     notify_jitsi_upgrade_result = "discord_notify_jitsi_upgrade_result" in request.form
@@ -248,6 +254,9 @@ def save_discord():
     Setting.set("discord_notify_elk", "true" if notify_elk else "false")
     Setting.set("discord_notify_elk_upgrade_started", "true" if notify_elk_upgrade_started else "false")
     Setting.set("discord_notify_elk_upgrade_result", "true" if notify_elk_upgrade_result else "false")
+    Setting.set("discord_notify_harmony", "true" if notify_harmony else "false")
+    Setting.set("discord_notify_harmony_upgrade_started", "true" if notify_harmony_upgrade_started else "false")
+    Setting.set("discord_notify_harmony_upgrade_result", "true" if notify_harmony_upgrade_result else "false")
     Setting.set("discord_notify_jitsi", "true" if notify_jitsi else "false")
     Setting.set("discord_notify_jitsi_upgrade_started", "true" if notify_jitsi_upgrade_started else "false")
     Setting.set("discord_notify_jitsi_upgrade_result", "true" if notify_jitsi_upgrade_result else "false")

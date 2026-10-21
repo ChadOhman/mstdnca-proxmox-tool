@@ -43,6 +43,13 @@ def index():
             "latest_version": Setting.get("elk_latest_version", ""),
             "installed": Setting.get("elk_installed", "false") == "true",
         },
+        "harmony": {
+            "auto_upgrade": Setting.get("harmony_auto_upgrade", "false") == "true",
+            "update_available": Setting.get("harmony_update_available", "false") == "true",
+            "current_version": Setting.get("harmony_current_version", ""),
+            "latest_version": Setting.get("harmony_latest_version", ""),
+            "installed": Setting.get("harmony_installed", "false") == "true",
+        },
         "jitsi": {
             "auto_upgrade": Setting.get("jitsi_auto_upgrade", "false") == "true",
             "update_available": Setting.get("jitsi_update_available", "false") == "true",
