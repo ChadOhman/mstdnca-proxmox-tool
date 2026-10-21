@@ -37,6 +37,7 @@ The production worker class is `gevent` (`scripts/setup.sh` gunicorn `ExecStart`
 │   ├── ghost.py            # Ghost CMS upgrades
 │   ├── peertube.py         # PeerTube upgrades
 │   ├── elk.py              # Elk (Mastodon web client) upgrades
+│   ├── harmony.py          # Harmony (self-hosted chat, Docker Compose) upgrades via its `harmony` CLI
 │   ├── jitsi.py            # Jitsi Meet install/upgrades
 │   ├── jibri.py            # Jibri (Jitsi recording) upgrades
 │   ├── exporters.py        # Prometheus exporter upgrades
@@ -59,7 +60,7 @@ One file per feature area in `routes/`:
 - `terminal.py` — WebSocket SSH terminal (Flask-Sock), 1800s idle timeout
 - `security.py` — user/role/tag/session management, audit log, `_safe_int()` helper
 - `services.py` — service monitoring (mastodon, sidekiq, postgres, redis)
-- `mastodon.py`, `ghost.py`, `peertube.py`, `elk.py`, `jitsi.py`, `jibri.py`, `prometheus_app.py`, `unpoller.py` — application upgrade routes
+- `mastodon.py`, `ghost.py`, `peertube.py`, `elk.py`, `harmony.py`, `jitsi.py`, `jibri.py`, `prometheus_app.py`, `unpoller.py` — application upgrade routes
 - `moderation.py` — PeerTube/Mastodon email cross-check, plus Mastodon Admin API JSON endpoints (reports, pending approvals, account actions, domain blocks) backed by `core/mastodon_admin.py`
 - `trends.py` — update history and trends
 - `ipmi.py` — IPMI sensor/power monitoring

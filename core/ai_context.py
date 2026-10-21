@@ -108,7 +108,7 @@ def _build_page_context(page_context, user):
             return "The user is on the main Dashboard."
         if page_type == "unifi":
             return "The user is viewing the UniFi network overview."
-        if page_type in ("mastodon", "ghost", "peertube", "jitsi", "elk"):
+        if page_type in ("mastodon", "ghost", "peertube", "jitsi", "elk", "harmony"):
             return f"The user is viewing the {page_type.capitalize()} application management page."
         return f"The user is on the {page_type} page."
     except Exception as e:

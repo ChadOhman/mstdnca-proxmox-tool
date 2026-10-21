@@ -599,6 +599,7 @@ class TestCollaborationFanOut:
 _APP_GUEST_FIELDS = [
     ("/elk/save", "elk_guest_id"),
     ("/ghost/save", "ghost_guest_id"),
+    ("/harmony/save", "harmony_guest_id"),
     ("/jibri/save", "jibri_guest_id"),
     ("/jitsi/save", "jitsi_guest_id"),
     ("/mastodon/save", "mastodon_guest_id"),
@@ -610,6 +611,9 @@ _APP_GUEST_FIELDS = [
 _APP_GUARDS = [
     ("/elk/preflight", "elk_guest_id", "/elk/upgrade"),
     ("/ghost/preflight", "ghost_guest_id", "/ghost/upgrade"),
+    ("/harmony/preflight", "harmony_guest_id", "/harmony/upgrade"),
+    ("/harmony/health", "harmony_guest_id", "/harmony/upgrade"),
+    ("/harmony/upgrade", "harmony_guest_id", "/harmony/upgrade"),
     ("/jibri/preflight", "jibri_guest_id", "/jibri/manage"),
     ("/jitsi/preflight", "jitsi_guest_id", "/jitsi/upgrade"),
     ("/mastodon/preflight", "mastodon_guest_id", "/mastodon/upgrade"),

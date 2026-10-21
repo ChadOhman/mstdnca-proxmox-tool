@@ -448,6 +448,72 @@ def _check_elk_release(app):
                 logger.error("Elk auto-upgrade failed")
 
 
+def _check_harmony_release(app):
+    """Check for new Harmony releases and optionally auto-upgrade."""
+    with app.app_context():
+        from models import Setting
+
+        # Only check once a Harmony guest is configured and its version detected
+        if not Setting.get("harmony_guest_id"):
+            return
+        if Setting.get("harmony_installed", "false") != "true":
+            return
+
+        from apps.harmony import check_harmony_release
+        update_available, latest, release_url = check_harmony_release()
+
+        if not update_available:
+            return
+
+        current = Setting.get("harmony_current_version", "")
+        logger.info(f"Harmony update available: v{current} -> v{latest}")
+
+        # Send Discord notification (only if not already notified for this version)
+        last_notified = Setting.get("harmony_last_notified_version", "")
+        if latest != last_notified:
+            from core.notifier import send_harmony_update_notification
+            ok, _msg = send_harmony_update_notification(current, latest, release_url)
+            if ok:
+                Setting.set("harmony_last_notified_version", latest)
+
+        # Auto-upgrade if enabled (off by default)
+        if Setting.get("harmony_auto_upgrade", "false") == "true":
+            logger.info("Auto-upgrade enabled, starting Harmony upgrade...")
+            from apps.harmony import run_harmony_upgrade
+            from apps.utils import upgrade_lock
+            from auth.audit import log_action
+            from core.errors import describe_exception
+            from core.notifier import send_upgrade_result_notification, send_upgrade_started_notification
+            from models import db
+
+            # Share the manual upgrade route's lock: a cron upgrade must never
+            # run concurrently with an operator-triggered one on the same host.
+            with upgrade_lock("harmony") as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Harmony auto-upgrade skipped: another upgrade is already running"
+                    )
+                    return
+                send_upgrade_started_notification("harmony", latest, "auto")
+                try:
+                    ok, log_output = run_harmony_upgrade()
+                except Exception as exc:
+                    logger.exception("Harmony auto-upgrade crashed")
+                    ok, log_output = False, f"Auto-upgrade crashed: {describe_exception(exc)}"
+            log_action("harmony_upgrade", "settings", resource_name="harmony",
+                       details={"status": "success" if ok else "error", "trigger": "auto"})
+            db.session.commit()
+            now = datetime.now(timezone.utc).isoformat()
+            Setting.set("harmony_last_upgrade_at", now)
+            Setting.set("harmony_last_upgrade_status", "success" if ok else "error")
+            Setting.set("harmony_last_upgrade_log", log_output)
+            send_upgrade_result_notification("harmony", latest, ok, "auto")
+            if ok:
+                logger.info("Harmony auto-upgrade completed successfully")
+            else:
+                logger.error("Harmony auto-upgrade failed")
+
+
 def _check_jitsi_release(app):
     """Check for new Jitsi releases and optionally auto-upgrade."""
     with app.app_context():
@@ -1132,7 +1198,7 @@ def _collect_prometheus_metrics(app):
                 logger.debug("Failed to update APT metrics for %s", guest.name, exc_info=True)
 
         # Application version info
-        for app_name in ("mastodon", "ghost", "peertube", "elk", "jitsi", "prometheus"):
+        for app_name in ("mastodon", "ghost", "peertube", "elk", "harmony", "jitsi", "prometheus"):
             current = Setting.get(f"{app_name}_current_version", "")
             latest = Setting.get(f"{app_name}_latest_version", "")
             update_avail = Setting.get(f"{app_name}_update_available", "false") == "true"
@@ -1665,6 +1731,17 @@ def init_scheduler(app):
         max_instances=1,
     )
 
+    # Harmony release check - runs alongside the scan job
+    _scheduler.add_job(
+        _check_harmony_release,
+        trigger=IntervalTrigger(hours=interval_hours),
+        args=[app],
+        id="harmony_check",
+        name="Check for Harmony releases",
+        replace_existing=True,
+        max_instances=1,
+    )
+
     # Jitsi release check - runs alongside the scan job
     _scheduler.add_job(
         _check_jitsi_release,
@@ -1853,7 +1930,7 @@ def init_scheduler(app):
     )
 
     _scheduler.start()
-    logger.info(f"Scheduler started: discovery every {discovery_hours}h, scan every {interval_hours}h, auto-update check every 15m, service check every {service_check_minutes}m, mastodon check every {interval_hours}h, ghost check every {interval_hours}h, peertube check every {interval_hours}h, elk check every {interval_hours}h, jitsi check every {interval_hours}h, host update check every {interval_hours}h, app update check every 6h, unifi event poll every {unifi_poll_minutes}m")
+    logger.info(f"Scheduler started: discovery every {discovery_hours}h, scan every {interval_hours}h, auto-update check every 15m, service check every {service_check_minutes}m, mastodon check every {interval_hours}h, ghost check every {interval_hours}h, peertube check every {interval_hours}h, elk check every {interval_hours}h, harmony check every {interval_hours}h, jitsi check every {interval_hours}h, host update check every {interval_hours}h, app update check every 6h, unifi event poll every {unifi_poll_minutes}m")
 
     return _scheduler
 
@@ -1867,6 +1944,7 @@ def reschedule_jobs(interval_hours, discovery_hours, service_check_minutes):
     _scheduler.reschedule_job("ghost_check", trigger=IntervalTrigger(hours=interval_hours))
     _scheduler.reschedule_job("peertube_check", trigger=IntervalTrigger(hours=interval_hours))
     _scheduler.reschedule_job("elk_check", trigger=IntervalTrigger(hours=interval_hours))
+    _scheduler.reschedule_job("harmony_check", trigger=IntervalTrigger(hours=interval_hours))
     _scheduler.reschedule_job("jitsi_check", trigger=IntervalTrigger(hours=interval_hours))
     _scheduler.reschedule_job("host_update_check", trigger=IntervalTrigger(hours=interval_hours))
     _scheduler.reschedule_job("discovery", trigger=IntervalTrigger(hours=discovery_hours))

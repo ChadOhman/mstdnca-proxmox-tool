@@ -10,7 +10,7 @@ A datacenter-wide administration tool for Proxmox environments. Runs as an LXC c
 - **UniFi network visibility** — View all UniFi devices and clients with subnet filtering and device restart support
 - **IPMI monitoring** — Sensor readings and power status for bare-metal hosts
 - **Service monitoring** — Track systemd service state across guests with failure/recovery alerts
-- **Application upgrade automation** — One-click upgrades for Mastodon (glitch-soc), Ghost, PeerTube, Elk, Jitsi Meet/Jibri, and Prometheus exporters, with Proxmox snapshots and auto-upgrade support
+- **Application upgrade automation** — One-click upgrades for Mastodon (glitch-soc), Ghost, PeerTube, Elk, Harmony, Jitsi Meet/Jibri, and Prometheus exporters, with Proxmox snapshots and auto-upgrade support
 - **Moderation tools** — PeerTube/Mastodon email cross-check for spam account detection, plus a Mastodon Admin API console: reports queue, pending signup approvals, account lookup with limit/suspend actions, and domain blocks
 - **Discord notifications** — Webhook alerts for available updates, upgrade results, and service failures, with severity breakdown and tag scoping
 - **Scheduled scans & auto-updates** — Configurable scan intervals and maintenance windows
@@ -179,7 +179,7 @@ Under **Credentials** (super admin only), add SSH credentials (password or priva
 
 1. In Discord, create a webhook for the channel you want alerts in: **Channel Settings > Integrations > Webhooks > New Webhook**, then copy the webhook URL
 2. In MCAT, go to **Settings > Discord Notifications** and paste the **Webhook URL**
-3. Check **Enable Discord notifications** and pick which events to notify on — guest & host package updates (optionally security updates only), app version updates and upgrade started/result for Mastodon, Ghost, PeerTube, Elk, and Jitsi Meet, Prometheus exporter changes, and MCAT application updates
+3. Check **Enable Discord notifications** and pick which events to notify on — guest & host package updates (optionally security updates only), app version updates and upgrade started/result for Mastodon, Ghost, PeerTube, Elk, Harmony, and Jitsi Meet, Prometheus exporter changes, and MCAT application updates
 4. Click **Send Test Notification** to verify, then **Save Discord Settings**
 
 Notifications arrive as rich embeds with per-guest update counts and severity colouring. Repeat scans that find the same set of pending updates are deduplicated, so you're only notified when something changes.
@@ -241,6 +241,31 @@ The upgrade process:
 12. Final service restart
 
 Enable **automatic upgrades** to have this run whenever a new release is detected.
+
+## Harmony Upgrades
+
+The **Applications > Harmony** page manages a [Harmony](https://docs.mony.lol/self-host/) chat server
+installed with Harmony's own installer (a git checkout, `/opt/harmony` by default, running a Docker Compose
+stack). The tool does not install Harmony; it drives the `self-host/harmony` CLI over SSH, so local compose
+overlays named by `COMPOSE_FILE` in `self-host/.env` keep applying.
+
+1. Register the Harmony VM under **Guests** with its IP address and an SSH credential (root, or a user with
+   passwordless sudo), and install that credential's public key on the VM
+2. Select the guest on **Applications > Harmony**, then **Detect Version** (`harmony version`) and
+   **Check for Updates** (GitHub releases of [y4my4my4m/harmony](https://github.com/y4my4my4m/harmony/releases))
+3. **Pre-flight Check** and **Health Check** confirm the instance is ready before the first upgrade
+
+The upgrade process:
+1. Snapshot (or vzdump backup) of the Harmony VM via the Proxmox API
+2. `harmony backup --no-storage` (database, roles and configuration secrets)
+3. `harmony update --version X.Y.Z` with its output streamed live (pulls images, applies migrations,
+   recreates containers)
+4. Verification: the version matches the target; `harmony doctor --offline` shows no container FAILs and
+   passing `migrations`, `auth`, `database` and (with voice) `livekit` checks; `realtime.messages` still has a
+   SELECT policy
+
+The doctor's exit status is not used: behind a tunnel or NAT its DNS and reachability checks can fail
+permanently. Automatic upgrades are off by default.
 
 ## User Management & Access Control
 
@@ -337,7 +362,7 @@ Flask Web UI (:5000)
 ├── IPMI ─────────── sensor readings for bare-metal hosts
 ├── Schedules ────── maintenance windows for auto-updates
 ├── Services ─────── systemd service monitoring across guests
-├── Applications ─── upgrades for Mastodon, Ghost, PeerTube, Elk, Jitsi, exporters
+├── Applications ─── upgrades for Mastodon, Ghost, PeerTube, Elk, Harmony, Jitsi, exporters
 ├── Moderation ───── PeerTube/Mastodon spam cross-check; Mastodon reports, approvals, account actions, domain blocks
 ├── Security ─────── users, roles, tags, sessions, audit log, credentials
 └── Settings ─────── Discord, scan, UniFi, CF Access, local bypass, backups

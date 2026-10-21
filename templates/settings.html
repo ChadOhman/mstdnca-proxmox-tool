@@ -97,6 +97,21 @@
                             <label class="form-check-label" for="discordNotifyElkUpgradeResult">Elk upgrade result (success/failure)</label>
                         </div>
                         <div class="form-check">
+                            <input type="checkbox" class="form-check-input" name="discord_notify_harmony" id="discordNotifyHarmony"
+                                {{ 'checked' if settings.discord_notify_harmony != 'false' }}>
+                            <label class="form-check-label" for="discordNotifyHarmony">Harmony version updates</label>
+                        </div>
+                        <div class="form-check ms-4 mb-1">
+                            <input type="checkbox" class="form-check-input" name="discord_notify_harmony_upgrade_started" id="discordNotifyHarmonyUpgradeStarted"
+                                {{ 'checked' if settings.discord_notify_harmony_upgrade_started != 'false' }}>
+                            <label class="form-check-label" for="discordNotifyHarmonyUpgradeStarted">Harmony upgrade started</label>
+                        </div>
+                        <div class="form-check ms-4 mb-1">
+                            <input type="checkbox" class="form-check-input" name="discord_notify_harmony_upgrade_result" id="discordNotifyHarmonyUpgradeResult"
+                                {{ 'checked' if settings.discord_notify_harmony_upgrade_result != 'false' }}>
+                            <label class="form-check-label" for="discordNotifyHarmonyUpgradeResult">Harmony upgrade result (success/failure)</label>
+                        </div>
+                        <div class="form-check">
                             <input type="checkbox" class="form-check-input" name="discord_notify_jitsi" id="discordNotifyJitsi"
                                 {{ 'checked' if settings.discord_notify_jitsi != 'false' }}>
                             <label class="form-check-label" for="discordNotifyJitsi">Jitsi Meet version updates</label>
