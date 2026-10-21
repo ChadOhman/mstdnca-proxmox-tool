@@ -22,7 +22,7 @@
         {% endif %}
         {% if has_any_hosts and current_user.can_manage_hosts %}
         <form method="post" action="/hosts/updates/apply-all"
-              data-confirm="Apply OS updates (apt dist-upgrade) to ALL PVE hosts that have pending updates? Hosts are updated one at a time.">
+              data-confirm="Apply OS updates (apt dist-upgrade) to ALL hosts (PVE and PBS) that have pending updates? Hosts are updated one at a time, PBS last.">
             <button type="submit" class="btn btn-outline-success">
                 <i class="bi bi-arrow-up-circle"></i> Update All Hosts
             </button>

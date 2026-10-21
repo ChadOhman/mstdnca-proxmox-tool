@@ -99,11 +99,12 @@ class TestApplyAllPermission:
 # ---------------------------------------------------------------------------
 
 class TestApplyAllTargetSelection:
-    def test_targets_only_pending_pve_hosts(self, app, auth_client, monkeypatch):
+    def test_targets_pending_pve_and_pbs_hosts_pbs_last(self, app, auth_client, monkeypatch):
         cred_id = _make_credential(app)
         h_pending = _make_host(app, "_bulk-pve-pending", ssh_credential_id=cred_id, pending=2)
         h_clean = _make_host(app, "_bulk-pve-clean", ssh_credential_id=cred_id, pending=0)
-        h_pbs = _make_host(app, "_bulk-pbs-pending", host_type="pbs",
+        # Named to sort before the PVE host, so ordering proves PBS goes last.
+        h_pbs = _make_host(app, "_bulk-a-pbs-pending", host_type="pbs",
                            ssh_credential_id=cred_id, pending=2)
         _reset_bulk()
         # Stub orchestrator so the spawned thread is a no-op (avoids cross-thread DB).
@@ -113,9 +114,9 @@ class TestApplyAllTargetSelection:
             assert resp.status_code == 302
             assert "/hosts/updates/apply-all/progress" in resp.headers["Location"]
             with _bulk_apply_lock:
-                names = {i["name"] for i in _bulk_apply["items"]}
-                assert names == {"_bulk-pve-pending"}  # PBS + clean excluded
-                assert _bulk_apply["total"] == 1
+                names = [i["name"] for i in _bulk_apply["items"]]
+                assert names == ["_bulk-pve-pending", "_bulk-a-pbs-pending"]  # clean excluded, PBS last
+                assert _bulk_apply["total"] == 2
             with app.app_context():
                 assert AuditLog.query.filter_by(action="host_update_all").count() >= 1
         finally:
