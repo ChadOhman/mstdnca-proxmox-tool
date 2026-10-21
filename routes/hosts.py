@@ -723,15 +723,55 @@ def task_log(host_id, upid):
         return jsonify({"error": "Failed to fetch task log."}), 500
 
 
+def _reconcile_host_packages(host_id, upgradable_output, append):
+    """Retire pending HostUpdatePackage rows that the upgrade actually installed.
+
+    ``apt-get dist-upgrade -y`` exits 0 even when packages are kept back (held,
+    phased), so only rows whose package no longer shows in
+    ``apt list --upgradable`` are marked applied; the rest stay pending.  An
+    ``upgradable_output`` of None means the re-check could not run, so nothing
+    is marked.  Returns (applied_count, security_count).
+    """
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from core.scanner import parse_upgradable
+
+    if upgradable_output is None:
+        append("\n[Note] Could not re-check upgradable packages; pending list left as-is "
+               "until the next scan.\n")
+        return 0, 0
+
+    still_upgradable = {p["name"] for p in parse_upgradable(upgradable_output)}
+    pending = HostUpdatePackage.query.filter_by(host_id=host_id, status="pending").all()
+    applied = [p for p in pending if p.package_name not in still_upgradable]
+    kept_back = sorted(p.package_name for p in pending if p.package_name in still_upgradable)
+
+    now_utc = _dt.now(_tz.utc)
+    for pkg in applied:
+        pkg.status = "applied"
+        pkg.applied_at = now_utc
+    db.session.commit()
+
+    if kept_back:
+        append(f"\n[Note] {len(kept_back)} package(s) still upgradable (kept back): {', '.join(kept_back)}\n")
+    return len(applied), len([p for p in applied if p.severity == "critical"])
+
+
 def _run_apply(host_id, app_ctx):
-    """Background thread: SSH to host and run apt-get dist-upgrade.
+    """Background thread: SSH to a PVE/PBS host and run apt-get dist-upgrade.
+
+    Refreshes the package lists first (the API-side refresh may be stale or
+    never have run), runs through sudo for non-root credentials, and afterwards
+    re-reads ``apt list --upgradable`` so only packages that really upgraded
+    are recorded as applied.
 
     Only the host id crosses the thread boundary; the host and its SSH
     credential are re-queried inside this thread's own app context (the same
     pattern _run_bulk_apply uses) so no ORM instance is shared between
     sessions and nothing can be expired out from under us.
     """
-    from clients.ssh_client import SSHClient
+    from clients.ssh_client import SSHClient, sudo_auth_failure_hint
 
     def _append(chunk):
         with _apply_lock:
@@ -746,6 +786,7 @@ def _run_apply(host_id, app_ctx):
 
     with app_ctx.app_context():
         client = None
+        upgradable_output = None
         try:
             host = ProxmoxHost.query.get(host_id)
             credential_model = host.ssh_credential if host else None
@@ -754,9 +795,27 @@ def _run_apply(host_id, app_ctx):
                 success = False
             else:
                 client = SSHClient.from_credential(host.hostname, credential_model)
-                cmd = f"{apt_upgrade_command(dist_upgrade=True)} 2>&1"
-                exit_code = client.execute_streaming(cmd, _append, timeout=1800, stop_fn=_stop_fn)
+                captured = []
+
+                def _stream(chunk):
+                    captured.append(chunk)
+                    _append(chunk)
+
+                cmd = f"apt-get update && {apt_upgrade_command(dist_upgrade=True)}"
+                _append(f"$ {cmd}\n")
+                exit_code = client.execute_sudo_streaming(cmd, _stream, timeout=1800, stop_fn=_stop_fn)
                 success = exit_code == 0
+                if _stop_fn():
+                    _append("\n[Cancelled by user]\n")
+                    success = False
+                elif success:
+                    out, _, code = client.execute("apt list --upgradable 2>/dev/null", timeout=60)
+                    upgradable_output = out if code == 0 else None
+                else:
+                    _append(f"\n\napt exited with code {exit_code}.\n")
+                    hint = sudo_auth_failure_hint("".join(captured), credential_model.username)
+                    if hint:
+                        _append(f"\n[Hint] {hint}\n")
         except Exception as e:
             _append(f"\n[Error: {e}]\n")
             success = False
@@ -769,23 +828,13 @@ def _run_apply(host_id, app_ctx):
 
         if success:
             try:
-                from datetime import datetime as _dt
-                from datetime import timezone as _tz
-
-                from models import HostUpdatePackage
                 host = ProxmoxHost.query.get(host_id)
                 if host:
-                    now_utc = _dt.now(_tz.utc)
-                    pending = HostUpdatePackage.query.filter_by(host_id=host_id, status="pending").all()
-                    applied_count = len(pending)
-                    security_count = len([p for p in pending if p.severity == "critical"])
-                    for pkg in pending:
-                        pkg.status = "applied"
-                        pkg.applied_at = now_utc
-                    db.session.commit()
+                    applied_count, security_count = _reconcile_host_packages(
+                        host_id, upgradable_output, _append)
 
                     from core.notifier import send_updates_applied_notification
-                    type_label = "PBS" if host.host_type == "pbs" else "PVE"
+                    type_label = "PBS" if host.is_pbs else "PVE"
                     send_updates_applied_notification([{
                         "name": host.name,
                         "type": type_label,
@@ -793,6 +842,7 @@ def _run_apply(host_id, app_ctx):
                         "security": security_count,
                     }])
             except Exception as e:
+                db.session.rollback()
                 logger.error(f"Failed to record host update apply: {e}")
 
         with _apply_lock:
@@ -863,7 +913,7 @@ def apply_cancel(host_id):
 
 
 # ---------------------------------------------------------------------------
-# Bulk update — apply pending updates to every PVE host, one at a time
+# Bulk update — apply pending updates to every PVE/PBS host, one at a time
 # ---------------------------------------------------------------------------
 
 def _run_bulk_apply(app_ctx):
@@ -922,7 +972,11 @@ def _run_bulk_apply(app_ctx):
 
 @bp.route("/updates/apply-all", methods=["POST"])
 def apply_all_updates():
-    """Start a sequential bulk update across all PVE hosts with pending updates."""
+    """Start a sequential bulk update across all PVE and PBS hosts with pending updates.
+
+    PVE nodes go first and PBS hosts last, so a backup server is not
+    restarting its services while the nodes it serves are mid-upgrade.
+    """
     from datetime import datetime as _dt
     from datetime import timezone as _tz
 
@@ -933,15 +987,14 @@ def apply_all_updates():
             flash("A bulk host update is already running.", "warning")
             return redirect(url_for("hosts.apply_all_progress"))
 
-    # Only PVE hosts (PBS excluded by design) that have pending package updates.
     hosts = (ProxmoxHost.query
              .filter(ProxmoxHost.host_update_packages.any(HostUpdatePackage.status == "pending"))
              .order_by(ProxmoxHost.name)
              .all())
-    targets = [h for h in hosts if not h.is_pbs]
+    targets = sorted(hosts, key=lambda h: h.is_pbs)  # stable: PVE first, then PBS, by name
 
     if not targets:
-        flash("No PVE hosts have pending updates.", "info")
+        flash("No hosts have pending updates.", "info")
         return redirect(url_for("hosts.index"))
 
     items = [{"host_id": h.id, "name": h.name, "state": "pending", "reason": None} for h in targets]
