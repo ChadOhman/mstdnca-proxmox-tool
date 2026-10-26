@@ -8,7 +8,7 @@ requests==2.34.2
 # paramiko 5.0.0 fixes CVE-2026-44405 (flagged by pip-audit against 4.0.0) and the
 # earlier Dependabot GHSA (low) rsakey.py SHA-1 advisory. Stable APIs used by
 # clients/ssh_client.py (SSHClient, *Key.from_private_key, AutoAddPolicy) are unchanged.
-paramiko==5.0.0
+paramiko==5.1.0
 # cryptography 48.0.1 fixes GHSA-537c-gmf6-5ccf (flagged by pip-audit against
 # 46.0.7). paramiko 5.0.0 and PyJWT[crypto] 2.13.0 both accept cryptography 48.x.
 cryptography==50.0.1
