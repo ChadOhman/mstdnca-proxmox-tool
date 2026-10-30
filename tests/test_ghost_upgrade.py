@@ -23,6 +23,7 @@ from apps.ghost import (
     _resolve_ghost_http_target,
     _resolve_ghost_service_user,
     _resolve_guest_binary,
+    _stop_stale_permission_sweeps,
     run_ghost_upgrade,
 )
 
@@ -81,21 +82,53 @@ class TestFixGhostPermissions:
         ssh = FakeSSH()
         assert _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log) is True
         cmd = ssh.calls[0]
-        assert "chown -R ghost_user: /opt/ghost" in cmd
-        assert "-type f -exec chmod 664" in cmd
-        assert "-type d -exec chmod 775" in cmd
+        assert cmd.startswith("cd /opt/ghost && ")
+        assert "! -user ghost_user -exec chown ghost_user: {} +" in cmd
+        assert "-type f ! -perm 664 -exec chmod 664 {} +" in cmd
+        assert "-type d ! -perm 775 -exec chmod 775 {} +" in cmd
 
-    def test_excludes_versions_tree_from_chmod(self):
+    def test_prunes_versions_trees_instead_of_filtering_them(self):
+        # ``! -path`` still descends into every versions/*/node_modules and
+        # ``chown -R`` walked them all; on a host with several installed
+        # releases that pushed the sweep past ten minutes.
         logs, log = _collect_log()
         ssh = FakeSSH()
         _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log)
-        assert "! -path '*/versions/*'" in ssh.calls[0]
+        cmd = ssh.calls[0]
+        assert '-path "./versions/*" -prune -o' in cmd
+        assert "! -path" not in cmd
+        assert "chown -R" not in cmd
+
+    def test_sweep_is_killed_on_the_guest_not_abandoned(self):
+        # A client-side timeout closes the channel but sshd leaves the remote
+        # find/chown running; the guest's own ``timeout`` must own the budget
+        # and the channel budget must outlast it.
+        logs, log = _collect_log()
+        ssh = FakeSSH()
+        seen = {}
+
+        def _execute_sudo(cmd, timeout=None):
+            seen["timeout"] = timeout
+            seen["cmd"] = cmd
+            return ("", "", 0)
+
+        ssh.execute_sudo = _execute_sudo
+        _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log)
+        assert f"timeout -k 10 {_PERMS_FIX_TIMEOUT} " in seen["cmd"]
+        assert seen["timeout"] > _PERMS_FIX_TIMEOUT
+        assert _PERMS_FIX_TIMEOUT >= 600
 
     def test_returns_false_and_warns_on_nonzero(self):
         logs, log = _collect_log()
-        ssh = FakeSSH([("chown -R", ("", "Operation not permitted", 1))])
+        ssh = FakeSSH([("chown ghost_user:", ("", "Operation not permitted", 1))])
         assert _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log) is False
         assert any("WARNING" in line for line in logs)
+
+    def test_guest_timeout_exit_is_reported_as_killed(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("chown ghost_user:", ("", "", 124))])
+        assert _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log) is False
+        assert any("killed after" in line for line in logs), logs
 
     def test_hands_content_to_the_service_account(self):
         # ghost-cli's linux-user layout: install owned by the CLI user,
@@ -107,31 +140,31 @@ class TestFixGhostPermissions:
         ssh = FakeSSH()
         _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log, service_user="ghost")
         cmd = ssh.calls[0]
-        assert "chown -R ghost_user: /opt/ghost" in cmd
-        assert cmd.index("chown -R ghost_user: /opt/ghost") < cmd.index("chown -R ghost: /opt/ghost/content")
+        assert "chown ghost_user: {} +" in cmd
+        assert cmd.index("chown ghost_user: {} +") < cmd.index("find ./content ! -user ghost -exec chown ghost: {} +")
 
     def test_no_content_chown_when_service_account_is_the_cli_user(self):
         logs, log = _collect_log()
         ssh = FakeSSH()
         _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log, service_user="ghost_user")
-        assert "/opt/ghost/content" not in ssh.calls[0]
+        assert "./content" not in ssh.calls[0]
 
-    def test_sweep_gets_a_long_timeout(self):
-        # The tree walk (versions/*/node_modules + content/images) took longer
-        # than the old 120 s budget on production, which silently skipped the
-        # remediation with "[timeout after 120 s]".
+
+class TestStopStalePermissionSweeps:
+    def test_kills_only_the_old_sweep_command_shapes(self):
         logs, log = _collect_log()
-        ssh = FakeSSH()
-        seen = {}
+        ssh = FakeSSH([("pgrep", ("2\n", "", 0))])
+        _stop_stale_permission_sweeps(ssh, "/opt/ghost", log)
+        cmd = ssh.calls[0]
+        assert "pkill -f -- '^find /opt/ghost ! -path'" in cmd
+        assert "pkill -f -- '^chown -R [A-Za-z0-9_.-]*: /opt/ghost'" in cmd
+        assert any("Stopped 2 stale" in line for line in logs), logs
 
-        def _execute_sudo(cmd, timeout=None):
-            seen["timeout"] = timeout
-            return ("", "", 0)
-
-        ssh.execute_sudo = _execute_sudo
-        _fix_ghost_permissions(ssh, "/opt/ghost", "ghost_user", log)
-        assert seen["timeout"] == _PERMS_FIX_TIMEOUT
-        assert _PERMS_FIX_TIMEOUT >= 600
+    def test_silent_when_nothing_was_running(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("pgrep", ("0\n", "", 0))])
+        _stop_stale_permission_sweeps(ssh, "/opt/ghost", log)
+        assert logs == []
 
 
 class TestResolveGhostServiceUser:
@@ -316,7 +349,7 @@ class TestGhostUpgradePostUpdatePermissions:
         assert ok is True
 
         # The permission fix runs twice: once before, once after the update.
-        perms_idxs = [i for i, c in enumerate(ssh.calls) if "chown -R ghost_user:" in c]
+        perms_idxs = [i for i, c in enumerate(ssh.calls) if "chown ghost_user: {} +" in c]
         assert len(perms_idxs) == 2, ssh.calls
         update_idx = ssh.index_of("ghost update")
         assert perms_idxs[0] < update_idx < perms_idxs[1]
@@ -327,9 +360,30 @@ class TestGhostUpgradePostUpdatePermissions:
         ok, _ = self._run(ssh)
 
         assert ok is True
-        perms = [c for c in ssh.calls if "chown -R ghost_user:" in c]
+        perms = [c for c in ssh.calls if "chown ghost_user: {} +" in c]
         assert len(perms) == 2
-        assert all("chown -R ghost: /opt/ghost/content" in c for c in perms), perms
+        assert all("find ./content ! -user ghost -exec chown ghost: {} +" in c for c in perms), perms
+
+    def test_failed_pre_update_sweep_aborts_before_ghost_update(self):
+        # A sweep that was killed on the guest (exit 124) or failed outright
+        # leaves a tree ghost-cli's check-permissions would reject, so the
+        # update must not be attempted on top of it.
+        ssh = self._healthy_ssh()
+        ssh.responses.insert(0, ("chown ghost_user: {} +", ("", "", 124)))
+        ok, log_text = self._run(ssh)
+
+        assert ok is False
+        assert not ssh.ran("ghost update")
+        assert "aborting before ghost update" in log_text
+
+    def test_stale_sweeps_are_stopped_before_the_new_sweep(self):
+        ssh = self._healthy_ssh()
+        ok, _ = self._run(ssh)
+
+        assert ok is True
+        kill_idx = ssh.index_of("pkill -f -- '^find /opt/ghost ! -path'")
+        perms_idx = ssh.index_of("chown ghost_user: {} +")
+        assert 0 <= kill_idx < perms_idx, ssh.calls
 
     def test_db_privileges_checked_before_update(self):
         ssh = self._healthy_ssh()
@@ -345,7 +399,7 @@ class TestGhostUpgradePostUpdatePermissions:
         ok, _ = self._run(ssh)
 
         assert ok is True
-        perms_idxs = [i for i, c in enumerate(ssh.calls) if "chown -R ghost_user:" in c]
+        perms_idxs = [i for i, c in enumerate(ssh.calls) if "chown ghost_user: {} +" in c]
         # Match the actual restart command, not the "systemctl restart ..."
         # substring that also appears inside the sudoers NOPASSWD grant lines.
         restart_idx = ssh.index_of("systemctl restart ghost_example-site 2>&1")
