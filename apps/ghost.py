@@ -86,8 +86,13 @@ def _get_ghost_config():
 # default is /etc/nginx).  The pre-update migrations rewrite files under here.
 _NGINX_SITES = "/etc/nginx/sites-available"
 
-# Seconds allowed for the chmod/chown sweep in _fix_ghost_permissions.
+# Seconds the guest-side ``timeout`` gives the chmod/chown sweep in
+# _fix_ghost_permissions.  The SSH channel budget is a little longer so the
+# sweep is always killed *on the guest* (exit 124) rather than abandoned by
+# the client: sshd does not kill a command whose channel the client closed,
+# so a client-side timeout used to leave find/chown running on the guest.
 _PERMS_FIX_TIMEOUT = 600
+_PERMS_FIX_CHANNEL_GRACE = 30
 
 
 def _resolve_guest_binary(ssh, name, default):
@@ -134,14 +139,22 @@ def _fix_ghost_permissions(ssh, ghost_dir, user, log, service_user=None):
     """Re-assert Ghost file ownership and modes over an SSH connection.
 
     Files outside ``versions/`` are normalised to 664, directories to 775, and
-    the tree is chowned to *user* (the account that owns the install and runs
-    ghost-cli).  ``content/`` is then handed to *service_user* — the account
-    the systemd unit runs as — because that is what ghost-cli's ``linux-user``
-    layout expects: its systemd precheck refuses to stop/start the service
-    unless ``content/`` is owned by the ``ghost`` account, and Ghost itself
-    writes logs, images and settings there at runtime.  The ``versions/``
-    trees are excluded from chmod so executable bits under
-    ``node_modules/.bin`` survive.
+    everything outside ``versions/`` is chowned to *user* (the account that
+    owns the install and runs ghost-cli).  ``content/`` is then handed to
+    *service_user* — the account the systemd unit runs as — because that is
+    what ghost-cli's ``linux-user`` layout expects: its systemd precheck
+    refuses to stop/start the service unless ``content/`` is owned by the
+    ``ghost`` account, and Ghost itself writes logs, images and settings there
+    at runtime.
+
+    The ``versions/<v>`` trees are pruned from the walk entirely: each one
+    carries a full ``node_modules``, ghost-cli extracts them as *user* in the
+    first place, and its own ``check-permissions`` step ignores them too.
+    Descending into them (as the old ``! -path`` filter and ``chown -R`` did)
+    is what pushed the sweep past ten minutes on a host with several installed
+    releases.  Only entries whose mode or owner is actually wrong are touched,
+    and the whole sweep runs under the guest's ``timeout`` so it dies with the
+    SSH channel instead of lingering on the guest after a client-side timeout.
 
     Run this both *before* ``ghost update`` (ghost-cli's check-permissions step
     rejects files with wrong modes) and *after* it: the update unpacks a new
@@ -149,25 +162,63 @@ def _fix_ghost_permissions(ssh, ghost_dir, user, log, service_user=None):
     files owned by root and make Ghost hit ``EACCES`` at runtime.
 
     Returns True on success.  On a non-zero exit it logs a warning and returns
-    False — the failure is non-fatal, so the caller decides whether to proceed.
+    False — the caller decides whether to proceed.
     """
-    perms_cmds = (
-        f"find {ghost_dir} ! -path '*/versions/*' -type f -exec chmod 664 {{}} + "
-        f"&& find {ghost_dir} ! -path '*/versions/*' -type d -exec chmod 775 {{}} + "
-        f"&& chown -R {user}: {ghost_dir}"
-    )
+    # Everything below runs with ghost_dir as cwd so the prune pattern is a
+    # fixed relative path.  It is double-quoted because the inner sh would
+    # otherwise glob it against the real versions/ entries.  versions/ itself
+    # is still visited (ghost-cli needs to create versions/<new> as *user*);
+    # only the per-release trees under it are skipped.
+    prune = '-path "./versions/*" -prune -o'
+    steps = [
+        f"find . {prune} -type f ! -perm 664 -exec chmod 664 {{}} +",
+        f"find . {prune} -type d ! -perm 775 -exec chmod 775 {{}} +",
+        f"find . {prune} ! -user {user} -exec chown {user}: {{}} +",
+    ]
     if service_user and service_user != user:
-        perms_cmds += f" && chown -R {service_user}: {ghost_dir}/content"
-    # Walking the whole tree (every versions/*/node_modules plus a large
-    # content/images) routinely takes longer than two minutes on production
-    # hosts, and a timeout here silently skips the remediation.
-    stdout, stderr, code = ssh.execute_sudo(perms_cmds, timeout=_PERMS_FIX_TIMEOUT)
+        steps.append(f"find ./content ! -user {service_user} -exec chown {service_user}: {{}} +")
+    sweep = " && ".join(steps)
+    perms_cmds = (
+        f"cd {ghost_dir} && timeout -k 10 {_PERMS_FIX_TIMEOUT} nice -n 10 sh -c '{sweep}'"
+    )
+    stdout, stderr, code = ssh.execute_sudo(
+        perms_cmds, timeout=_PERMS_FIX_TIMEOUT + _PERMS_FIX_CHANNEL_GRACE
+    )
     if code == 0:
         log("File permissions fixed")
         return True
+    if code == 124:
+        log(f"WARNING: Permission fix was killed after {_PERMS_FIX_TIMEOUT} s on the guest")
+        return False
     log(f"WARNING: Permission fix returned exit {code}: "
         f"{(stderr or stdout or '').strip()[:200]}")
     return False
+
+
+def _stop_stale_permission_sweeps(ssh, ghost_dir, log):
+    """Kill find/chown sweeps left behind by earlier, timed-out upgrade runs.
+
+    Before the sweep ran under the guest's ``timeout``, a client-side timeout
+    closed the SSH channel but left the remote ``find ... chown -R`` chain
+    running; every retry stacked another one on top, and the resulting I/O
+    load is what made each later attempt slower still.  Only the exact
+    command shapes this module has ever issued are matched.
+    """
+    # Anchored to the start of the command line, so the shell running this
+    # very command (whose argv also contains the pattern) never matches.
+    patterns = (
+        f"^find {ghost_dir} ! -path",
+        f"^chown -R [A-Za-z0-9_.-]*: {ghost_dir}",
+    )
+    parts = ["n=0"]
+    for pat in patterns:
+        parts.append(f"n=$((n + $(pgrep -fc -- '{pat}')))")
+        parts.append(f"pkill -f -- '{pat}'")
+    parts.append("echo $n")
+    out, _, _ = ssh.execute_sudo("; ".join(parts), timeout=15)
+    count = (out or "").strip().splitlines()[-1].strip() if (out or "").strip() else "0"
+    if count.isdigit() and int(count) > 0:
+        log(f"Stopped {count} stale permission sweep process(es) left by earlier runs")
 
 
 def _preflight_nginx_reload(ssh, nginx_bin, log):
@@ -1040,7 +1091,13 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
             # cache files with executable bits), so do it proactively to keep
             # the update from aborting.
             log("Fixing file permissions...")
-            _fix_ghost_permissions(ssh, ghost_dir, user, log, service_user=service_user)
+            _stop_stale_permission_sweeps(ssh, ghost_dir, log)
+            if not _fix_ghost_permissions(ssh, ghost_dir, user, log, service_user=service_user):
+                # ghost-cli's check-permissions step would reject the tree, and
+                # a sweep that is still running (or was killed half-way) is
+                # exactly the I/O load that makes the update itself fail.
+                log("ERROR: aborting before ghost update — nothing was modified")
+                return False, "\n".join(log_lines)
             log("")
 
             # Ensure the Ghost DB user can run migration DDL *before* the update
