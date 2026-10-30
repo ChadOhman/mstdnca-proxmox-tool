@@ -12,6 +12,7 @@ import pytest
 
 from apps.ghost import (
     _PERMS_FIX_TIMEOUT,
+    _check_ghost_db_engine,
     _check_ghost_http,
     _ensure_ghost_db_privileges,
     _ensure_node_compatible,
@@ -20,6 +21,8 @@ from apps.ghost import (
     _node_satisfies,
     _node_target_major,
     _preflight_nginx_reload,
+    _recover_after_failed_update,
+    _report_ghost_state,
     _resolve_ghost_http_target,
     _resolve_ghost_service_user,
     _resolve_guest_binary,
@@ -580,6 +583,185 @@ class TestGhostSudoersGrants:
         assert "/usr/sbin/nginx -t" in cmd
         assert "/usr/bin/systemctl daemon-reload" in cmd
 
+    def test_grants_ghost_cli_rollback_via_current_symlink(self):
+        # ghost-cli's automatic rollback runs
+        # 'sudo /opt/ghost/current/node_modules/.bin/knex-migrator-rollback ...'.
+        # sudo matches the typed path, not the resolved one, so the grant
+        # must use current/, not versions/*.  Without it the rollback died on
+        # the password prompt and left current on the broken release.
+        ssh = self._ssh()
+        self._run(ssh)
+        cmd = self._sudoers_cmd(ssh)
+        assert ("ghost_user ALL=(root) NOPASSWD: "
+                "/opt/ghost/current/node_modules/.bin/knex-migrator-rollback *") in cmd
+        assert ("ghost_user ALL=(root) NOPASSWD: "
+                "/opt/ghost/current/node_modules/.bin/knex-migrator-migrate *") in cmd
+
+
+class TestCheckGhostDbEngine:
+    def test_warns_on_mariadb(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("ghost-db-host", ('"localhost"', "", 0)),
+            ("SELECT VERSION()", ("10.5.29-MariaDB-0+deb11u1\n", "", 0)),
+        ])
+        assert _check_ghost_db_engine(ssh, "/opt/ghost", log) == "10.5.29-MariaDB-0+deb11u1"
+        warn = [line for line in logs if line.startswith("WARNING")]
+        assert len(warn) == 1, logs
+        assert "MariaDB (10.5.29-MariaDB-0+deb11u1)" in warn[0]
+        assert "6.73" in warn[0]
+
+    def test_quiet_on_mysql(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("ghost-db-host", ('"localhost"', "", 0)),
+            ("SELECT VERSION()", ("8.4.13\n", "", 0)),
+        ])
+        assert _check_ghost_db_engine(ssh, "/opt/ghost", log) == "8.4.13"
+        assert not any("WARNING" in line for line in logs), logs
+        assert any("8.4.13" in line for line in logs)
+
+    def test_skips_remote_host_without_querying(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("ghost-db-host", ('"10.0.4.119"', "", 0))])
+        assert _check_ghost_db_engine(ssh, "/opt/ghost", log) is None
+        assert not ssh.ran("SELECT VERSION()")
+        assert any("10.0.4.119 (remote)" in line for line in logs), logs
+        assert not any("WARNING" in line for line in logs)
+
+    def test_skips_when_no_local_server(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("ghost-db-host", ('""', "", 0)),
+            ("SELECT VERSION()", ("", "ERROR 2002 (HY000): Can't connect", 1)),
+        ])
+        assert _check_ghost_db_engine(ssh, "/opt/ghost", log) is None
+        assert not any("WARNING" in line for line in logs)
+
+    def test_privilege_check_skips_remote_host(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("ghost-db-host", ('"10.0.4.119"', "", 0)),
+            ("config.production.json", ('["ghost", "ghost"]', "", 0)),
+        ])
+        assert _ensure_ghost_db_privileges(ssh, "/opt/ghost", log) is False
+        assert not ssh.ran("SHOW GRANTS")
+        assert not ssh.ran("GRANT ALL")
+        assert any("remote" in line and "skipping" in line for line in logs), logs
+        assert not any("WARNING" in line for line in logs)
+
+
+class TestReportGhostState:
+    UNIT = "ghost_news-mstdn-ca"
+
+    def test_reports_site_down_on_broken_release(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("readlink /opt/ghost/current", ("/opt/ghost/versions/6.73.0\n", "", 0)),
+            ("is-active", ("inactive\n", "", 3)),
+            ("ghost-http-target", ('{"url": "https://news.example", "host": "127.0.0.1", "port": 2370}', "", 0)),
+            ("curl", ("HTTP:000", "", 0)),
+        ])
+        assert _report_ghost_state(ssh, "/opt/ghost", self.UNIT, log) == ("6.73.0", False, "000")
+        assert any("current -> 6.73.0, service inactive, HTTP 000 at http://127.0.0.1:2370/" in line
+                   for line in logs), logs
+        assert any(line.startswith("SITE IS DOWN") for line in logs)
+
+    def test_reports_site_up(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("readlink /opt/ghost/current", ("/opt/ghost/versions/6.64.0\n", "", 0)),
+            ("is-active", ("active\n", "", 0)),
+            ("curl", ("HTTP:301", "", 0)),
+        ])
+        assert _report_ghost_state(ssh, "/opt/ghost", self.UNIT, log) == ("6.64.0", True, "301")
+        assert any("Site is up on 6.64.0" in line for line in logs), logs
+
+    def test_unreadable_link_is_reported_as_unknown(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([("is-active", ("inactive\n", "", 3))])
+        version, active, code = _report_ghost_state(ssh, "/opt/ghost", self.UNIT, log)
+        assert version is None and active is False
+        assert any("current -> unknown" in line for line in logs)
+
+
+class TestRecoverAfterFailedUpdate:
+    UNIT = "ghost_news-mstdn-ca"
+
+    def _broken(self, extra=()):
+        # current moved to 6.73.0 while 6.64.0 was running, service dead.
+        return FakeSSH(list(extra) + [
+            ("readlink /opt/ghost/current", ("/opt/ghost/versions/6.73.0\n", "", 0)),
+            ("is-active", ("inactive\n", "", 3)),
+            ("curl", ("HTTP:000", "", 0)),
+        ])
+
+    def test_retries_rollback_once_after_sweeping_permissions(self):
+        logs, log = _collect_log()
+        ssh = self._broken([("ghost update --rollback", ("Rolled back", "", 0))])
+        _recover_after_failed_update(ssh, "/opt/ghost", "ghost_user", self.UNIT, "6.64.0", log,
+                                     service_user="ghost")
+        rollback_idx = ssh.index_of("ghost update --rollback --no-prompt")
+        sweep_idx = ssh.index_of("chown ghost_user: {} +")
+        assert 0 <= sweep_idx < rollback_idx, ssh.calls
+        assert ssh.calls[rollback_idx].startswith("su - ghost_user -c 'cd /opt/ghost && ghost update --rollback")
+        assert len([c for c in ssh.calls if "--rollback" in c]) == 1
+        # Reported twice: before and after the rollback attempt.
+        assert len([c for c in ssh.calls if "readlink /opt/ghost/current" in c]) == 2
+        assert any("retrying ghost-cli's rollback once" in line for line in logs), logs
+        assert any(line.startswith("State after rollback") for line in logs)
+
+    def test_returns_true_when_rollback_restores_the_old_release(self):
+        logs, log = _collect_log()
+        state = {"rolled": False}
+
+        def _execute_sudo(cmd, timeout=None):
+            if "ghost update --rollback" in cmd:
+                state["rolled"] = True
+                return ("ok", "", 0)
+            if "readlink" in cmd:
+                return (f"/opt/ghost/versions/{'6.64.0' if state['rolled'] else '6.73.0'}\n", "", 0)
+            if "is-active" in cmd:
+                return ("active\n" if state["rolled"] else "inactive\n", "", 0)
+            if "curl" in cmd:
+                return ("HTTP:301" if state["rolled"] else "HTTP:000", "", 0)
+            return ("", "", 0)
+
+        ssh = FakeSSH()
+        ssh.execute_sudo = _execute_sudo
+        ok = _recover_after_failed_update(ssh, "/opt/ghost", "ghost_user", self.UNIT, "6.64.0", log)
+        assert ok is True
+        assert any("Site is up on 6.64.0" in line for line in logs), logs
+
+    def test_no_rollback_when_service_is_still_active(self):
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("readlink /opt/ghost/current", ("/opt/ghost/versions/6.64.0\n", "", 0)),
+            ("is-active", ("active\n", "", 0)),
+            ("curl", ("HTTP:301", "", 0)),
+        ])
+        assert _recover_after_failed_update(ssh, "/opt/ghost", "ghost_user", self.UNIT, "6.64.0", log) is False
+        assert not ssh.ran("--rollback")
+        assert not ssh.ran("chown")
+
+    def test_no_rollback_when_current_never_moved(self):
+        # Failed before linking (e.g. a doctor check): nothing to roll back.
+        logs, log = _collect_log()
+        ssh = FakeSSH([
+            ("readlink /opt/ghost/current", ("/opt/ghost/versions/6.64.0\n", "", 0)),
+            ("is-active", ("inactive\n", "", 3)),
+            ("curl", ("HTTP:000", "", 0)),
+        ])
+        assert _recover_after_failed_update(ssh, "/opt/ghost", "ghost_user", self.UNIT, "6.64.0", log) is False
+        assert not ssh.ran("--rollback")
+        assert any(line.startswith("SITE IS DOWN") for line in logs)
+
+    def test_no_rollback_without_a_known_previous_version(self):
+        logs, log = _collect_log()
+        ssh = self._broken()
+        assert _recover_after_failed_update(ssh, "/opt/ghost", "ghost_user", self.UNIT, None, log) is False
+        assert not ssh.ran("--rollback")
+
 
 class TestPreflightNginxReload:
     """ghost-cli's nginx migrations end in 'nginx -s reload' and hide its stderr
@@ -700,6 +882,40 @@ class TestGhostUpgradeNginxPreflightAndDebugLog:
         assert ssh.index_of("ghost-cli-debug-") > ssh.index_of("ghost update")
         assert "ghost-cli debug log (tail)" in msg
         assert "invalid PID number" in msg
+
+    def test_failed_update_reports_state_and_retries_rollback(self):
+        # The 2026-10-30 shape: migrations blew up after ghost-cli had linked
+        # 6.73.0; its own rollback was blocked.  The job must say the site is
+        # down and try the rollback once itself, after a permission sweep.
+        responses = self._base_responses()
+        responses[0] = (".ghost-cli", ('{"name": "example-site", "active-version": "6.64.0"}', "", 0))
+        ssh = FakeSSH(responses + [
+            ("ghost update --rollback", ("Rolled back", "", 0)),
+            ("ghost update", ("[FAILED] Ghost was able to start, but errored during boot", "", 1)),
+            ("readlink /opt/ghost/current", ("/opt/ghost/versions/6.73.0\n", "", 0)),
+            ("is-active", ("inactive\n", "", 3)),
+            ("curl", ("HTTP:000", "", 0)),
+        ])
+        ok, msg = self._run(ssh)
+        assert ok is False
+        assert "SITE IS DOWN (current -> 6.73.0)" in msg
+        rollback_idx = ssh.index_of("ghost update --rollback --no-prompt")
+        assert rollback_idx > ssh.index_of("ghost update --no-prompt"), ssh.calls
+        assert rollback_idx > ssh.index_of("ghost-cli-debug-")
+        assert "retrying ghost-cli's rollback once" in msg
+        assert "State after rollback" in msg
+
+    def test_mariadb_warning_logged_before_update(self):
+        ssh = FakeSSH(self._base_responses() + [
+            ("SELECT VERSION()", ("10.5.29-MariaDB-0+deb11u1\n", "", 0)),
+            ("ghost update", ("Finished", "", 0)),
+            ("is-active", ("active", "", 0)),
+            ("curl", ("HTTP:200", "", 0)),
+        ])
+        ok, msg = self._run(ssh)
+        assert ok is True
+        assert ssh.index_of("SELECT VERSION()") < ssh.index_of("ghost update --no-prompt")
+        assert "WARNING: database server is MariaDB" in msg
 
     def test_debug_log_not_fetched_on_success(self):
         ssh = FakeSSH(self._base_responses() + [
