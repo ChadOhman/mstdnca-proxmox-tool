@@ -527,6 +527,9 @@ def _check_ghost_http(ssh, ghost_dir, nginx_bin, log, attempts=6, delay=10):
 # (un-backticked) identifier is safe to use directly — no shell metacharacters
 # and no SQL-quote-breaking characters are possible.
 _DB_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.]+)?$")
+# Database hosts the guest's own 'mysql -u root' (unix socket) can see.
+_LOCAL_DB_HOSTS = ("", "localhost", "127.0.0.1", "::1")
 
 
 def _resolve_ghost_db(ssh, ghost_dir):
@@ -576,6 +579,12 @@ def _ensure_ghost_db_privileges(ssh, ghost_dir, log):
         log(f"WARNING: resolved DB name/user has unexpected characters "
             f"(db={db!r}, user={user!r}) — skipping DB privilege check")
         return False
+    host = _resolve_ghost_db_host(ssh, ghost_dir)
+    if host not in _LOCAL_DB_HOSTS:
+        # The local 'mysql -u root' cannot see a remote server, and the
+        # account there is '<user>'@'<guest ip>', not @'localhost'.
+        log(f"Database host is {host} (remote) — skipping local DB privilege check")
+        return False
 
     show_sql = f"SHOW GRANTS FOR '{user}'@'localhost'"  # noqa: S608
     grants_out, grants_err, grants_code = ssh.execute_sudo(
@@ -605,6 +614,133 @@ def _ensure_ghost_db_privileges(ssh, ghost_dir, log):
         return False
     log(f"MySQL privileges granted for '{user}'@'localhost' on `{db}`")
     return True
+
+
+def _check_ghost_db_engine(ssh, ghost_dir, log):
+    """Warn before the update when Ghost's database is MariaDB.
+
+    Ghost supports MySQL 8 only.  Since 6.73 its schema has ``pattern:``
+    columns, for which Ghost emits an inline ``CONSTRAINT <name> CHECK (col
+    REGEXP ...)`` on any MySQL-family server; MariaDB accepts only an unnamed
+    column-level CHECK, so the migration dies with a SQL syntax error after
+    ``current`` has already been switched (2026-10-30, news.mstdn.ca).  The
+    same code path runs for every future pattern column, so this is not a
+    one-off.
+
+    A warning only: the operator may be pinning an older release.  Returns the
+    detected version string, or None when there is no local server to ask
+    (a remote database host, or ``mysql`` not installed).
+    """
+    host = _resolve_ghost_db_host(ssh, ghost_dir)
+    if host not in _LOCAL_DB_HOSTS:
+        log(f"Database host is {host} (remote) — skipping database engine check")
+        return None
+    out, _, code = ssh.execute_sudo("mysql -u root -N -e 'SELECT VERSION()'", timeout=15)
+    version = (out or "").strip().splitlines()[0].strip() if (out or "").strip() else ""
+    if code != 0 or not version:
+        log("Local database server not reachable as root — skipping database engine check")
+        return None
+    if "mariadb" in version.lower():
+        log(f"WARNING: database server is MariaDB ({version}). Ghost supports MySQL 8 "
+            "only; Ghost 6.73+ migrations fail on MariaDB (inline named CHECK "
+            "constraints), and the failure happens after 'current' has been switched. "
+            "Move the database to MySQL 8 before updating past 6.72.")
+    else:
+        log(f"Database server: {version}")
+    return version
+
+
+def _resolve_ghost_db_host(ssh, ghost_dir):
+    """Read ``database.connection.host`` from ``config.production.json``.
+
+    Returns the host as a string ('' when unset, which Ghost treats as
+    localhost), or '' when the config cannot be read, so callers fall back to
+    the local-server behaviour.
+    """
+    cfg = f"{ghost_dir}/config.production.json"
+    py_cmd = (
+        f"python3 -c \"import json; "
+        f"c = json.load(open('{cfg}'))['database']['connection']; "
+        f"print(json.dumps(str(c.get('host') or '')))\" 2>/dev/null  # ghost-db-host"
+    )
+    stdout, _, code = ssh.execute_sudo(py_cmd, timeout=10)
+    if code != 0 or not (stdout or "").strip():
+        return ""
+    try:
+        host = json.loads(stdout.strip())
+    except ValueError:
+        return ""
+    return host.strip() if isinstance(host, str) else ""
+
+
+# ---------------------------------------------------------------------------
+# Post-failure state and recovery
+# ---------------------------------------------------------------------------
+
+def _report_ghost_state(ssh, ghost_dir, service_name, log, label="Post-failure state"):
+    """Log where the install actually stands and return it.
+
+    A failed ``ghost update`` can leave ``current`` on the new release with the
+    service dead — exactly what the exit code and ghost-cli's one-line error
+    do not say.  Returns ``(version, active, http_code)`` where *version* is
+    the release ``current`` points at (None if unreadable).
+    """
+    out, _, _ = ssh.execute_sudo(f"readlink {ghost_dir}/current 2>/dev/null", timeout=10)
+    target = (out or "").strip()
+    version = _osp.basename(target.rstrip("/")) if target else ""
+    version = version if _VERSION_RE.fullmatch(version) else None
+
+    out, _, _ = ssh.execute_sudo(f"systemctl is-active {service_name} 2>/dev/null", timeout=15)
+    unit_state = (out or "").strip() or "unknown"
+    active = unit_state == "active"
+
+    _, host, port = _resolve_ghost_http_target(ssh, ghost_dir)
+    out, _, _ = ssh.execute_sudo(
+        f"c=$(curl -s -o /dev/null -m 10 -w '%{{http_code}}' http://{host}:{port}/); echo HTTP:$c",
+        timeout=30,
+    )
+    m = re.search(r"HTTP:(\d{3})", out or "")
+    http_code = m.group(1) if m else "000"
+
+    log(f"{label}: current -> {version or 'unknown'}, service {unit_state}, "
+        f"HTTP {http_code} at http://{host}:{port}/")
+    if active and http_code[0] in "23":
+        log(f"Site is up on {version or 'the linked release'}")
+    else:
+        log(f"SITE IS DOWN (current -> {version or 'unknown'})")
+    return version, active, http_code
+
+
+def _recover_after_failed_update(ssh, ghost_dir, user, service_name, pre_version, log,
+                                 service_user=None):
+    """After a failed ``ghost update``: report the state and retry the rollback once.
+
+    ghost-cli already attempts ``ghost update --rollback`` itself when the new
+    release fails to boot, but that rollback re-runs the doctor checks and the
+    file-permissions check rejects whatever corepack downloaded into
+    ``.cache/`` during the update, so it is abandoned with ``current`` still
+    on the broken release.  Re-running the permission sweep clears that, so
+    one more ``--rollback`` attempt is worth making.  Only when the facts
+    warrant it: ``current`` moved away from the release that was running and
+    the service is not active.  Never loops.
+    """
+    version, active, _ = _report_ghost_state(ssh, ghost_dir, service_name, log)
+    if active or not pre_version or not version or version == pre_version:
+        return False
+
+    log(f"ghost update left current on {version} while {pre_version} was running — "
+        f"retrying ghost-cli's rollback once")
+    _fix_ghost_permissions(ssh, ghost_dir, user, log, service_user=service_user)
+    rollback_cmd = f"su - {user} -c 'cd {ghost_dir} && ghost update --rollback --no-prompt'"
+    log(f"Running: {rollback_cmd}")
+    stdout, stderr, code = ssh.execute_sudo(rollback_cmd, timeout=600)
+    _log_cmd_output(log, stdout, stderr, code, max_chars=3000)
+    if code != 0:
+        log(f"WARNING: rollback returned exit {code}")
+    version, active, _ = _report_ghost_state(
+        ssh, ghost_dir, service_name, log, label="State after rollback"
+    )
+    return active and version == pre_version
 
 
 # ---------------------------------------------------------------------------
@@ -1021,10 +1157,16 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
             ghost_cli_raw, _, cli_rc = ssh.execute_sudo(
                 f"cat {ghost_dir}/.ghost-cli 2>/dev/null", timeout=10
             )
+            pre_version = None
             if cli_rc == 0 and ghost_cli_raw.strip():
                 m_name = re.search(r'"name"\s*:\s*"([^"]+)"', ghost_cli_raw)
                 if m_name and re.match(r"^[a-zA-Z0-9_-]+$", m_name.group(1)):
                     service_name = f"ghost_{m_name.group(1)}"
+                # Remembered so a failed update can tell whether ghost-cli
+                # left 'current' on the new release.
+                m_ver = re.search(r'"active-version"\s*:\s*"([^"]+)"', ghost_cli_raw)
+                if m_ver and _VERSION_RE.fullmatch(m_ver.group(1)):
+                    pre_version = m_ver.group(1)
             log(f"Ghost service name: {service_name}")
 
             # ghost-cli's linux-user layout: the install is owned by the CLI
@@ -1064,6 +1206,14 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
                 f"{user} ALL=(root) NOPASSWD: {sed_bin} -i * {_NGINX_SITES}/*",
                 f"{user} ALL=(root) NOPASSWD: {nginx_bin} -t",
                 f"{user} ALL=(root) NOPASSWD: {nginx_bin} -s reload",
+                # ghost-cli's automatic rollback after a failed boot runs
+                # 'sudo <dir>/current/node_modules/.bin/knex-migrator-rollback'.
+                # sudo matches the path exactly as typed (no symlink
+                # resolution), so grant the current/ form.  Without it the
+                # rollback dies on the password prompt and leaves 'current'
+                # on the broken release (2026-10-30, news.mstdn.ca).
+                f"{user} ALL=(root) NOPASSWD: {ghost_dir}/current/node_modules/.bin/knex-migrator-rollback *",
+                f"{user} ALL=(root) NOPASSWD: {ghost_dir}/current/node_modules/.bin/knex-migrator-migrate *",
             ]
             write_parts = [
                 f"echo '{line}' {'>' if i == 0 else '>>'} {sudoers_path}"
@@ -1108,6 +1258,12 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
             _ensure_ghost_db_privileges(ssh, ghost_dir, log)
             log("")
 
+            # Ghost supports MySQL 8 only; on MariaDB its 6.73+ migrations
+            # fail *after* ghost-cli has switched 'current'.  Say so now.
+            log("Checking the database engine...")
+            _check_ghost_db_engine(ssh, ghost_dir, log)
+            log("")
+
             # Newer Ghost releases raise the minimum Node.js; ghost-cli only
             # notices after its nginx migrations have run.  Check (and, with
             # 'n' on the guest, fix) before anything is touched.
@@ -1141,6 +1297,10 @@ def run_ghost_upgrade(log_callback=None, skip_protection=False):
             if code != 0:
                 log(f"ERROR: ghost update failed (exit {code})")
                 _log_ghost_cli_debug(ssh, ghost_dir, log, since=started_at)
+                _recover_after_failed_update(
+                    ssh, ghost_dir, user, service_name, pre_version, log,
+                    service_user=service_user,
+                )
                 return False, "\n".join(log_lines)
 
             log("ghost update completed successfully")
