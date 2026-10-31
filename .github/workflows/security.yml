@@ -11,37 +11,35 @@ on:
 permissions:
   contents: read
 
+# Runs on the self-hosted runner (scripts/setup-runner.sh) with the system
+# Python 3.11 in a per-job venv; see ci.yml for the reasoning.
 jobs:
   bandit:
     name: Bandit Security Scan
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, lambnet]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.13"
-          cache: 'pip'
-
       - name: Install bandit
-        run: pip install bandit
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet bandit
 
       - name: Run bandit
-        run: bandit -r . -c pyproject.toml
+        run: .venv/bin/bandit -r . -c pyproject.toml
 
   dependency-audit:
     name: Dependency Audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, lambnet]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.13"
-          cache: 'pip'
-
       - name: Install pip-audit
-        run: pip install pip-audit
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet pip-audit
 
       - name: Audit dependencies
-        run: pip-audit -r requirements.txt -r requirements-dev.txt
+        run: .venv/bin/pip-audit -r requirements.txt -r requirements-dev.txt
