@@ -463,3 +463,168 @@ class TestMastodonMetricsHistoryRoute:
             db.session.delete(GuestService.query.get(svc_id))
             db.session.delete(Guest.query.get(guest_id))
             db.session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Status-class series + traffic breakdown
+# ---------------------------------------------------------------------------
+
+def _instant(metric, value):
+    return {"metric": metric, "value": [1700000000, str(value)]}
+
+
+def _breakdown_responses(promql):
+    """Fake Prometheus instant-query responses keyed off the PromQL shape."""
+    if promql.startswith("topk("):
+        return [
+            _instant({"controller": "api/v1/timelines/home", "action": "show"}, 600),
+            _instant({"controller": "activitypub/inboxes", "action": "create"}, 300),
+        ]
+    if promql.startswith("sum by (status)"):
+        return [_instant({"status": "200"}, 850), _instant({"status": "502"}, 50), _instant({"status": "404"}, 0)]
+    if promql.startswith("sum by (controller, action)") and 'status=~"5.."' in promql:
+        return [_instant({"controller": "activitypub/inboxes", "action": "create"}, 30)]
+    if promql.startswith("sum by (controller, action)") and "duration_seconds_sum" in promql:
+        return [
+            _instant({"controller": "api/v1/timelines/home", "action": "show"}, 60),
+            _instant({"controller": "activitypub/inboxes", "action": "create"}, 15),
+        ]
+    if promql.startswith("sum by (controller, action)") and "duration_seconds_count" in promql:
+        return [
+            _instant({"controller": "api/v1/timelines/home", "action": "show"}, 600),
+            _instant({"controller": "activitypub/inboxes", "action": "create"}, 300),
+        ]
+    if "duration_seconds_sum" in promql:
+        return [_instant({}, 100)]
+    return [_instant({}, 900)]
+
+
+class TestMastodonTrafficBreakdown:
+
+    @patch("clients.prometheus_query.PrometheusQueryClient.query_range")
+    def test_snapshot_includes_status_classes(self, mock_query_range, app):
+        with app.app_context():
+            Setting.set("prometheus_url", "http://10.0.0.5:9090")
+            db.session.commit()
+            from clients.prometheus_query import PrometheusQueryClient
+
+            mock_query_range.return_value = [{"values": [[1700000000, "1.0"]]}]
+            data = PrometheusQueryClient().get_mastodon_metrics("10.0.0.85:9394")
+            snap = data["snapshots"][0]
+            for cls in ("2xx", "3xx", "4xx", "5xx"):
+                assert f"puma_rate_{cls}" in snap
+            queries = [c.args[0] for c in mock_query_range.call_args_list]
+            assert any('status=~"5.."' in q and "or vector(0)" in q for q in queries)
+
+    @patch("clients.prometheus_query.PrometheusQueryClient.query")
+    def test_breakdown_builds_tables(self, mock_query, app):
+        with app.app_context():
+            Setting.set("prometheus_url", "http://10.0.0.5:9090")
+            db.session.commit()
+            from clients.prometheus_query import PrometheusQueryClient
+
+            mock_query.side_effect = _breakdown_responses
+            data = PrometheusQueryClient().get_mastodon_traffic_breakdown("10.0.0.85:9394", "day")
+
+        assert data["detailed"] is True
+        assert data["has_status"] is True
+        assert data["total_requests"] == 900
+        # zero-count statuses are dropped; sorted by volume
+        assert [s["status"] for s in data["statuses"]] == ["200", "502"]
+        top, inbox = data["endpoints"]
+        assert top["controller"] == "api/v1/timelines/home"
+        assert top["share"] == 66.67
+        assert top["avg_ms"] == 100.0
+        assert top["time_share"] == 60.0
+        assert top["errors_5xx"] == 0
+        assert inbox["errors_5xx"] == 30
+        assert inbox["error_pct"] == 10.0
+        assert inbox["avg_ms"] == 50.0
+        # window is the full timeframe
+        assert all("[86400s]" in c.args[0] for c in mock_query.call_args_list)
+
+    @patch("clients.prometheus_query.PrometheusQueryClient.query")
+    def test_breakdown_without_detailed_labels(self, mock_query, app):
+        with app.app_context():
+            Setting.set("prometheus_url", "http://10.0.0.5:9090")
+            db.session.commit()
+            from clients.prometheus_query import PrometheusQueryClient
+
+            mock_query.return_value = [_instant({}, 500)]
+            data = PrometheusQueryClient().get_mastodon_traffic_breakdown("10.0.0.85:9394")
+
+        assert data["detailed"] is False
+        assert data["endpoints"] == []
+        assert data["has_status"] is False
+        assert data["total_requests"] == 500
+
+    @patch("clients.prometheus_query.PrometheusQueryClient.query")
+    def test_breakdown_escapes_target(self, mock_query, app):
+        with app.app_context():
+            Setting.set("prometheus_url", "http://10.0.0.5:9090")
+            db.session.commit()
+            from clients.prometheus_query import PrometheusQueryClient
+
+            mock_query.return_value = []
+            PrometheusQueryClient().get_mastodon_traffic_breakdown('x"} or up{job=~".*')
+        for c in mock_query.call_args_list:
+            assert 'instance="x\\"} or up{job=~\\".*"' in c.args[0]
+
+    def _make_service(self, app, name, ip, service_name, with_exporter=False):
+        with app.app_context():
+            guest = _create_guest(app, name=name, ip=ip)
+            svc = GuestService(guest_id=guest.id, service_name=service_name,
+                               unit_name="mastodon-web.service", status="running")
+            db.session.add(svc)
+            exp_id = None
+            if with_exporter:
+                exp = ExporterInstance(guest_id=guest.id, exporter_type="mastodon", port=9394, status="installed")
+                db.session.add(exp)
+                db.session.flush()
+                exp_id = exp.id
+            db.session.commit()
+            return svc.id, guest.id, exp_id
+
+    def _cleanup(self, app, svc_id, guest_id, exp_id=None):
+        with app.app_context():
+            if exp_id:
+                db.session.delete(db.session.get(ExporterInstance, exp_id))
+            db.session.delete(db.session.get(GuestService, svc_id))
+            db.session.delete(db.session.get(Guest, guest_id))
+            db.session.commit()
+
+    def test_route_rejects_sidekiq(self, app, auth_client):
+        svc_id, guest_id, _ = self._make_service(app, "masto-tb-sq", "10.0.0.90", "mastodon-sidekiq")
+        resp = auth_client.get(f"/services/{svc_id}/mastodon/traffic-breakdown")
+        assert resp.status_code == 400
+        self._cleanup(app, svc_id, guest_id)
+
+    def test_route_without_prometheus(self, app, auth_client):
+        with app.app_context():
+            Setting.set("prometheus_enabled", "false")
+            db.session.commit()
+        svc_id, guest_id, _ = self._make_service(app, "masto-tb-noprom", "10.0.0.91", "mastodon-web (puma)")
+        resp = auth_client.get(f"/services/{svc_id}/mastodon/traffic-breakdown")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["available"] is False
+        assert "Prometheus" in data["reason"]
+        self._cleanup(app, svc_id, guest_id)
+
+    @patch("clients.prometheus_query.PrometheusQueryClient.query")
+    def test_route_with_data(self, mock_query, app, auth_client):
+        with app.app_context():
+            Setting.set("prometheus_enabled", "true")
+            Setting.set("prometheus_url", "http://10.0.0.5:9090")
+            db.session.commit()
+        svc_id, guest_id, exp_id = self._make_service(
+            app, "masto-tb-data", "10.0.0.92", "mastodon-web (puma)", with_exporter=True)
+        mock_query.side_effect = _breakdown_responses
+        resp = auth_client.get(f"/services/{svc_id}/mastodon/traffic-breakdown?timeframe=week")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["available"] is True
+        assert data["timeframe"] == "week"
+        assert len(data["endpoints"]) == 2
+        assert all("[604800s]" in c.args[0] for c in mock_query.call_args_list)
+        self._cleanup(app, svc_id, guest_id, exp_id)

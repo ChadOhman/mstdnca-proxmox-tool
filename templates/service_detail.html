@@ -1123,6 +1123,59 @@
                     <canvas id="puma-chart-rss" height="120" role="img" aria-label="Puma RSS memory over time"></canvas>
                 </div>
             </div>
+            <div class="row g-3 mt-0">
+                <div class="col-md-8">
+                    <div class="text-muted small mb-1">Requests by Status Class (req/sec)</div>
+                    <canvas id="puma-chart-status" height="90" role="img" aria-label="Puma request rate by HTTP status class over time"></canvas>
+                </div>
+                <div class="col-md-4">
+                    <div class="text-muted small mb-1">5xx Error Rate (%)</div>
+                    <canvas id="puma-chart-errpct" height="180" role="img" aria-label="Puma 5xx error percentage over time"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Puma Traffic Breakdown (totals over the selected timeframe) -->
+<div class="card bg-dark mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-bar-chart"></i> Traffic Breakdown <span id="pumaTrafficTotal" class="badge bg-secondary ms-2 d-none" style="font-size: 0.65rem;"></span></h5>
+        <span class="text-muted small" id="pumaTrafficWindow"></span>
+    </div>
+    <div class="card-body">
+        <div id="pumaTrafficLoading" class="text-center text-muted py-3">
+            <div class="spinner-border spinner-border-sm me-2" role="status"></div>Loading traffic breakdown...
+        </div>
+        <div id="pumaTrafficError" class="text-center text-muted py-3 d-none"></div>
+        <div id="pumaTraffic" class="row g-3 d-none">
+            <div class="col-lg-3">
+                <div class="text-muted small mb-1">By Status Code</div>
+                <table class="table table-dark table-sm mb-0" aria-label="Requests by HTTP status code">
+                    <thead><tr><th>Status</th><th class="text-end">Requests</th><th class="text-end">%</th></tr></thead>
+                    <tbody id="pumaTrafficStatus"></tbody>
+                </table>
+            </div>
+            <div class="col-lg-9">
+                <div class="text-muted small mb-1">Top Endpoints</div>
+                <div id="pumaTrafficNoDetail" class="text-muted small d-none">
+                    Per-endpoint data needs detailed web metrics. Turn on <strong>Detailed web metrics</strong>
+                    in the Mastodon exporter settings on the Prometheus page (<code>MASTODON_PROMETHEUS_EXPORTER_WEB_DETAILED_METRICS=true</code>).
+                </div>
+                <div class="table-responsive" id="pumaTrafficEndpointsWrap">
+                    <table class="table table-dark table-sm mb-0" aria-label="Top Mastodon endpoints by request count">
+                        <thead><tr>
+                            <th>Controller#Action</th>
+                            <th class="text-end">Requests</th>
+                            <th class="text-end">% Traffic</th>
+                            <th class="text-end">Avg (ms)</th>
+                            <th class="text-end" title="Share of total Puma request time spent in this endpoint">% Time</th>
+                            <th class="text-end">5xx</th>
+                        </tr></thead>
+                        <tbody id="pumaTrafficEndpoints"></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
     </div>
 </div>
@@ -3439,6 +3492,35 @@ function pumaLoadCharts(timeframe) {
         _pumaCharts.threads = makeOrUpdate(_pumaCharts.threads, 'puma-chart-threads', 'Utilization %', threadUtil, '#22c55e', v => v + '%');
         _pumaCharts.rss = makeOrUpdate(_pumaCharts.rss, 'puma-chart-rss', 'RSS (MB)', rssMb, '#06b6d4', v => v + 'MB');
 
+        // Status-class breakdown (multi-series, so it doesn't go through makeOrUpdate)
+        const statusClasses = [
+            ['2xx', 'puma_rate_2xx', '#22c55e'],
+            ['3xx', 'puma_rate_3xx', '#3b82f6'],
+            ['4xx', 'puma_rate_4xx', '#f59e0b'],
+            ['5xx', 'puma_rate_5xx', '#ef4444'],
+        ];
+        const statusDatasets = statusClasses.map(([label, key, color]) => ({
+            label: label,
+            data: snaps.map(s => s[key] != null ? +Number(s[key]).toFixed(2) : null),
+            borderColor: color, backgroundColor: color + '22', fill: false, tension: 0.3, pointRadius: 0,
+        }));
+        if (_pumaCharts.status) {
+            _pumaCharts.status.data.labels = labels;
+            _pumaCharts.status.data.datasets.forEach((ds, i) => { ds.data = statusDatasets[i].data; });
+            _pumaCharts.status.update();
+        } else {
+            var statusOpts = JSON.parse(JSON.stringify(chartOpts));
+            statusOpts.options.plugins.legend = {display: true, labels: {color: '#adb5bd', boxWidth: 12}};
+            statusOpts.data = {labels: labels, datasets: statusDatasets};
+            _pumaCharts.status = new Chart(document.getElementById('puma-chart-status'), statusOpts);
+        }
+        const errPct = snaps.map(s => {
+            const tot = ['puma_rate_2xx', 'puma_rate_3xx', 'puma_rate_4xx', 'puma_rate_5xx']
+                .reduce((a, k) => a + (Number(s[k]) || 0), 0);
+            return tot > 0 ? +((Number(s.puma_rate_5xx) || 0) / tot * 100).toFixed(2) : null;
+        });
+        _pumaCharts.errpct = makeOrUpdate(_pumaCharts.errpct, 'puma-chart-errpct', '5xx %', errPct, '#ef4444', v => v + '%');
+
         _loadDbRuntimeCharts(snaps, labels);
     })
     .catch(err => {
@@ -3453,10 +3535,89 @@ document.querySelectorAll('#pumaChartTimeframe button').forEach(btn => {
         document.querySelectorAll('#pumaChartTimeframe button').forEach(b => b.classList.remove('active'));
         this.classList.add('active');
         pumaLoadCharts(this.dataset.tf);
+        pumaLoadTraffic(this.dataset.tf);
     });
 });
 
-document.addEventListener('DOMContentLoaded', function() { pumaLoadCharts('day'); });
+function pumaLoadTraffic(timeframe) {
+    timeframe = timeframe || 'day';
+    const loading = document.getElementById('pumaTrafficLoading');
+    const errEl = document.getElementById('pumaTrafficError');
+    const wrap = document.getElementById('pumaTraffic');
+    const totalBadge = document.getElementById('pumaTrafficTotal');
+    const tfNames = {hour: 'last hour', day: 'last 24 hours', '3d': 'last 3 days', week: 'last 7 days', month: 'last 30 days'};
+    document.getElementById('pumaTrafficWindow').textContent = 'Totals over the ' + (tfNames[timeframe] || timeframe);
+    loading.classList.remove('d-none');
+    wrap.classList.add('d-none');
+    errEl.classList.add('d-none');
+    totalBadge.classList.add('d-none');
+
+    function cell(text, cls) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        if (cls) td.className = cls;
+        return td;
+    }
+    const fmt = n => (n == null ? '—' : Number(n).toLocaleString());
+
+    fetch('/services/{{ service.id }}/mastodon/traffic-breakdown?timeframe=' + encodeURIComponent(timeframe), {cache: 'no-store'})
+    .then(r => r.json())
+    .then(data => {
+        loading.classList.add('d-none');
+        if (!data.available || !data.total_requests) {
+            errEl.textContent = data.reason || 'No traffic recorded in this window.';
+            errEl.classList.remove('d-none');
+            return;
+        }
+        wrap.classList.remove('d-none');
+        totalBadge.textContent = fmt(data.total_requests) + ' requests';
+        totalBadge.classList.remove('d-none');
+
+        const statusBody = document.getElementById('pumaTrafficStatus');
+        statusBody.replaceChildren();
+        if (!data.has_status) {
+            const tr = document.createElement('tr');
+            const td = cell('No status labels reported.', 'text-muted');
+            td.colSpan = 3;
+            tr.appendChild(td);
+            statusBody.appendChild(tr);
+        }
+        (data.statuses || []).forEach(s => {
+            const tr = document.createElement('tr');
+            const code = String(s.status);
+            const cls = code.startsWith('5') ? 'text-danger' : code.startsWith('4') ? 'text-warning' : '';
+            tr.append(cell(code, cls), cell(fmt(s.requests), 'text-end'), cell(s.share + '%', 'text-end'));
+            statusBody.appendChild(tr);
+        });
+
+        const epBody = document.getElementById('pumaTrafficEndpoints');
+        epBody.replaceChildren();
+        document.getElementById('pumaTrafficNoDetail').classList.toggle('d-none', !!data.detailed);
+        document.getElementById('pumaTrafficEndpointsWrap').classList.toggle('d-none', !data.detailed);
+        (data.endpoints || []).forEach(e => {
+            const tr = document.createElement('tr');
+            const name = cell((e.controller || '?') + '#' + (e.action || '?'), 'font-monospace small');
+            const errCell = cell(fmt(e.errors_5xx) + (e.errors_5xx ? ' (' + e.error_pct + '%)' : ''),
+                                 'text-end' + (e.errors_5xx ? ' text-danger' : ''));
+            tr.append(
+                name,
+                cell(fmt(e.requests), 'text-end'),
+                cell(e.share + '%', 'text-end'),
+                cell(e.avg_ms == null ? '—' : e.avg_ms, 'text-end'),
+                cell(e.time_share == null ? '—' : e.time_share + '%', 'text-end'),
+                errCell,
+            );
+            epBody.appendChild(tr);
+        });
+    })
+    .catch(() => {
+        loading.classList.add('d-none');
+        errEl.textContent = 'Failed to load traffic breakdown.';
+        errEl.classList.remove('d-none');
+    });
+}
+
+document.addEventListener('DOMContentLoaded', function() { pumaLoadCharts('day'); pumaLoadTraffic('day'); });
 {% endif %}{# stats.type == 'puma' #}
 
 {% if stats.type == 'sidekiq' %}

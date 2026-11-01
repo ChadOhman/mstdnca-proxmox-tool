@@ -437,6 +437,14 @@ class PrometheusQueryClient:
                 f'sum(ruby_puma_running_threads{{{inst}}}) / '
                 f'clamp_min(sum(ruby_puma_max_threads{{{inst}}}), 1) * 100'
             ),
+            # Request rate per HTTP status class. `or vector(0)` keeps a class that saw no
+            # traffic in the window at 0 instead of dropping the whole series.
+            **{
+                f"puma_rate_{cls}xx": (
+                    f'sum(rate(ruby_http_requests_total{{{inst},status=~"{cls}.."}}[{ri}])) or vector(0)'
+                )
+                for cls in range(2, 6)
+            },
             "puma_backlog": f'sum(ruby_puma_backlog{{{inst}}})',
             "puma_rss_memory": f'sum(ruby_rss{{{inst}}})',
             # -- Sidekiq --
@@ -458,6 +466,122 @@ class PrometheusQueryClient:
         }
 
         return self._run_snapshot_queries(queries, start, end, step, source="mastodon_exporter")
+
+    def get_mastodon_traffic_breakdown(self, target, timeframe="day", limit=15):
+        """Summarise Mastodon web traffic over *timeframe* by status code and by endpoint.
+
+        Relies on the ``controller``/``action``/``status`` labels the prometheus_exporter
+        gem's Rails middleware attaches to ``ruby_http_requests_total`` (and
+        ``controller``/``action`` on the duration summaries). Mastodon only uses that
+        middleware when ``MASTODON_PROMETHEUS_EXPORTER_WEB_DETAILED_METRICS=true``; without
+        it the series carry no endpoint labels, which is reported as ``detailed: False``.
+
+        All figures are totals over the window (``increase(...[window])``), evaluated as
+        instant queries, so the result is a single table rather than a time series.
+        """
+        dur, _step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
+        limit = max(1, min(int(limit), 50))
+        inst = f'instance="{escape_label_value(target)}"'
+        win = f"{dur}s"
+        by = "controller, action"
+
+        def _inc(metric, extra=""):
+            return f"increase({metric}{{{inst}{extra}}}[{win}])"
+
+        reqs = "ruby_http_requests_total"
+        dur_sum = "ruby_http_request_duration_seconds_sum"
+        dur_count = "ruby_http_request_duration_seconds_count"
+
+        errors_5xx = _inc(reqs, ',status=~"5.."')
+        queries = {
+            "total": f"sum({_inc(reqs)})",
+            "time_total": f"sum({_inc(dur_sum)})",
+            "by_status": f"sum by (status) ({_inc(reqs)})",
+            "top": f"topk({limit}, sum by ({by}) ({_inc(reqs)}))",
+            "errors": f"sum by ({by}) ({errors_5xx})",
+            "time": f"sum by ({by}) ({_inc(dur_sum)})",
+            "count": f"sum by ({by}) ({_inc(dur_count)})",
+        }
+
+        results = {}
+        for name, promql in queries.items():
+            try:
+                results[name] = self.query(promql)
+            except Exception:
+                logger.debug("Prometheus instant query failed for %s", promql, exc_info=True)
+                results[name] = []
+
+        def _val(series):
+            try:
+                return float(series.get("value", [None, None])[1])
+            except (TypeError, ValueError, IndexError):
+                return 0.0
+
+        def _scalar(name):
+            rows = results.get(name) or []
+            return _val(rows[0]) if rows else 0.0
+
+        def _key(series):
+            m = series.get("metric", {})
+            return (m.get("controller", ""), m.get("action", ""))
+
+        total = _scalar("total")
+        time_total = _scalar("time_total")
+
+        statuses = []
+        for s in results["by_status"]:
+            n = _val(s)
+            if n <= 0:
+                continue
+            statuses.append({
+                "status": s.get("metric", {}).get("status", "") or "unknown",
+                "requests": round(n),
+                "share": round(n / total * 100, 2) if total else 0.0,
+            })
+        statuses.sort(key=lambda r: r["requests"], reverse=True)
+
+        errors = {_key(s): _val(s) for s in results["errors"]}
+        times = {_key(s): _val(s) for s in results["time"]}
+        counts = {_key(s): _val(s) for s in results["count"]}
+
+        endpoints = []
+        detailed = False
+        for s in results["top"]:
+            controller, action = _key(s)
+            if controller or action:
+                detailed = True
+            n = _val(s)
+            if n <= 0:
+                continue
+            key = (controller, action)
+            err = errors.get(key, 0.0)
+            t = times.get(key, 0.0)
+            c = counts.get(key, 0.0)
+            endpoints.append({
+                "controller": controller,
+                "action": action,
+                "requests": round(n),
+                "share": round(n / total * 100, 2) if total else 0.0,
+                "errors_5xx": round(err),
+                "error_pct": round(err / n * 100, 2) if n else 0.0,
+                "avg_ms": round(t / c * 1000, 1) if c else None,
+                "time_share": round(t / time_total * 100, 2) if time_total else None,
+            })
+        endpoints.sort(key=lambda r: r["requests"], reverse=True)
+
+        # A status label alone (without controller/action) still counts as detailed enough
+        # for the status table; only the endpoint table needs the Rails labels.
+        has_status = any(r["status"] != "unknown" for r in statuses)
+
+        return {
+            "source": "mastodon_exporter",
+            "timeframe": timeframe,
+            "total_requests": round(total),
+            "detailed": detailed,
+            "has_status": has_status,
+            "statuses": statuses,
+            "endpoints": endpoints if detailed else [],
+        }
 
     def get_ipmi_metrics_exporter(self, target, timeframe="day"):
         """Query ipmi_exporter metrics and return snapshots."""

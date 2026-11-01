@@ -1167,6 +1167,36 @@ def mastodon_metrics_history(service_id):
     return jsonify({"snapshots": [], "source": "none"})
 
 
+@bp.route("/<int:service_id>/mastodon/traffic-breakdown")
+def mastodon_traffic_breakdown(service_id):
+    """Per-status and per-endpoint request totals for a Mastodon web (Puma) service."""
+    from models import Setting
+
+    svc = GuestService.query.get_or_404(service_id)
+    if "sidekiq" in svc.service_name or not any(n in svc.service_name for n in ("mastodon", "puma")):
+        return jsonify({"error": "Not a Mastodon web service"}), 400
+
+    timeframe = request.args.get("timeframe", "day")
+    empty = {"available": False, "statuses": [], "endpoints": [], "detailed": False, "has_status": False}
+
+    if Setting.get("prometheus_enabled", "false") != "true" or not Setting.get("prometheus_url", ""):
+        return jsonify({**empty, "reason": "Prometheus is not configured."})
+
+    from clients.prometheus_query import PrometheusQueryClient, _get_exporter_target
+
+    mastodon_target = _get_exporter_target(svc.guest_id, "mastodon")
+    if not mastodon_target:
+        return jsonify({**empty, "reason": "The Mastodon exporter is not enabled on this guest."})
+
+    try:
+        data = PrometheusQueryClient().get_mastodon_traffic_breakdown(mastodon_target, timeframe)
+    except Exception:
+        logger.debug("Prometheus query failed for Mastodon traffic breakdown", exc_info=True)
+        return jsonify({**empty, "reason": "Prometheus query failed."})
+
+    return jsonify({**data, "available": True})
+
+
 def save_service_snapshot(svc, data):
     """Persist a metric snapshot for services that support historical charts."""
     snapshot_data = None
