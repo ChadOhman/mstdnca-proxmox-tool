@@ -233,6 +233,36 @@ class TestRoutes:
             assert entry is not None
 
     @patch("routes.highlights.fetch_highlights")
+    def test_default_donate_text_is_not_pinned(self, mock_fetch, app, auth_client):
+        from models import Setting
+        from routes.highlights import DEFAULT_DONATE_HEADING, DEFAULT_DONATE_MESSAGE
+
+        mock_fetch.return_value = ([], None)
+        auth_client.post("/highlights/build", data={
+            "month": "2026-10", "donate_heading": DEFAULT_DONATE_HEADING, "donate_message": DEFAULT_DONATE_MESSAGE,
+        })
+        with app.app_context():
+            assert Setting.get("mastodon_highlights_donate_heading") == ""
+            assert Setting.get("mastodon_highlights_donate_message") == ""
+
+    def test_legacy_saved_default_shows_current_default(self, app, auth_client):
+        from models import Setting
+        from routes.highlights import DEFAULT_DONATE_HEADING
+
+        with app.app_context():
+            Setting.set("mastodon_highlights_donate_heading", "Help keep the server running")
+            Setting.set("mastodon_highlights_donate_button", "Give now")
+        try:
+            body = auth_client.get("/highlights/").data.decode()
+            assert DEFAULT_DONATE_HEADING in body
+            assert "Help keep the server running" not in body
+            assert 'value="Give now"' in body  # genuinely custom text is kept
+        finally:
+            with app.app_context():
+                Setting.set("mastodon_highlights_donate_heading", "")
+                Setting.set("mastodon_highlights_donate_button", "")
+
+    @patch("routes.highlights.fetch_highlights")
     def test_rejects_unsafe_donate_link(self, mock_fetch, auth_client):
         resp = auth_client.post("/highlights/build", data={"month": "2026-10", "donate_url": "javascript:alert(1)"})
         assert resp.status_code == 200

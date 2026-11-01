@@ -29,6 +29,21 @@ DEFAULT_DONATE_MESSAGE = (
     "If the community made your month a little better, please consider chipping in."
 )
 DEFAULT_DONATE_BUTTON = "Donate"
+DONATE_DEFAULTS = {
+    "donate_url": "",
+    "donate_heading": DEFAULT_DONATE_HEADING,
+    "donate_message": DEFAULT_DONATE_MESSAGE,
+    "donate_button": DEFAULT_DONATE_BUTTON,
+}
+# Earlier default copy that the first release saved as if it were custom text.
+# Treated as unset so instances pick up the current defaults.
+LEGACY_DONATE_DEFAULTS = {
+    "donate_heading": {"Help keep the server running"},
+    "donate_message": {
+        "This server is run by volunteers and paid for entirely by members like you. "
+        "If the community made your month a little better, please consider chipping in.",
+    },
+}
 MAX_TEXT = 2000
 
 
@@ -41,16 +56,21 @@ def _require_admin():
         return redirect(url_for("dashboard.index"))
 
 
+def _saved_donate(key):
+    """Saved donate text, or the current default when none (or a stale default) is stored."""
+    value = Setting.get(f"mastodon_highlights_{key}", "")
+    if not value or value in LEGACY_DONATE_DEFAULTS.get(key, ()):
+        return DONATE_DEFAULTS[key]
+    return value
+
+
 def _saved_form():
     return {
         "month": default_month(),
         "count": DEFAULT_COUNT,
         "per_author": DEFAULT_PER_AUTHOR,
         "intro": "",
-        "donate_url": Setting.get("mastodon_highlights_donate_url", ""),
-        "donate_heading": Setting.get("mastodon_highlights_donate_heading", DEFAULT_DONATE_HEADING),
-        "donate_message": Setting.get("mastodon_highlights_donate_message", DEFAULT_DONATE_MESSAGE),
-        "donate_button": Setting.get("mastodon_highlights_donate_button", DEFAULT_DONATE_BUTTON),
+        **{key: _saved_donate(key) for key in DONATE_DEFAULTS},
         "unsubscribe": True,
     }
 
@@ -89,9 +109,10 @@ def build():
         flash("The donate link must be a full http:// or https:// URL.", "error")
         return _render(form, posts=None)
 
-    # The donate block rarely changes month to month, so remember it.
-    for key in ("donate_url", "donate_heading", "donate_message", "donate_button"):
-        Setting.set(f"mastodon_highlights_{key}", form[key])
+    # The donate block rarely changes month to month, so remember edits. Text
+    # left at the default is stored empty so a later change to the default shows up.
+    for key, default in DONATE_DEFAULTS.items():
+        Setting.set(f"mastodon_highlights_{key}", "" if form[key] == default else form[key])
 
     posts, err = fetch_highlights(form["month"], form["count"], form["per_author"])
     if err:
