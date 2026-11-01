@@ -201,6 +201,9 @@ class TestRoutes:
         resp = auth_client.get("/highlights/")
         assert resp.status_code == 200
         assert b"Mastodon Monthly Highlights" in resp.data
+        # The recipient CSV posts to the existing admin-only active-users export.
+        assert b'action="/active-users/export.csv"' in resp.data
+        assert b'name="days"' in resp.data
 
     @patch("routes.highlights.fetch_highlights")
     def test_build_renders_email_and_remembers_donate(self, mock_fetch, app, auth_client):
