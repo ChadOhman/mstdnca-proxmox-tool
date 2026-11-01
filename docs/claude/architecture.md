@@ -41,6 +41,7 @@ The production worker class is `gevent` (`scripts/setup.sh` gunicorn `ExecStart`
 │   ├── jitsi.py            # Jitsi Meet install/upgrades
 │   ├── jibri.py            # Jibri (Jitsi recording) upgrades
 │   ├── exporters.py        # Prometheus exporter upgrades
+│   ├── nginxlog.py         # nginx access-log exporter: managed log_format, route/UA grouping
 │   ├── prometheus_app.py   # Prometheus server upgrades
 │   ├── unpoller.py         # UnPoller upgrades
 │   └── backup.py           # App database backup
