@@ -1,0 +1,15 @@
+{% if form.donate_url or form.donate_message %}
+<tr><td style="padding:32px 32px 0 32px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f0f0ff;border-radius:8px;">
+<tr><td align="center" style="padding:24px 20px;">
+<h2 style="margin:0 0 8px 0;font-size:20px;color:#282c37;">{{ form.donate_heading }}</h2>
+<p style="margin:0 0 16px 0;font-size:15px;line-height:1.5;">{{ form.donate_message }}</p>
+{% if form.donate_url %}<a href="{{ form.donate_url }}" style="display:inline-block;background:#6364ff;color:#ffffff;font-size:16px;font-weight:bold;text-decoration:none;padding:12px 28px;border-radius:6px;">{{ form.donate_button }}</a>{% endif %}
+</td></tr>
+</table>
+</td></tr>
+{% endif %}
+<tr><td style="padding:24px 32px 32px 32px;font-size:12px;line-height:1.5;color:#606984;" align="center">
+Posts are featured from members who have opted in to being discoverable.{% if email.host %} You're receiving this because you have an account on {{ email.host }}.{% endif %}
+{% if form.unsubscribe %}<br><a href="[[UNSUB_LINK_EN]]" style="color:#606984;">Unsubscribe</a>{% endif %}
+</td></tr>

@@ -33,6 +33,7 @@
                 <a href="/mastodon/upgrade" class="btn btn-outline-light mt-auto">Go to Mastodon</a>
                 {% if current_user.is_admin %}
                 <a href="{{ url_for('active_users.index') }}" class="btn btn-outline-secondary btn-sm mt-2"><i class="bi bi-people"></i> Active users</a>
+                <a href="{{ url_for('highlights.index') }}" class="btn btn-outline-secondary btn-sm mt-2"><i class="bi bi-stars"></i> Monthly highlights</a>
                 {% endif %}
             </div>
         </div>

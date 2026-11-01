@@ -1,0 +1,204 @@
+{% extends "base.html" %}
+{% block title %}Monthly Highlights - Mastodon Canada Administration Tool{% endblock %}
+
+{% block content %}
+<h2 class="mb-4"><i class="bi bi-stars"></i> Mastodon Monthly Highlights</h2>
+
+<div class="card bg-dark mb-4">
+    <div class="card-body">
+        <p class="mb-2">
+            Builds a newsletter of the month's most-favourited and most-boosted local posts, with a donation prompt,
+            as HTML to paste into Mailjet (<em>Code your own</em> template or an HTML section).
+        </p>
+        <p class="small text-muted mb-3">
+            Only posts Mastodon would put in Trends are eligible: public, not a reply, no content warning or sensitive
+            media, from a discoverable account that is not suspended, limited or a bot, and not rejected from trends
+            by a moderator. Boosts count double, and each person gets at most <em>Max per person</em> posts. Send it to the list from
+            <a href="{{ url_for('active_users.index') }}">Active users</a>.
+        </p>
+        <form method="post" action="{{ url_for('highlights.build') }}">
+            <div class="row g-2">
+                <div class="col-sm-4 col-lg-2">
+                    <label class="form-label small mb-1" for="hl-month">Month</label>
+                    <input type="month" class="form-control form-control-sm" id="hl-month" name="month"
+                           value="{{ form.month }}" required>
+                </div>
+                <div class="col-sm-4 col-lg-2">
+                    <label class="form-label small mb-1" for="hl-count">Posts</label>
+                    <input type="number" class="form-control form-control-sm" id="hl-count" name="count"
+                           value="{{ form.count }}" min="{{ min_count }}" max="{{ max_count }}" required>
+                </div>
+                <div class="col-sm-4 col-lg-2">
+                    <label class="form-label small mb-1" for="hl-per-author">Max per person</label>
+                    <input type="number" class="form-control form-control-sm" id="hl-per-author" name="per_author"
+                           value="{{ form.per_author }}" min="1" max="{{ max_count }}" required>
+                </div>
+                <div class="col-lg-6">
+                    <label class="form-label small mb-1" for="hl-intro">Intro <span class="text-muted">(optional)</span></label>
+                    <input type="text" class="form-control form-control-sm" id="hl-intro" name="intro"
+                           value="{{ form.intro }}" maxlength="2000"
+                           placeholder="Here are the posts the community loved most in …">
+                </div>
+                <div class="col-lg-6">
+                    <label class="form-label small mb-1" for="hl-donate-url">Donate link</label>
+                    <input type="url" class="form-control form-control-sm" id="hl-donate-url" name="donate_url"
+                           value="{{ form.donate_url }}" placeholder="https://…">
+                </div>
+                <div class="col-sm-6 col-lg-4">
+                    <label class="form-label small mb-1" for="hl-donate-heading">Donate heading</label>
+                    <input type="text" class="form-control form-control-sm" id="hl-donate-heading" name="donate_heading"
+                           value="{{ form.donate_heading }}" maxlength="2000">
+                </div>
+                <div class="col-sm-6 col-lg-2">
+                    <label class="form-label small mb-1" for="hl-donate-button">Button text</label>
+                    <input type="text" class="form-control form-control-sm" id="hl-donate-button" name="donate_button"
+                           value="{{ form.donate_button }}" maxlength="2000">
+                </div>
+                <div class="col-12">
+                    <label class="form-label small mb-1" for="hl-donate-message">Donate message</label>
+                    <textarea class="form-control form-control-sm" id="hl-donate-message" name="donate_message"
+                              rows="2" maxlength="2000">{{ form.donate_message }}</textarea>
+                </div>
+                <div class="col-12 d-flex flex-wrap gap-3 align-items-center">
+                    <div class="form-check mb-0">
+                        <input class="form-check-input" type="checkbox" id="hl-unsub" name="unsubscribe"
+                               {% if form.unsubscribe %}checked{% endif %}>
+                        <label class="form-check-label small" for="hl-unsub">
+                            Add Mailjet unsubscribe link (<code>[[UNSUB_LINK_EN]]</code>)
+                        </label>
+                    </div>
+                    <button type="submit" class="btn btn-sm btn-primary ms-auto">
+                        <i class="bi bi-magic"></i> Build email
+                    </button>
+                </div>
+            </div>
+            <p class="small text-muted mt-2 mb-0">The donate fields are remembered for next month.</p>
+        </form>
+    </div>
+</div>
+
+{% if posts is not none %}
+<div class="row g-4">
+    <div class="col-xl-5">
+        <div class="card bg-dark h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">Top posts, {{ email.label }}</h5>
+                <small class="text-muted" id="hl-selected-count"></small>
+            </div>
+            <div class="card-body">
+                {% if posts %}
+                <p class="small text-muted">Untick a post to leave it out; the email updates as you go.</p>
+                <ul class="list-group list-group-flush">
+                    {% for post, block in posts %}
+                    <li class="list-group-item bg-dark text-light px-0">
+                        <div class="form-check">
+                            <input class="form-check-input hl-pick" type="checkbox" id="hl-pick-{{ loop.index }}"
+                                   data-block="hl-block-{{ loop.index }}" {% if loop.index <= form.count %}checked{% endif %}>
+                            <label class="form-check-label w-100" for="hl-pick-{{ loop.index }}">
+                                <strong>{{ post.display_name }}</strong>
+                                <span class="text-muted">@{{ post.username }}</span>
+                                <span class="badge bg-secondary ms-1">★ {{ post.favourites }} ⟲ {{ post.reblogs }} 💬 {{ post.replies }}</span>
+                                <div class="small text-truncate text-muted">{{ post.text }}</div>
+                            </label>
+                            {% if post.url %}<a class="small" href="{{ post.url }}" target="_blank" rel="noopener noreferrer">Open post <i class="bi bi-box-arrow-up-right"></i></a>{% endif %}
+                        </div>
+                        <template id="hl-block-{{ loop.index }}">{{ block|safe }}</template>
+                    </li>
+                    {% endfor %}
+                </ul>
+                {% else %}
+                <p class="text-muted mb-0">No eligible posts in {{ email.label }}.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <div class="col-xl-7">
+        <div class="card bg-dark">
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <h5 class="mb-0">Email</h5>
+                <div class="d-flex gap-2">
+                    <button type="button" class="btn btn-sm btn-primary" id="hl-copy-html">
+                        <i class="bi bi-clipboard"></i> Copy HTML
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-light" id="hl-copy-rich">
+                        <i class="bi bi-clipboard-check"></i> Copy formatted
+                    </button>
+                </div>
+            </div>
+            <div class="card-body">
+                <p class="small text-muted mb-2" id="hl-copy-status" role="status" aria-live="polite">
+                    <strong>Copy HTML</strong> for Mailjet's code editor; <strong>Copy formatted</strong> to paste into a
+                    visual text block.
+                </p>
+                <iframe id="hl-preview" title="Email preview" sandbox="" class="w-100 rounded bg-white"
+                        style="height: 640px; border: 0;"></iframe>
+                <label class="form-label small mt-3 mb-1" for="hl-html">HTML</label>
+                <textarea id="hl-html" class="form-control form-control-sm font-monospace" rows="8" readonly></textarea>
+            </div>
+        </div>
+    </div>
+</div>
+{# Fragments are server-rendered, autoescaped HTML; the script below only concatenates them. #}
+<template id="hl-wrapper">{{ fragments.wrapper|safe }}</template>
+<template id="hl-header">{{ fragments.header|safe }}</template>
+<template id="hl-footer">{{ fragments.footer|safe }}</template>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if posts is not none %}
+<script>
+(function () {
+    // Every fragment is server-rendered (and escaped) HTML in a <template>;
+    // this only concatenates them, so no post text is ever handled as markup here.
+    const wrapper = document.getElementById("hl-wrapper").innerHTML;
+    const header = document.getElementById("hl-header").innerHTML;
+    const footer = document.getElementById("hl-footer").innerHTML;
+    const picks = Array.from(document.querySelectorAll(".hl-pick"));
+    const preview = document.getElementById("hl-preview");
+    const output = document.getElementById("hl-html");
+    const counter = document.getElementById("hl-selected-count");
+    const status = document.getElementById("hl-copy-status");
+
+    function build() {
+        const chosen = picks.filter(p => p.checked);
+        const body = chosen.map(p => document.getElementById(p.dataset.block).innerHTML).join("\n");
+        const html = wrapper.replace("<!--HL_ROWS-->", () => header + "\n" + body + "\n" + footer).trim();
+        output.value = html;
+        preview.srcdoc = '<!doctype html><html><head><meta charset="utf-8"></head><body style="margin:0">' + html + "</body></html>";
+        counter.textContent = chosen.length + " of " + picks.length + " selected";
+    }
+
+    function plainText(html) {
+        // DOMParser documents are inert: nothing in them loads or runs.
+        const doc = new DOMParser().parseFromString(html, "text/html");
+        doc.querySelectorAll("br").forEach(br => br.replaceWith("\n"));
+        doc.querySelectorAll("p, h1, h2, tr").forEach(el => el.append("\n\n"));
+        return doc.body.textContent.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    }
+
+    async function copy(rich) {
+        try {
+            if (rich && window.ClipboardItem) {
+                await navigator.clipboard.write([new ClipboardItem({
+                    "text/html": new Blob([output.value], {type: "text/html"}),
+                    "text/plain": new Blob([plainText(output.value)], {type: "text/plain"}),
+                })]);
+            } else {
+                await navigator.clipboard.writeText(output.value);
+            }
+            status.textContent = rich ? "Formatted email copied. Paste it into a Mailjet text block." : "HTML copied. Paste it into Mailjet's code editor.";
+        } catch (e) {
+            output.select();
+            status.textContent = "Couldn't reach the clipboard. The HTML is selected below; press Ctrl+C.";
+        }
+    }
+
+    picks.forEach(p => p.addEventListener("change", build));
+    document.getElementById("hl-copy-html").addEventListener("click", () => copy(false));
+    document.getElementById("hl-copy-rich").addEventListener("click", () => copy(true));
+    build();
+})();
+</script>
+{% endif %}
+{% endblock %}
