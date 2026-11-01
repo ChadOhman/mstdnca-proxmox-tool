@@ -7,6 +7,7 @@ gracefully when Prometheus is unreachable.
 """
 
 import logging
+import re
 import time
 import zoneinfo
 from datetime import datetime, timezone
@@ -71,6 +72,10 @@ _TIMEFRAMES = {
     "year": (31536000, 86400),
     "365d": (31536000, 86400),
 }
+
+
+# Extra label matcher for 5xx responses, appended inside an existing {...} selector.
+_STATUS_5XX = ',status=~"5.."'
 
 
 def escape_label_value(value):
@@ -583,6 +588,132 @@ class PrometheusQueryClient:
             "endpoints": endpoints if detailed else [],
         }
 
+    # ----- nginx access-log exporter (apps/nginxlog.py) -----
+
+    @staticmethod
+    def _nginx_selector(targets, vhost=None):
+        """Label matcher for the given exporter targets (and optionally one vhost)."""
+        alternation = "|".join(re.escape(t) for t in sorted(targets))
+        sel = f'instance=~"{escape_label_value(alternation)}"'
+        if vhost:
+            sel += f',vhost="{escape_label_value(vhost)}"'
+        return sel
+
+    def get_nginx_traffic_metrics(self, targets, timeframe="day", vhost=None):
+        """Time series of request rate, bandwidth, latency and client mix from nginx logs."""
+        dur, step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
+        end = time.time()
+        start = end - dur
+        sel = self._nginx_selector(targets, vhost)
+        ri = f"{max(step * 2, 120)}s"
+        count = "nginx_http_response_count_total"
+
+        def _quantile(q, metric):
+            return f"histogram_quantile({q}, sum by (le) (rate({metric}_bucket{{{sel}}}[{ri}])))"
+
+        queries = {
+            "req_rate": f"sum(rate({count}{{{sel}}}[{ri}]))",
+            "rate_5xx": f'sum(rate({count}{{{sel},status=~"5.."}}[{ri}])) or vector(0)',
+            "rate_4xx": f'sum(rate({count}{{{sel},status=~"4.."}}[{ri}])) or vector(0)',
+            "bytes_out_rate": f"sum(rate(nginx_http_response_size_bytes{{{sel}}}[{ri}]))",
+            "bytes_in_rate": f"sum(rate(nginx_http_request_size_bytes{{{sel}}}[{ri}]))",
+            "p50_response_time": _quantile(0.5, "nginx_http_response_time_seconds_hist"),
+            "p95_response_time": _quantile(0.95, "nginx_http_response_time_seconds_hist"),
+            "p95_upstream_time": _quantile(0.95, "nginx_http_upstream_time_seconds_hist"),
+            **{
+                f"client_{cls}": f'sum(rate({count}{{{sel},client="{cls}"}}[{ri}])) or vector(0)'
+                for cls in ("fediverse", "app", "browser", "bot")
+            },
+            "client_other": f'sum(rate({count}{{{sel},client=~"other|none|"}}[{ri}])) or vector(0)',
+        }
+        return self._run_snapshot_queries(queries, start, end, step, source="nginxlog_exporter")
+
+    def get_nginx_traffic_breakdown(self, targets, timeframe="day", vhost=None):
+        """Totals over *timeframe* by vhost, route, client class, cache status and HTTP status.
+
+        When *vhost* is None the busiest vhost in the window is chosen, so the
+        page shows one site rather than every site on a shared proxy summed up.
+        """
+        dur, _step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
+        win = f"{dur}s"
+        all_sel = self._nginx_selector(targets)
+        count = "nginx_http_response_count_total"
+
+        def _rows(promql):
+            try:
+                return self.query(promql)
+            except Exception:
+                logger.debug("Prometheus instant query failed for %s", promql, exc_info=True)
+                return []
+
+        def _val(series):
+            try:
+                return float(series.get("value", [None, None])[1])
+            except (TypeError, ValueError, IndexError):
+                return 0.0
+
+        def _by(label, promql):
+            return {s.get("metric", {}).get(label, ""): _val(s) for s in _rows(promql)}
+
+        vhosts = _by("vhost", f"sum by (vhost) (increase({count}{{{all_sel}}}[{win}]))")
+        vhost_list = sorted(
+            ({"vhost": k or "(none)", "value": k, "requests": round(v)} for k, v in vhosts.items() if v > 0),
+            key=lambda r: r["requests"], reverse=True,
+        )
+        if vhost is None and vhost_list:
+            vhost = vhost_list[0]["value"]
+
+        sel = self._nginx_selector(targets, vhost)
+
+        def _inc(metric, extra=""):
+            return f"increase({metric}{{{sel}{extra}}}[{win}])"
+
+        total = sum(_by("", f"sum({_inc(count)})").values())
+
+        def _table(label, extra_cols=None):
+            counts = _by(label, f"sum by ({label}) ({_inc(count)})")
+            rows = []
+            for key, n in counts.items():
+                if n <= 0:
+                    continue
+                row = {label: key or "(none)", "requests": round(n),
+                       "share": round(n / total * 100, 2) if total else 0.0}
+                for col, values in (extra_cols or {}).items():
+                    row[col] = values(key, n)
+                rows.append(row)
+            rows.sort(key=lambda r: r["requests"], reverse=True)
+            return rows
+
+        route_bytes = _by("route", f"sum by (route) ({_inc('nginx_http_response_size_bytes')})")
+        route_5xx = _by("route", f"sum by (route) ({_inc(count, _STATUS_5XX)})")
+        route_time = _by("route", f"sum by (route) ({_inc('nginx_http_response_time_seconds_sum')})")
+        route_time_n = _by("route", f"sum by (route) ({_inc('nginx_http_response_time_seconds_count')})")
+        bytes_total = sum(route_bytes.values())
+
+        routes = _table("route", {
+            "bytes": lambda k, n: round(route_bytes.get(k, 0.0)),
+            "bytes_share": lambda k, n: round(route_bytes.get(k, 0.0) / bytes_total * 100, 2) if bytes_total else 0.0,
+            "errors_5xx": lambda k, n: round(route_5xx.get(k, 0.0)),
+            "avg_ms": lambda k, n: (round(route_time.get(k, 0.0) / route_time_n[k] * 1000, 1)
+                                    if route_time_n.get(k) else None),
+        })
+
+        parse_errors = sum(_by("", f"sum(increase(nginx_parse_errors_total{{{all_sel}}}[{win}]))").values())
+
+        return {
+            "source": "nginxlog_exporter",
+            "timeframe": timeframe,
+            "vhost": vhost,
+            "vhosts": vhost_list,
+            "total_requests": round(total),
+            "total_bytes": round(bytes_total),
+            "parse_errors": round(parse_errors),
+            "routes": routes,
+            "clients": _table("client"),
+            "cache": _table("cache"),
+            "statuses": _table("status"),
+        }
+
     def get_ipmi_metrics_exporter(self, target, timeframe="day"):
         """Query ipmi_exporter metrics and return snapshots."""
         dur, step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
@@ -628,15 +759,18 @@ class PrometheusQueryClient:
 
         for short_name, promql in queries.items():
             result = self._range_single(promql, start, end, step)
-            all_series[short_name] = result.get("values", [])
+            # Keyed by timestamp, not position: series cover different spans (a query
+            # ending in `or vector(0)` has a point at every step, a real series only
+            # where data exists), so positional pairing would shift values in time.
+            all_series[short_name] = dict(zip(result.get("timestamps", []), result.get("values", []), strict=True))
             if not timestamps and result.get("timestamps"):
                 timestamps = result["timestamps"]
 
         snapshots = []
-        for i, ts in enumerate(timestamps):
+        for ts in timestamps:
             snap = {"captured_at": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()}
             for name, values in all_series.items():
-                snap[name] = values[i] if i < len(values) else None
+                snap[name] = values.get(ts)
             snapshots.append(snap)
 
         return {"snapshots": snapshots, "source": source}
