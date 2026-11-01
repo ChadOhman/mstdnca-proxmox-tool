@@ -81,7 +81,8 @@
     <div class="card-body">
         <h5 class="card-title"><i class="bi bi-people"></i> Recipients</h5>
         <p class="small text-muted mb-3">
-            A CSV of local members who signed in during the window, ready to import into a Mailjet contact list
+            A CSV of local members who signed in during the window, or who haven't (to win them back), ready to
+            import into a Mailjet contact list
             (columns: username, email, locale, last_active). It leaves out unconfirmed, unapproved, disabled, suspended
             and memorialized accounts. Mastodon has no marketing-email opt-in, so keep the unsubscribe link in the
             email. Each download is recorded in the audit log;
@@ -89,7 +90,14 @@
         </p>
         <form method="post" action="{{ url_for('active_users.export_csv') }}" class="d-flex flex-wrap gap-2 align-items-end">
             <div>
-                <label class="form-label small mb-1" for="hl-days">Active within (days)</label>
+                <label class="form-label small mb-1" for="hl-mode">Members who have</label>
+                <select class="form-select form-select-sm" id="hl-mode" name="mode">
+                    <option value="active"{% if 'active' != 'inactive' %} selected{% endif %}>signed in within</option>
+                    <option value="inactive"{% if 'active' == 'inactive' %} selected{% endif %}>not signed in for</option>
+                </select>
+            </div>
+            <div>
+                <label class="form-label small mb-1" for="hl-days">Days</label>
                 <input type="number" class="form-control form-control-sm" id="hl-days" name="days"
                        value="{{ recipient_days }}" min="{{ recipient_min_days }}" max="{{ recipient_max_days }}"
                        required style="width: 8rem">
