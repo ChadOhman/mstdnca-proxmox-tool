@@ -13,8 +13,8 @@
         <p class="small text-muted mb-3">
             Only posts Mastodon would put in Trends are eligible: public, not a reply, no content warning or sensitive
             media, from a discoverable account that is not suspended, limited or a bot, and not rejected from trends
-            by a moderator. Boosts count double, and each person gets at most <em>Max per person</em> posts. Send it to the list from
-            <a href="{{ url_for('active_users.index') }}">Active users</a>.
+            by a moderator. Boosts count double, and each person gets at most <em>Max per person</em> posts. Download the
+            recipient list from <a href="#hl-recipients">Recipients</a> below.
         </p>
         <form method="post" action="{{ url_for('highlights.build') }}">
             <div class="row g-2">
@@ -73,6 +73,30 @@
                 </div>
             </div>
             <p class="small text-muted mt-2 mb-0">The donate fields are remembered for next month.</p>
+        </form>
+    </div>
+</div>
+
+<div class="card bg-dark mb-4" id="hl-recipients">
+    <div class="card-body">
+        <h5 class="card-title"><i class="bi bi-people"></i> Recipients</h5>
+        <p class="small text-muted mb-3">
+            A CSV of local members who signed in during the window, ready to import into a Mailjet contact list
+            (columns: username, email, locale, last_active). It leaves out unconfirmed, unapproved, disabled, suspended
+            and memorialized accounts. Mastodon has no marketing-email opt-in, so keep the unsubscribe link in the
+            email. Each download is recorded in the audit log;
+            <a href="{{ url_for('active_users.index') }}">Active users</a> previews the list.
+        </p>
+        <form method="post" action="{{ url_for('active_users.export_csv') }}" class="d-flex flex-wrap gap-2 align-items-end">
+            <div>
+                <label class="form-label small mb-1" for="hl-days">Active within (days)</label>
+                <input type="number" class="form-control form-control-sm" id="hl-days" name="days"
+                       value="{{ recipient_days }}" min="{{ recipient_min_days }}" max="{{ recipient_max_days }}"
+                       required style="width: 8rem">
+            </div>
+            <button type="submit" class="btn btn-sm btn-outline-light">
+                <i class="bi bi-download"></i> Download CSV
+            </button>
         </form>
     </div>
 </div>

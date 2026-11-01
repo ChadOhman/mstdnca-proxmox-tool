@@ -4,6 +4,7 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 
 from auth.audit import log_action
+from core.mastodon_active_users import DEFAULT_DAYS, MAX_DAYS, MIN_DAYS
 from core.mastodon_highlights import (
     DEFAULT_COUNT,
     DEFAULT_PER_AUTHOR,
@@ -22,9 +23,9 @@ from models import Setting, db
 
 bp = Blueprint("highlights", __name__)
 
-DEFAULT_DONATE_HEADING = "Help keep the server running"
+DEFAULT_DONATE_HEADING = "Help keep our community running"
 DEFAULT_DONATE_MESSAGE = (
-    "This server is run by volunteers and paid for entirely by members like you. "
+    "This community is run by volunteers and paid entirely by members like you. "
     "If the community made your month a little better, please consider chipping in."
 )
 DEFAULT_DONATE_BUTTON = "Donate"
@@ -55,7 +56,9 @@ def _saved_form():
 
 
 def _render(form, **extra):
-    return render_template("highlights.html", form=form, min_count=MIN_COUNT, max_count=MAX_COUNT, **extra)
+    return render_template("highlights.html", form=form, min_count=MIN_COUNT, max_count=MAX_COUNT,
+                           recipient_days=DEFAULT_DAYS, recipient_min_days=MIN_DAYS, recipient_max_days=MAX_DAYS,
+                           **extra)
 
 
 @bp.route("/", methods=["GET"])
