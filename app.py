@@ -167,6 +167,7 @@ def create_app(test_config=None):
     from routes.ghost import bp as ghost_bp
     from routes.guests import bp as guests_bp
     from routes.harmony import bp as harmony_bp
+    from routes.highlights import bp as highlights_bp
     from routes.hosts import bp as hosts_bp
     from routes.ipmi import bp as ipmi_bp
     from routes.jibri import bp as jibri_bp
@@ -207,6 +208,7 @@ def create_app(test_config=None):
     app.register_blueprint(applications_bp, url_prefix="/applications")
     app.register_blueprint(moderation_bp, url_prefix="/moderation")
     app.register_blueprint(active_users_bp, url_prefix="/active-users")
+    app.register_blueprint(highlights_bp, url_prefix="/highlights")
     app.register_blueprint(prometheus_metrics_bp)
     app.register_blueprint(prometheus_app_bp, url_prefix="/prometheus")
     app.register_blueprint(ipmi_bp, url_prefix="/ipmi")
