@@ -36,6 +36,18 @@ class TestQueryBuilding:
                        "u.disabled = false", "a.suspended_at IS NULL", "a.memorial = false"):
             assert clause in sql
 
+    def test_inactive_query(self):
+        sql = build_active_users_query(90, "inactive")
+        assert "u.current_sign_in_at IS NULL OR u.current_sign_in_at < now() - interval '90 days'" in sql
+        assert ">= now()" not in sql
+        # Same mailability filters as the active list.
+        for clause in ("a.domain IS NULL", "u.confirmed_at IS NOT NULL", "u.disabled = false",
+                       "a.suspended_at IS NULL", "a.memorial = false"):
+            assert clause in sql
+
+    def test_unknown_mode_falls_back_to_active(self):
+        assert build_active_users_query(30, "'; DROP TABLE users; --") == build_active_users_query(30)
+
     def test_query_never_interpolates_raw_input(self):
         sql = build_active_users_query("1 days'; DROP TABLE users; --")
         assert "DROP" not in sql
@@ -173,7 +185,7 @@ class TestRoutes:
         assert resp.status_code == 200
         assert b"2 active users in the last 30 days" in resp.data
         assert b"alice@example.com" in resp.data
-        mock_fetch.assert_called_once_with(30)
+        mock_fetch.assert_called_once_with(30, "active")
         with app.app_context():
             entry = AuditLog.query.filter_by(action="mastodon_active_users_view").order_by(AuditLog.id.desc()).first()
             assert entry is not None
@@ -194,6 +206,24 @@ class TestRoutes:
             assert entry is not None
             # Emails stay out of the audit trail.
             assert "@" not in (entry.details or "")
+
+    @patch("routes.active_users.fetch_active_users")
+    def test_inactive_preview_and_export(self, mock_fetch, app, auth_client):
+        from models import AuditLog
+
+        never = {"username": "carol", "email": "carol@example.com", "locale": "", "last_active": ""}
+        mock_fetch.return_value = ([never], None)
+        resp = auth_client.post("/active-users/preview", data={"days": "90", "mode": "inactive"})
+        assert resp.status_code == 200
+        assert b"1 user not signed in for 90 days" in resp.data
+        assert b"never" in resp.data
+        mock_fetch.assert_called_with(90, "inactive")
+
+        resp = auth_client.post("/active-users/export.csv", data={"days": "90", "mode": "inactive"})
+        assert "mastodon-inactive-users-90d-" in resp.headers["Content-Disposition"]
+        with app.app_context():
+            entry = AuditLog.query.filter_by(action="mastodon_active_users_export").order_by(AuditLog.id.desc()).first()
+            assert entry.resource_name == "inactive 90+ days"
 
     @patch("routes.active_users.fetch_active_users")
     def test_error_flashes_and_redirects(self, mock_fetch, auth_client):

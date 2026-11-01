@@ -11,7 +11,9 @@ is ever interpolated into a nested-quoted shell argument. The only
 caller-controlled value in the SQL is the look-back window, which is coerced
 to an ``int`` within :data:`MIN_DAYS`..:data:`MAX_DAYS` before it is used.
 
-"Active" means ``users.current_sign_in_at`` falls inside the window. Mastodon
+"Active" means ``users.current_sign_in_at`` falls inside the window;
+"inactive" (``mode="inactive"``) means it is older than the window or the
+account has never signed in, for re-engagement mailings. Mastodon
 refreshes that column at most once a day per session
 (``User::SIGN_IN_UPDATE_FREQUENCY``), so it is accurate to the day. Mastodon's
 own dashboard MAU figure comes from a Redis activity counter rather than this
@@ -36,6 +38,10 @@ QUERY_TIMEOUT = 60
 
 CSV_COLUMNS = ("username", "email", "locale", "last_active")
 
+MODE_ACTIVE = "active"
+MODE_INACTIVE = "inactive"
+MODES = (MODE_ACTIVE, MODE_INACTIVE)
+
 # Leading characters a spreadsheet treats as a formula. An email local part
 # may legitimately start with "=", "+" or "-", so these cells are prefixed
 # with an apostrophe in the CSV (OWASP CSV injection guidance).
@@ -51,22 +57,35 @@ def clamp_days(raw):
     return max(MIN_DAYS, min(MAX_DAYS, days))
 
 
-def build_active_users_query(days):
+def clamp_mode(raw):
+    """Coerce a mode from user input to one of :data:`MODES` (default active)."""
+    return raw if raw in MODES else MODE_ACTIVE
+
+
+def build_active_users_query(days, mode=MODE_ACTIVE):
     """Return the SQL selecting local, mailable accounts active within ``days`` days.
+
+    With ``mode="inactive"`` it selects the opposite: accounts whose last
+    sign-in is older than ``days`` days, or that never signed in.
 
     Excludes remote accounts, unconfirmed/unapproved sign-ups, disabled logins,
     suspended accounts and memorialised accounts. The result is a single JSON
-    array (one psql output line) so emails containing ``|`` or other
-    separators can't corrupt the row split.
+    array (json_agg may wrap it over several lines) so emails containing ``|``
+    or other separators can't corrupt the row split.
     """
     days = clamp_days(days)
+    if clamp_mode(mode) == MODE_INACTIVE:
+        window = ("AND (u.current_sign_in_at IS NULL "
+                  f"OR u.current_sign_in_at < now() - interval '{days} days') ")
+    else:
+        window = f"AND u.current_sign_in_at >= now() - interval '{days} days' "
     return (
-        "SELECT coalesce(json_agg(r ORDER BY r.last_active DESC), '[]'::json) FROM ("  # noqa: S608 — days is an int
+        "SELECT coalesce(json_agg(r ORDER BY r.last_active DESC NULLS LAST), '[]'::json) FROM ("  # noqa: S608 — days is an int
         "SELECT a.username, u.email, coalesce(u.locale, '') AS locale, "
         "to_char(u.current_sign_in_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS last_active "
         "FROM users u JOIN accounts a ON a.id = u.account_id "
         "WHERE a.domain IS NULL "
-        f"AND u.current_sign_in_at >= now() - interval '{days} days' "
+        f"{window}"
         "AND u.confirmed_at IS NOT NULL "
         "AND u.approved = true "
         "AND u.disabled = false "
@@ -97,7 +116,7 @@ def parse_active_users_output(stdout):
     return rows
 
 
-def fetch_active_users(days=DEFAULT_DAYS):
+def fetch_active_users(days=DEFAULT_DAYS, mode=MODE_ACTIVE):
     """Query the Mastodon DB guest for active local users.
 
     Returns ``(rows, None)`` on success or ``(None, message)`` on failure. The
@@ -127,7 +146,7 @@ def fetch_active_users(days=DEFAULT_DAYS):
     except ValueError:
         return None, "Configured Mastodon database name is invalid"
 
-    cmd = _build_mastodon_email_query_cmd(db_name, build_active_users_query(days))
+    cmd = _build_mastodon_email_query_cmd(db_name, build_active_users_query(days, mode))
 
     try:
         from clients.ssh_client import SSHClient

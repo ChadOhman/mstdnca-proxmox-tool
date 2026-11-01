@@ -7,8 +7,8 @@
 <div class="card bg-dark mb-4">
     <div class="card-body">
         <p class="mb-2">
-            Local Mastodon accounts that signed in during the selected window, read from the Mastodon database.
-            The list leaves out unconfirmed, unapproved, disabled, suspended and memorialized accounts.
+            Local Mastodon accounts that signed in during the selected window, or that haven't (including accounts
+            that never signed in), read from the Mastodon database. The list leaves out unconfirmed, unapproved, disabled, suspended and memorialized accounts.
         </p>
         <p class="small text-muted mb-3">
             Sign-in times are accurate to the day. Mastodon's own dashboard counts active users from a separate
@@ -18,7 +18,14 @@
         </p>
         <form method="post" class="d-flex flex-wrap gap-2 align-items-end">
             <div>
-                <label class="form-label small mb-1" for="active-days">Active within (days)</label>
+                <label class="form-label small mb-1" for="active-mode">Members who have</label>
+                <select class="form-select form-select-sm" id="active-mode" name="mode">
+                    <option value="active"{% if mode != 'inactive' %} selected{% endif %}>signed in within</option>
+                    <option value="inactive"{% if mode == 'inactive' %} selected{% endif %}>not signed in for</option>
+                </select>
+            </div>
+            <div>
+                <label class="form-label small mb-1" for="active-days">Days</label>
                 <input type="number" class="form-control form-control-sm" id="active-days" name="days"
                        value="{{ days }}" min="{{ min_days }}" max="{{ max_days }}" required style="width: 8rem">
             </div>
@@ -35,8 +42,13 @@
 {% if rows is not none %}
 <div class="card bg-dark">
     <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
-        <h5 class="mb-0">{{ total }} active user{{ '' if total == 1 else 's' }} in the last {{ days }} day{{ '' if days == 1 else 's' }}</h5>
-        {% if total > preview_limit %}<small class="text-muted">Showing the {{ preview_limit }} most recent; the CSV has all {{ total }}</small>{% endif %}
+        {% set plural_days = '' if days == 1 else 's' %}
+        {% if mode == 'inactive' %}
+        <h5 class="mb-0">{{ total }} user{{ '' if total == 1 else 's' }} not signed in for {{ days }} day{{ plural_days }}</h5>
+        {% else %}
+        <h5 class="mb-0">{{ total }} active user{{ '' if total == 1 else 's' }} in the last {{ days }} day{{ plural_days }}</h5>
+        {% endif %}
+        {% if total > preview_limit %}<small class="text-muted">Showing the {{ preview_limit }} most recently signed in; the CSV has all {{ total }}</small>{% endif %}
     </div>
     <div class="card-body">
         {% if rows %}
@@ -56,7 +68,7 @@
                         <td>@{{ row.username }}</td>
                         <td>{{ row.email }}</td>
                         <td>{{ row.locale }}</td>
-                        <td>{{ row.last_active }}</td>
+                        <td>{{ row.last_active or 'never' }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>

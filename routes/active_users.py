@@ -10,7 +10,10 @@ from core.mastodon_active_users import (
     DEFAULT_DAYS,
     MAX_DAYS,
     MIN_DAYS,
+    MODE_ACTIVE,
+    MODE_INACTIVE,
     clamp_days,
+    clamp_mode,
     fetch_active_users,
     rows_to_csv,
 )
@@ -38,41 +41,47 @@ def _no_store(response):
     return response
 
 
-def _audit(action, days, count):
-    log_action(action, "mastodon_active_users", resource_name=f"last {days} days",
-               details={"days": days, "count": count}, audience="moderators")
+def _window_label(days, mode):
+    return f"inactive {days}+ days" if mode == MODE_INACTIVE else f"last {days} days"
+
+
+def _audit(action, days, mode, count):
+    log_action(action, "mastodon_active_users", resource_name=_window_label(days, mode),
+               details={"days": days, "mode": mode, "count": count}, audience="moderators")
     db.session.commit()
 
 
 @bp.route("/", methods=["GET"])
 def index():
-    return render_template("active_users.html", days=DEFAULT_DAYS, min_days=MIN_DAYS, max_days=MAX_DAYS,
-                           rows=None, total=None, preview_limit=PREVIEW_LIMIT)
+    return render_template("active_users.html", days=DEFAULT_DAYS, mode=MODE_ACTIVE, min_days=MIN_DAYS,
+                           max_days=MAX_DAYS, rows=None, total=None, preview_limit=PREVIEW_LIMIT)
 
 
 @bp.route("/preview", methods=["POST"])
 def preview():
     days = clamp_days(request.form.get("days"))
-    rows, err = fetch_active_users(days)
+    mode = clamp_mode(request.form.get("mode"))
+    rows, err = fetch_active_users(days, mode)
     if err:
         flash(err, "error")
         return redirect(url_for("active_users.index"))
-    _audit("mastodon_active_users_view", days, len(rows))
-    return render_template("active_users.html", days=days, min_days=MIN_DAYS, max_days=MAX_DAYS,
+    _audit("mastodon_active_users_view", days, mode, len(rows))
+    return render_template("active_users.html", days=days, mode=mode, min_days=MIN_DAYS, max_days=MAX_DAYS,
                            rows=rows[:PREVIEW_LIMIT], total=len(rows), preview_limit=PREVIEW_LIMIT)
 
 
 @bp.route("/export.csv", methods=["POST"])
 def export_csv():
     days = clamp_days(request.form.get("days"))
-    rows, err = fetch_active_users(days)
+    mode = clamp_mode(request.form.get("mode"))
+    rows, err = fetch_active_users(days, mode)
     if err:
         flash(err, "error")
         return redirect(url_for("active_users.index"))
-    _audit("mastodon_active_users_export", days, len(rows))
+    _audit("mastodon_active_users_export", days, mode, len(rows))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     return Response(
         rows_to_csv(rows),
         mimetype="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="mastodon-active-users-{days}d-{stamp}.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="mastodon-{mode}-users-{days}d-{stamp}.csv"'},
     )
