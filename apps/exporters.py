@@ -93,6 +93,23 @@ KNOWN_EXPORTERS = {
         "config_file_path": "/etc/ipmi_exporter/config.yml",
         "extra_install_deps": ["freeipmi"],
     },
+    "nginxlog_exporter": {
+        "display_name": "nginx Access Log Exporter",
+        "github_repo": "martin-helmich/prometheus-nginxlog-exporter",
+        "binary_name": "prometheus-nginxlog-exporter",
+        "default_port": 4040,
+        "systemd_unit": "prometheus-nginxlog-exporter.service",
+        "requires_config": False,
+        "job_name": "nginxlog",
+        # goreleaser layout: <binary>_<ver>_linux_<arch>.tar.gz with the binary at the
+        # archive root, digests in checksums.txt.
+        "asset_style": "goreleaser",
+        # Listen address/port live in the config file (apps/nginxlog.py), not on the CLI.
+        "exec_args": ["-config-file=/etc/prometheus-nginxlog-exporter/config.yml"],
+        # nginx logs are group adm (0640) on Debian/Ubuntu.
+        "supplementary_groups": ["adm"],
+        "setup_hook": "nginxlog",
+    },
 }
 
 # Built-in exporters — these are part of the application itself (no binary to install).
@@ -292,10 +309,14 @@ def _release_asset_urls(info, binary, latest, dl_arch):
     ``sha256sums.txt`` next to the tarballs in the same release, so the digest
     can be checked on the target host before anything is unpacked as root.
     """
+    base = f"https://github.com/{info['github_repo']}/releases/download/v{latest}"
+    if info.get("asset_style") == "goreleaser":
+        # Binary sits at the archive root, so the extract dir is the workdir itself.
+        asset = f"{binary}_{latest}_linux_{dl_arch}.tar.gz"
+        return asset, f"{base}/{asset}", f"{base}/checksums.txt", ""
     vprefix = info.get("asset_version_prefix", "")
     extract_dir = f"{binary}-{vprefix}{latest}.linux-{dl_arch}"
     asset = f"{extract_dir}.tar.gz"
-    base = f"https://github.com/{info['github_repo']}/releases/download/v{latest}"
     return asset, f"{base}/{asset}", f"{base}/sha256sums.txt", extract_dir
 
 
@@ -352,15 +373,23 @@ def _generate_exporter_systemd_unit(exporter_type, port, env_file=None):
     if env_file:
         env_line = f"\nEnvironmentFile={env_file}"
 
-    extra_args = ""
-    for arg in info.get("exec_extra_args", []):
-        extra_args += f" \\\n  {arg}"
-    if info.get("config_file_path"):
-        extra_args += f" \\\n  --config.file={info['config_file_path']}"
-    exec_start = (
-        f"ExecStart=/usr/local/bin/{binary} \\\n"
-        f"  --web.listen-address=:{port}{extra_args}"
-    )
+    if info.get("supplementary_groups"):
+        env_line += "\nSupplementaryGroups=" + " ".join(info["supplementary_groups"])
+
+    if "exec_args" in info:
+        # Exporters that don't take Prometheus-style --web.listen-address flags.
+        args = "".join(f" \\\n  {arg}" for arg in info["exec_args"])
+        exec_start = f"ExecStart=/usr/local/bin/{binary}{args}"
+    else:
+        extra_args = ""
+        for arg in info.get("exec_extra_args", []):
+            extra_args += f" \\\n  {arg}"
+        if info.get("config_file_path"):
+            extra_args += f" \\\n  --config.file={info['config_file_path']}"
+        exec_start = (
+            f"ExecStart=/usr/local/bin/{binary} \\\n"
+            f"  --web.listen-address=:{port}{extra_args}"
+        )
 
     return f"""[Unit]
 Description={info['display_name']}
@@ -384,6 +413,26 @@ WantedBy=multi-user.target
 # ---------------------------------------------------------------------------
 # Install / Uninstall
 # ---------------------------------------------------------------------------
+
+def _run_setup_hook(info, ssh, instance, _log):
+    """Run an exporter's ``setup_hook`` after its binary is in place. Returns True on success."""
+    hook = info.get("setup_hook")
+    if not hook:
+        return True
+    if hook == "nginxlog":
+        from apps import nginxlog
+        return (nginxlog.setup_nginx_logging(ssh, _log)
+                and nginxlog.write_exporter_config(ssh, instance.port, info["binary_name"], _log))
+    _log(f"ERROR: Unknown setup hook {hook!r}.")
+    return False
+
+
+def _run_teardown_hook(info, ssh, _log):
+    """Undo an exporter's ``setup_hook`` during uninstall (best effort)."""
+    if info.get("setup_hook") == "nginxlog":
+        from apps import nginxlog
+        nginxlog.teardown_nginx_logging(ssh, _log)
+
 
 def run_exporter_install(instance_id, log_callback=None):
     """Install an exporter on the target guest via SSH.
@@ -468,7 +517,7 @@ def run_exporter_install(instance_id, log_callback=None):
 
             # Install binary
             _log("Installing binary...")
-            src = shlex.quote(f"{workdir}/{extract_dir}/{binary}")
+            src = shlex.quote("/".join(part for part in (workdir, extract_dir, binary) if part))
             stdout, stderr, code = ssh.execute_sudo(
                 f"cp {src} /usr/local/bin/ && "
                 f"chown {binary}:{binary} /usr/local/bin/{binary}",
@@ -477,6 +526,13 @@ def run_exporter_install(instance_id, log_callback=None):
             _log_cmd_output(_log, stdout, stderr, code)
             if code != 0:
                 _log("ERROR: Failed to install binary.")
+                _cleanup_workdir(ssh, workdir)
+                instance.status = "failed"
+                db.session.commit()
+                return False, log_lines
+
+            # Exporter-specific setup on the guest (e.g. nginx log format + config file)
+            if not _run_setup_hook(info, ssh, instance, _log):
                 _cleanup_workdir(ssh, workdir)
                 instance.status = "failed"
                 db.session.commit()
@@ -628,6 +684,8 @@ def run_exporter_uninstall(instance_id, log_callback=None):
             )
             _log_cmd_output(_log, stdout, stderr, code)
 
+            _run_teardown_hook(info, ssh, _log)
+
             _log(f"{info['display_name']} uninstalled successfully.")
 
             instance.status = "removed"
@@ -676,7 +734,7 @@ def _install_host_exporter_release(ssh, info, binary, _log, exporter_type):
 
     # Install binary
     _log("Installing binary...")
-    src = shlex.quote(f"{workdir}/{extract_dir}/{binary}")
+    src = shlex.quote("/".join(part for part in (workdir, extract_dir, binary) if part))
     stdout, stderr, code = ssh.execute_sudo(
         f"cp {src} /usr/local/bin/ && "
         f"chown {binary}:{binary} /usr/local/bin/{binary}",

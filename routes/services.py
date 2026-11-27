@@ -1167,6 +1167,110 @@ def mastodon_metrics_history(service_id):
     return jsonify({"snapshots": [], "source": "none"})
 
 
+@bp.route("/<int:service_id>/mastodon/traffic-breakdown")
+def mastodon_traffic_breakdown(service_id):
+    """Per-status and per-endpoint request totals for a Mastodon web (Puma) service."""
+    from models import Setting
+
+    svc = GuestService.query.get_or_404(service_id)
+    if "sidekiq" in svc.service_name or not any(n in svc.service_name for n in ("mastodon", "puma")):
+        return jsonify({"error": "Not a Mastodon web service"}), 400
+
+    timeframe = request.args.get("timeframe", "day")
+    empty = {"available": False, "statuses": [], "endpoints": [], "detailed": False, "has_status": False}
+
+    if Setting.get("prometheus_enabled", "false") != "true" or not Setting.get("prometheus_url", ""):
+        return jsonify({**empty, "reason": "Prometheus is not configured."})
+
+    from clients.prometheus_query import PrometheusQueryClient, _get_exporter_target
+
+    mastodon_target = _get_exporter_target(svc.guest_id, "mastodon")
+    if not mastodon_target:
+        return jsonify({**empty, "reason": "The Mastodon exporter is not enabled on this guest."})
+
+    try:
+        data = PrometheusQueryClient().get_mastodon_traffic_breakdown(mastodon_target, timeframe)
+    except Exception:
+        logger.debug("Prometheus query failed for Mastodon traffic breakdown", exc_info=True)
+        return jsonify({**empty, "reason": "Prometheus query failed."})
+
+    return jsonify({**data, "available": True})
+
+
+def _nginxlog_targets():
+    """Scrape targets of installed nginx log exporters on guests the current user may access."""
+    from models import ExporterInstance
+
+    targets = []
+    for exp in ExporterInstance.query.filter_by(exporter_type="nginxlog_exporter", status="installed").all():
+        guest = exp.guest
+        if guest is None or not current_user.may_access_guest(guest):
+            continue
+        ip = (guest.ip_address or "").strip()
+        if not ip or ip.lower() in ("dhcp", "dhcp6", "auto"):
+            continue
+        targets.append(f"{ip}:{exp.port}")
+    return targets
+
+
+def _edge_traffic_request(service_id):
+    """Shared checks for the nginx edge-traffic endpoints.
+
+    Returns ``(client, targets, timeframe, vhost, None)`` or ``(.., error_response)``.
+    """
+    from models import Setting
+
+    svc = GuestService.query.get_or_404(service_id)
+    if "sidekiq" in svc.service_name or not any(n in svc.service_name for n in ("mastodon", "puma")):
+        return None, None, None, None, (jsonify({"error": "Not a Mastodon web service"}), 400)
+
+    timeframe = request.args.get("timeframe", "day")
+    vhost = request.args.get("vhost") or None
+    if vhost is not None and (len(vhost) > 255 or any(ord(c) < 32 for c in vhost)):
+        return None, None, None, None, (jsonify({"error": "Invalid vhost"}), 400)
+
+    if Setting.get("prometheus_enabled", "false") != "true" or not Setting.get("prometheus_url", ""):
+        return None, None, None, None, jsonify({"available": False, "reason": "Prometheus is not configured."})
+
+    targets = _nginxlog_targets()
+    if not targets:
+        return None, None, None, None, jsonify({
+            "available": False, "not_installed": True,
+            "reason": "No nginx Access Log Exporter is installed. Add one on the Prometheus page.",
+        })
+
+    from clients.prometheus_query import PrometheusQueryClient
+    return PrometheusQueryClient(), targets, timeframe, vhost, None
+
+
+@bp.route("/<int:service_id>/mastodon/edge-traffic")
+def mastodon_edge_traffic(service_id):
+    """Time series of nginx-level traffic in front of a Mastodon web service."""
+    prom, targets, timeframe, vhost, err = _edge_traffic_request(service_id)
+    if err is not None:
+        return err
+    try:
+        data = prom.get_nginx_traffic_metrics(targets, timeframe, vhost=vhost)
+    except Exception:
+        logger.debug("Prometheus query failed for nginx edge traffic", exc_info=True)
+        return jsonify({"available": False, "reason": "Prometheus query failed."})
+    return jsonify({**data, "available": True})
+
+
+@bp.route("/<int:service_id>/mastodon/edge-traffic-breakdown")
+def mastodon_edge_traffic_breakdown(service_id):
+    """nginx-level totals by vhost, route, client class, cache and status."""
+    prom, targets, timeframe, vhost, err = _edge_traffic_request(service_id)
+    if err is not None:
+        return err
+    try:
+        data = prom.get_nginx_traffic_breakdown(targets, timeframe, vhost=vhost)
+    except Exception:
+        logger.debug("Prometheus query failed for nginx edge traffic breakdown", exc_info=True)
+        return jsonify({"available": False, "reason": "Prometheus query failed."})
+    return jsonify({**data, "available": True})
+
+
 def save_service_snapshot(svc, data):
     """Persist a metric snapshot for services that support historical charts."""
     snapshot_data = None

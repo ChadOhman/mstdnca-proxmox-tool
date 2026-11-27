@@ -1090,17 +1090,23 @@ class TestEnableMastodonExporter:
         with app.app_context():
             # Guest without credential, and no default credential exists
             guest = _create_guest(app, name="masto-nocred", ip="10.0.0.80")
-            # Ensure no default credential
-            Credential.query.filter_by(is_default=True).update({"is_default": False})
+            # Ensure no default credential — and restore the flags afterwards, or every
+            # later test that relies on the default credential fails depending on order.
+            leaked = Credential.query.filter_by(is_default=True).all()
+            for cred in leaked:
+                cred.is_default = False
             db.session.commit()
 
-            log = []
-            result = enable_mastodon_exporter(guest.id, log_callback=log.append)
-            assert result is False
-            assert any("No SSH credential" in m for m in log)
-
-            db.session.delete(guest)
-            db.session.commit()
+            try:
+                log = []
+                result = enable_mastodon_exporter(guest.id, log_callback=log.append)
+                assert result is False
+                assert any("No SSH credential" in m for m in log)
+            finally:
+                db.session.delete(guest)
+                for cred in leaked:
+                    cred.is_default = True
+                db.session.commit()
 
     def test_no_ip(self, app):
         from apps.exporters import enable_mastodon_exporter

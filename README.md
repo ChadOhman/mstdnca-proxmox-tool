@@ -242,6 +242,21 @@ The upgrade process:
 
 Enable **automatic upgrades** to have this run whenever a new release is detected.
 
+## Mastodon Traffic Metrics
+
+With Prometheus configured, the Puma service page shows traffic at two levels:
+
+- **Traffic Breakdown** (Rails): requests by status code and the top `controller#action` endpoints with latency, share of Puma time and 5xx counts. It uses the Mastodon built-in exporter and needs **Detailed web metrics** turned on.
+- **Edge Traffic (nginx)**: requests, bandwidth, p50/p95 latency, and a breakdown by route group, client type (fediverse servers, apps, browsers, bots), proxy cache status and status code. It needs the **nginx Access Log Exporter** ([prometheus-nginxlog-exporter](https://github.com/martin-helmich/prometheus-nginxlog-exporter)) installed on the nginx guest from **Prometheus → Exporters**.
+
+Installing the nginx exporter:
+
+- adds `/etc/nginx/conf.d/mstdnca-metrics-log.conf`, which defines a JSON `log_format` and writes a separate log at `/var/log/nginx/mstdnca-metrics.log`. That log has no client IPs, referrers or cookies. nginx is checked with `nginx -t` before the reload, and the snippet is removed again if the check fails.
+- logs a warning for each `server`/`location` block that sets its own `access_log` (including `access_log off`). nginx doesn't inherit `access_log` into such blocks, so add `access_log /var/log/nginx/mstdnca-metrics.log mstdnca_metrics;` to each one you want counted.
+- groups paths and user agents into fixed sets (see `apps/nginxlog.py`) and labels sites by `$server_name`, so the number of Prometheus series stays bounded. The site picker on the card switches between vhosts on a shared proxy.
+
+Uninstalling removes the snippet, the log files and the exporter config. The new log is rotated by Debian's standard `/var/log/nginx/*.log` logrotate rule.
+
 ## Harmony Upgrades
 
 The **Applications > Harmony** page manages a [Harmony](https://docs.mony.lol/self-host/) chat server

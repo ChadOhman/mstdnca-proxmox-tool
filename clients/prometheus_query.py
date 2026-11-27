@@ -7,6 +7,7 @@ gracefully when Prometheus is unreachable.
 """
 
 import logging
+import re
 import time
 import zoneinfo
 from datetime import datetime, timezone
@@ -71,6 +72,10 @@ _TIMEFRAMES = {
     "year": (31536000, 86400),
     "365d": (31536000, 86400),
 }
+
+
+# Extra label matcher for 5xx responses, appended inside an existing {...} selector.
+_STATUS_5XX = ',status=~"5.."'
 
 
 def escape_label_value(value):
@@ -437,6 +442,14 @@ class PrometheusQueryClient:
                 f'sum(ruby_puma_running_threads{{{inst}}}) / '
                 f'clamp_min(sum(ruby_puma_max_threads{{{inst}}}), 1) * 100'
             ),
+            # Request rate per HTTP status class. `or vector(0)` keeps a class that saw no
+            # traffic in the window at 0 instead of dropping the whole series.
+            **{
+                f"puma_rate_{cls}xx": (
+                    f'sum(rate(ruby_http_requests_total{{{inst},status=~"{cls}.."}}[{ri}])) or vector(0)'
+                )
+                for cls in range(2, 6)
+            },
             "puma_backlog": f'sum(ruby_puma_backlog{{{inst}}})',
             "puma_rss_memory": f'sum(ruby_rss{{{inst}}})',
             # -- Sidekiq --
@@ -458,6 +471,248 @@ class PrometheusQueryClient:
         }
 
         return self._run_snapshot_queries(queries, start, end, step, source="mastodon_exporter")
+
+    def get_mastodon_traffic_breakdown(self, target, timeframe="day", limit=15):
+        """Summarise Mastodon web traffic over *timeframe* by status code and by endpoint.
+
+        Relies on the ``controller``/``action``/``status`` labels the prometheus_exporter
+        gem's Rails middleware attaches to ``ruby_http_requests_total`` (and
+        ``controller``/``action`` on the duration summaries). Mastodon only uses that
+        middleware when ``MASTODON_PROMETHEUS_EXPORTER_WEB_DETAILED_METRICS=true``; without
+        it the series carry no endpoint labels, which is reported as ``detailed: False``.
+
+        All figures are totals over the window (``increase(...[window])``), evaluated as
+        instant queries, so the result is a single table rather than a time series.
+        """
+        dur, _step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
+        limit = max(1, min(int(limit), 50))
+        inst = f'instance="{escape_label_value(target)}"'
+        win = f"{dur}s"
+        by = "controller, action"
+
+        def _inc(metric, extra=""):
+            return f"increase({metric}{{{inst}{extra}}}[{win}])"
+
+        reqs = "ruby_http_requests_total"
+        dur_sum = "ruby_http_request_duration_seconds_sum"
+        dur_count = "ruby_http_request_duration_seconds_count"
+
+        errors_5xx = _inc(reqs, ',status=~"5.."')
+        queries = {
+            "total": f"sum({_inc(reqs)})",
+            "time_total": f"sum({_inc(dur_sum)})",
+            "by_status": f"sum by (status) ({_inc(reqs)})",
+            "top": f"topk({limit}, sum by ({by}) ({_inc(reqs)}))",
+            "errors": f"sum by ({by}) ({errors_5xx})",
+            "time": f"sum by ({by}) ({_inc(dur_sum)})",
+            "count": f"sum by ({by}) ({_inc(dur_count)})",
+        }
+
+        results = {}
+        for name, promql in queries.items():
+            try:
+                results[name] = self.query(promql)
+            except Exception:
+                logger.debug("Prometheus instant query failed for %s", promql, exc_info=True)
+                results[name] = []
+
+        def _val(series):
+            try:
+                return float(series.get("value", [None, None])[1])
+            except (TypeError, ValueError, IndexError):
+                return 0.0
+
+        def _scalar(name):
+            rows = results.get(name) or []
+            return _val(rows[0]) if rows else 0.0
+
+        def _key(series):
+            m = series.get("metric", {})
+            return (m.get("controller", ""), m.get("action", ""))
+
+        total = _scalar("total")
+        time_total = _scalar("time_total")
+
+        statuses = []
+        for s in results["by_status"]:
+            n = _val(s)
+            if n <= 0:
+                continue
+            statuses.append({
+                "status": s.get("metric", {}).get("status", "") or "unknown",
+                "requests": round(n),
+                "share": round(n / total * 100, 2) if total else 0.0,
+            })
+        statuses.sort(key=lambda r: r["requests"], reverse=True)
+
+        errors = {_key(s): _val(s) for s in results["errors"]}
+        times = {_key(s): _val(s) for s in results["time"]}
+        counts = {_key(s): _val(s) for s in results["count"]}
+
+        endpoints = []
+        detailed = False
+        for s in results["top"]:
+            controller, action = _key(s)
+            if controller or action:
+                detailed = True
+            n = _val(s)
+            if n <= 0:
+                continue
+            key = (controller, action)
+            err = errors.get(key, 0.0)
+            t = times.get(key, 0.0)
+            c = counts.get(key, 0.0)
+            endpoints.append({
+                "controller": controller,
+                "action": action,
+                "requests": round(n),
+                "share": round(n / total * 100, 2) if total else 0.0,
+                "errors_5xx": round(err),
+                "error_pct": round(err / n * 100, 2) if n else 0.0,
+                "avg_ms": round(t / c * 1000, 1) if c else None,
+                "time_share": round(t / time_total * 100, 2) if time_total else None,
+            })
+        endpoints.sort(key=lambda r: r["requests"], reverse=True)
+
+        # A status label alone (without controller/action) still counts as detailed enough
+        # for the status table; only the endpoint table needs the Rails labels.
+        has_status = any(r["status"] != "unknown" for r in statuses)
+
+        return {
+            "source": "mastodon_exporter",
+            "timeframe": timeframe,
+            "total_requests": round(total),
+            "detailed": detailed,
+            "has_status": has_status,
+            "statuses": statuses,
+            "endpoints": endpoints if detailed else [],
+        }
+
+    # ----- nginx access-log exporter (apps/nginxlog.py) -----
+
+    @staticmethod
+    def _nginx_selector(targets, vhost=None):
+        """Label matcher for the given exporter targets (and optionally one vhost)."""
+        alternation = "|".join(re.escape(t) for t in sorted(targets))
+        sel = f'instance=~"{escape_label_value(alternation)}"'
+        if vhost:
+            sel += f',vhost="{escape_label_value(vhost)}"'
+        return sel
+
+    def get_nginx_traffic_metrics(self, targets, timeframe="day", vhost=None):
+        """Time series of request rate, bandwidth, latency and client mix from nginx logs."""
+        dur, step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
+        end = time.time()
+        start = end - dur
+        sel = self._nginx_selector(targets, vhost)
+        ri = f"{max(step * 2, 120)}s"
+        count = "nginx_http_response_count_total"
+
+        def _quantile(q, metric):
+            return f"histogram_quantile({q}, sum by (le) (rate({metric}_bucket{{{sel}}}[{ri}])))"
+
+        queries = {
+            "req_rate": f"sum(rate({count}{{{sel}}}[{ri}]))",
+            "rate_5xx": f'sum(rate({count}{{{sel},status=~"5.."}}[{ri}])) or vector(0)',
+            "rate_4xx": f'sum(rate({count}{{{sel},status=~"4.."}}[{ri}])) or vector(0)',
+            "bytes_out_rate": f"sum(rate(nginx_http_response_size_bytes{{{sel}}}[{ri}]))",
+            "bytes_in_rate": f"sum(rate(nginx_http_request_size_bytes{{{sel}}}[{ri}]))",
+            "p50_response_time": _quantile(0.5, "nginx_http_response_time_seconds_hist"),
+            "p95_response_time": _quantile(0.95, "nginx_http_response_time_seconds_hist"),
+            "p95_upstream_time": _quantile(0.95, "nginx_http_upstream_time_seconds_hist"),
+            **{
+                f"client_{cls}": f'sum(rate({count}{{{sel},client="{cls}"}}[{ri}])) or vector(0)'
+                for cls in ("fediverse", "app", "browser", "bot")
+            },
+            "client_other": f'sum(rate({count}{{{sel},client=~"other|none|"}}[{ri}])) or vector(0)',
+        }
+        return self._run_snapshot_queries(queries, start, end, step, source="nginxlog_exporter")
+
+    def get_nginx_traffic_breakdown(self, targets, timeframe="day", vhost=None):
+        """Totals over *timeframe* by vhost, route, client class, cache status and HTTP status.
+
+        When *vhost* is None the busiest vhost in the window is chosen, so the
+        page shows one site rather than every site on a shared proxy summed up.
+        """
+        dur, _step = _TIMEFRAMES.get(timeframe, _TIMEFRAMES["day"])
+        win = f"{dur}s"
+        all_sel = self._nginx_selector(targets)
+        count = "nginx_http_response_count_total"
+
+        def _rows(promql):
+            try:
+                return self.query(promql)
+            except Exception:
+                logger.debug("Prometheus instant query failed for %s", promql, exc_info=True)
+                return []
+
+        def _val(series):
+            try:
+                return float(series.get("value", [None, None])[1])
+            except (TypeError, ValueError, IndexError):
+                return 0.0
+
+        def _by(label, promql):
+            return {s.get("metric", {}).get(label, ""): _val(s) for s in _rows(promql)}
+
+        vhosts = _by("vhost", f"sum by (vhost) (increase({count}{{{all_sel}}}[{win}]))")
+        vhost_list = sorted(
+            ({"vhost": k or "(none)", "value": k, "requests": round(v)} for k, v in vhosts.items() if v > 0),
+            key=lambda r: r["requests"], reverse=True,
+        )
+        if vhost is None and vhost_list:
+            vhost = vhost_list[0]["value"]
+
+        sel = self._nginx_selector(targets, vhost)
+
+        def _inc(metric, extra=""):
+            return f"increase({metric}{{{sel}{extra}}}[{win}])"
+
+        total = sum(_by("", f"sum({_inc(count)})").values())
+
+        def _table(label, extra_cols=None):
+            counts = _by(label, f"sum by ({label}) ({_inc(count)})")
+            rows = []
+            for key, n in counts.items():
+                if n <= 0:
+                    continue
+                row = {label: key or "(none)", "requests": round(n),
+                       "share": round(n / total * 100, 2) if total else 0.0}
+                for col, values in (extra_cols or {}).items():
+                    row[col] = values(key, n)
+                rows.append(row)
+            rows.sort(key=lambda r: r["requests"], reverse=True)
+            return rows
+
+        route_bytes = _by("route", f"sum by (route) ({_inc('nginx_http_response_size_bytes')})")
+        route_5xx = _by("route", f"sum by (route) ({_inc(count, _STATUS_5XX)})")
+        route_time = _by("route", f"sum by (route) ({_inc('nginx_http_response_time_seconds_sum')})")
+        route_time_n = _by("route", f"sum by (route) ({_inc('nginx_http_response_time_seconds_count')})")
+        bytes_total = sum(route_bytes.values())
+
+        routes = _table("route", {
+            "bytes": lambda k, n: round(route_bytes.get(k, 0.0)),
+            "bytes_share": lambda k, n: round(route_bytes.get(k, 0.0) / bytes_total * 100, 2) if bytes_total else 0.0,
+            "errors_5xx": lambda k, n: round(route_5xx.get(k, 0.0)),
+            "avg_ms": lambda k, n: (round(route_time.get(k, 0.0) / route_time_n[k] * 1000, 1)
+                                    if route_time_n.get(k) else None),
+        })
+
+        parse_errors = sum(_by("", f"sum(increase(nginx_parse_errors_total{{{all_sel}}}[{win}]))").values())
+
+        return {
+            "source": "nginxlog_exporter",
+            "timeframe": timeframe,
+            "vhost": vhost,
+            "vhosts": vhost_list,
+            "total_requests": round(total),
+            "total_bytes": round(bytes_total),
+            "parse_errors": round(parse_errors),
+            "routes": routes,
+            "clients": _table("client"),
+            "cache": _table("cache"),
+            "statuses": _table("status"),
+        }
 
     def get_ipmi_metrics_exporter(self, target, timeframe="day"):
         """Query ipmi_exporter metrics and return snapshots."""
@@ -504,15 +759,18 @@ class PrometheusQueryClient:
 
         for short_name, promql in queries.items():
             result = self._range_single(promql, start, end, step)
-            all_series[short_name] = result.get("values", [])
+            # Keyed by timestamp, not position: series cover different spans (a query
+            # ending in `or vector(0)` has a point at every step, a real series only
+            # where data exists), so positional pairing would shift values in time.
+            all_series[short_name] = dict(zip(result.get("timestamps", []), result.get("values", []), strict=True))
             if not timestamps and result.get("timestamps"):
                 timestamps = result["timestamps"]
 
         snapshots = []
-        for i, ts in enumerate(timestamps):
+        for ts in timestamps:
             snap = {"captured_at": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()}
             for name, values in all_series.items():
-                snap[name] = values[i] if i < len(values) else None
+                snap[name] = values.get(ts)
             snapshots.append(snap)
 
         return {"snapshots": snapshots, "source": source}

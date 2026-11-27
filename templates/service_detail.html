@@ -1123,6 +1123,133 @@
                     <canvas id="puma-chart-rss" height="120" role="img" aria-label="Puma RSS memory over time"></canvas>
                 </div>
             </div>
+            <div class="row g-3 mt-0">
+                <div class="col-md-8">
+                    <div class="text-muted small mb-1">Requests by Status Class (req/sec)</div>
+                    <canvas id="puma-chart-status" height="90" role="img" aria-label="Puma request rate by HTTP status class over time"></canvas>
+                </div>
+                <div class="col-md-4">
+                    <div class="text-muted small mb-1">5xx Error Rate (%)</div>
+                    <canvas id="puma-chart-errpct" height="180" role="img" aria-label="Puma 5xx error percentage over time"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Puma Traffic Breakdown (totals over the selected timeframe) -->
+<div class="card bg-dark mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-bar-chart"></i> Traffic Breakdown <span id="pumaTrafficTotal" class="badge bg-secondary ms-2 d-none" style="font-size: 0.65rem;"></span></h5>
+        <span class="text-muted small" id="pumaTrafficWindow"></span>
+    </div>
+    <div class="card-body">
+        <div id="pumaTrafficLoading" class="text-center text-muted py-3">
+            <div class="spinner-border spinner-border-sm me-2" role="status"></div>Loading traffic breakdown...
+        </div>
+        <div id="pumaTrafficError" class="text-center text-muted py-3 d-none"></div>
+        <div id="pumaTraffic" class="row g-3 d-none">
+            <div class="col-lg-3">
+                <div class="text-muted small mb-1">By Status Code</div>
+                <table class="table table-dark table-sm mb-0" aria-label="Requests by HTTP status code">
+                    <thead><tr><th>Status</th><th class="text-end">Requests</th><th class="text-end">%</th></tr></thead>
+                    <tbody id="pumaTrafficStatus"></tbody>
+                </table>
+            </div>
+            <div class="col-lg-9">
+                <div class="text-muted small mb-1">Top Endpoints</div>
+                <div id="pumaTrafficNoDetail" class="text-muted small d-none">
+                    Per-endpoint data needs detailed web metrics. Turn on <strong>Detailed web metrics</strong>
+                    in the Mastodon exporter settings on the Prometheus page (<code>MASTODON_PROMETHEUS_EXPORTER_WEB_DETAILED_METRICS=true</code>).
+                </div>
+                <div class="table-responsive" id="pumaTrafficEndpointsWrap">
+                    <table class="table table-dark table-sm mb-0" aria-label="Top Mastodon endpoints by request count">
+                        <thead><tr>
+                            <th>Controller#Action</th>
+                            <th class="text-end">Requests</th>
+                            <th class="text-end">% Traffic</th>
+                            <th class="text-end">Avg (ms)</th>
+                            <th class="text-end" title="Share of total Puma request time spent in this endpoint">% Time</th>
+                            <th class="text-end">5xx</th>
+                        </tr></thead>
+                        <tbody id="pumaTrafficEndpoints"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Edge Traffic (nginx access logs via prometheus-nginxlog-exporter) -->
+<div class="card bg-dark mb-4" id="edgeTrafficCard">
+    <div class="card-header d-flex flex-wrap gap-2 justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-hdd-network"></i> Edge Traffic (nginx) <span id="edgeTotal" class="badge bg-secondary ms-2 d-none" style="font-size: 0.65rem;"></span></h5>
+        <div class="d-flex align-items-center gap-2">
+            <label for="edgeVhost" class="text-muted small mb-0">Site</label>
+            <select id="edgeVhost" class="form-select form-select-sm bg-dark text-light" style="width:auto; max-width: 18rem;" disabled></select>
+        </div>
+    </div>
+    <div class="card-body">
+        <div id="edgeLoading" class="text-center text-muted py-3">
+            <div class="spinner-border spinner-border-sm me-2" role="status"></div>Loading edge traffic...
+        </div>
+        <div id="edgeError" class="text-center text-muted py-3 d-none"></div>
+        <div id="edgeParseWarn" class="alert alert-warning py-1 small d-none"></div>
+        <div id="edgeContent" class="d-none">
+            <div class="row g-3 mb-3">
+                <div class="col-md-6 col-xl-3">
+                    <div class="text-muted small mb-1">Requests (req/sec)</div>
+                    <canvas id="edge-chart-req" height="140" role="img" aria-label="nginx request rate and error rates over time"></canvas>
+                </div>
+                <div class="col-md-6 col-xl-3">
+                    <div class="text-muted small mb-1">Bandwidth (Mbit/s)</div>
+                    <canvas id="edge-chart-bw" height="140" role="img" aria-label="nginx bandwidth in and out over time"></canvas>
+                </div>
+                <div class="col-md-6 col-xl-3">
+                    <div class="text-muted small mb-1">Response Time (ms)</div>
+                    <canvas id="edge-chart-latency" height="140" role="img" aria-label="nginx p50 and p95 response time over time"></canvas>
+                </div>
+                <div class="col-md-6 col-xl-3">
+                    <div class="text-muted small mb-1">Requests by Client (req/sec)</div>
+                    <canvas id="edge-chart-clients" height="140" role="img" aria-label="nginx request rate by client class over time"></canvas>
+                </div>
+            </div>
+            <div class="row g-3">
+                <div class="col-xl-8">
+                    <div class="text-muted small mb-1">By Route</div>
+                    <div class="table-responsive">
+                        <table class="table table-dark table-sm mb-0" aria-label="Requests by route group">
+                            <thead><tr>
+                                <th>Route</th>
+                                <th class="text-end">Requests</th>
+                                <th class="text-end">% Req</th>
+                                <th class="text-end">Sent</th>
+                                <th class="text-end">% Bytes</th>
+                                <th class="text-end">Avg (ms)</th>
+                                <th class="text-end">5xx</th>
+                            </tr></thead>
+                            <tbody id="edgeRoutes"></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="col-xl-4">
+                    <div class="text-muted small mb-1">By Client</div>
+                    <table class="table table-dark table-sm mb-3" aria-label="Requests by client class">
+                        <thead><tr><th>Client</th><th class="text-end">Requests</th><th class="text-end">%</th></tr></thead>
+                        <tbody id="edgeClients"></tbody>
+                    </table>
+                    <div class="text-muted small mb-1">Proxy Cache</div>
+                    <table class="table table-dark table-sm mb-3" aria-label="Requests by proxy cache status">
+                        <thead><tr><th>Cache</th><th class="text-end">Requests</th><th class="text-end">%</th></tr></thead>
+                        <tbody id="edgeCache"></tbody>
+                    </table>
+                    <div class="text-muted small mb-1">By Status Code</div>
+                    <table class="table table-dark table-sm mb-0" aria-label="nginx requests by HTTP status code">
+                        <thead><tr><th>Status</th><th class="text-end">Requests</th><th class="text-end">%</th></tr></thead>
+                        <tbody id="edgeStatus"></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
     </div>
 </div>
@@ -3439,6 +3566,35 @@ function pumaLoadCharts(timeframe) {
         _pumaCharts.threads = makeOrUpdate(_pumaCharts.threads, 'puma-chart-threads', 'Utilization %', threadUtil, '#22c55e', v => v + '%');
         _pumaCharts.rss = makeOrUpdate(_pumaCharts.rss, 'puma-chart-rss', 'RSS (MB)', rssMb, '#06b6d4', v => v + 'MB');
 
+        // Status-class breakdown (multi-series, so it doesn't go through makeOrUpdate)
+        const statusClasses = [
+            ['2xx', 'puma_rate_2xx', '#22c55e'],
+            ['3xx', 'puma_rate_3xx', '#3b82f6'],
+            ['4xx', 'puma_rate_4xx', '#f59e0b'],
+            ['5xx', 'puma_rate_5xx', '#ef4444'],
+        ];
+        const statusDatasets = statusClasses.map(([label, key, color]) => ({
+            label: label,
+            data: snaps.map(s => s[key] != null ? +Number(s[key]).toFixed(2) : null),
+            borderColor: color, backgroundColor: color + '22', fill: false, tension: 0.3, pointRadius: 0,
+        }));
+        if (_pumaCharts.status) {
+            _pumaCharts.status.data.labels = labels;
+            _pumaCharts.status.data.datasets.forEach((ds, i) => { ds.data = statusDatasets[i].data; });
+            _pumaCharts.status.update();
+        } else {
+            var statusOpts = JSON.parse(JSON.stringify(chartOpts));
+            statusOpts.options.plugins.legend = {display: true, labels: {color: '#adb5bd', boxWidth: 12}};
+            statusOpts.data = {labels: labels, datasets: statusDatasets};
+            _pumaCharts.status = new Chart(document.getElementById('puma-chart-status'), statusOpts);
+        }
+        const errPct = snaps.map(s => {
+            const tot = ['puma_rate_2xx', 'puma_rate_3xx', 'puma_rate_4xx', 'puma_rate_5xx']
+                .reduce((a, k) => a + (Number(s[k]) || 0), 0);
+            return tot > 0 ? +((Number(s.puma_rate_5xx) || 0) / tot * 100).toFixed(2) : null;
+        });
+        _pumaCharts.errpct = makeOrUpdate(_pumaCharts.errpct, 'puma-chart-errpct', '5xx %', errPct, '#ef4444', v => v + '%');
+
         _loadDbRuntimeCharts(snaps, labels);
     })
     .catch(err => {
@@ -3453,10 +3609,265 @@ document.querySelectorAll('#pumaChartTimeframe button').forEach(btn => {
         document.querySelectorAll('#pumaChartTimeframe button').forEach(b => b.classList.remove('active'));
         this.classList.add('active');
         pumaLoadCharts(this.dataset.tf);
+        pumaLoadTraffic(this.dataset.tf);
     });
 });
 
-document.addEventListener('DOMContentLoaded', function() { pumaLoadCharts('day'); });
+function pumaLoadTraffic(timeframe) {
+    timeframe = timeframe || 'day';
+    const loading = document.getElementById('pumaTrafficLoading');
+    const errEl = document.getElementById('pumaTrafficError');
+    const wrap = document.getElementById('pumaTraffic');
+    const totalBadge = document.getElementById('pumaTrafficTotal');
+    const tfNames = {hour: 'last hour', day: 'last 24 hours', '3d': 'last 3 days', week: 'last 7 days', month: 'last 30 days'};
+    document.getElementById('pumaTrafficWindow').textContent = 'Totals over the ' + (tfNames[timeframe] || timeframe);
+    loading.classList.remove('d-none');
+    wrap.classList.add('d-none');
+    errEl.classList.add('d-none');
+    totalBadge.classList.add('d-none');
+
+    function cell(text, cls) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        if (cls) td.className = cls;
+        return td;
+    }
+    const fmt = n => (n == null ? '—' : Number(n).toLocaleString());
+
+    fetch('/services/{{ service.id }}/mastodon/traffic-breakdown?timeframe=' + encodeURIComponent(timeframe), {cache: 'no-store'})
+    .then(r => r.json())
+    .then(data => {
+        loading.classList.add('d-none');
+        if (!data.available || !data.total_requests) {
+            errEl.textContent = data.reason || 'No traffic recorded in this window.';
+            errEl.classList.remove('d-none');
+            return;
+        }
+        wrap.classList.remove('d-none');
+        totalBadge.textContent = fmt(data.total_requests) + ' requests';
+        totalBadge.classList.remove('d-none');
+
+        const statusBody = document.getElementById('pumaTrafficStatus');
+        statusBody.replaceChildren();
+        if (!data.has_status) {
+            const tr = document.createElement('tr');
+            const td = cell('No status labels reported.', 'text-muted');
+            td.colSpan = 3;
+            tr.appendChild(td);
+            statusBody.appendChild(tr);
+        }
+        (data.statuses || []).forEach(s => {
+            const tr = document.createElement('tr');
+            const code = String(s.status);
+            const cls = code.startsWith('5') ? 'text-danger' : code.startsWith('4') ? 'text-warning' : '';
+            tr.append(cell(code, cls), cell(fmt(s.requests), 'text-end'), cell(s.share + '%', 'text-end'));
+            statusBody.appendChild(tr);
+        });
+
+        const epBody = document.getElementById('pumaTrafficEndpoints');
+        epBody.replaceChildren();
+        document.getElementById('pumaTrafficNoDetail').classList.toggle('d-none', !!data.detailed);
+        document.getElementById('pumaTrafficEndpointsWrap').classList.toggle('d-none', !data.detailed);
+        (data.endpoints || []).forEach(e => {
+            const tr = document.createElement('tr');
+            const name = cell((e.controller || '?') + '#' + (e.action || '?'), 'font-monospace small');
+            const errCell = cell(fmt(e.errors_5xx) + (e.errors_5xx ? ' (' + e.error_pct + '%)' : ''),
+                                 'text-end' + (e.errors_5xx ? ' text-danger' : ''));
+            tr.append(
+                name,
+                cell(fmt(e.requests), 'text-end'),
+                cell(e.share + '%', 'text-end'),
+                cell(e.avg_ms == null ? '—' : e.avg_ms, 'text-end'),
+                cell(e.time_share == null ? '—' : e.time_share + '%', 'text-end'),
+                errCell,
+            );
+            epBody.appendChild(tr);
+        });
+    })
+    .catch(() => {
+        loading.classList.add('d-none');
+        errEl.textContent = 'Failed to load traffic breakdown.';
+        errEl.classList.remove('d-none');
+    });
+}
+
+let _edgeCharts = {};
+let _edgeTimeframe = 'day';
+
+function _edgeCell(text, cls) {
+    const td = document.createElement('td');
+    td.textContent = text;
+    if (cls) td.className = cls;
+    return td;
+}
+
+function _edgeBytes(n) {
+    if (n == null) return '—';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0, v = Number(n);
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i ? v.toFixed(1) : v.toFixed(0)) + ' ' + units[i];
+}
+
+function _edgeFillShareTable(tbodyId, rows, key, labelFn, clsFn) {
+    const body = document.getElementById(tbodyId);
+    body.replaceChildren();
+    if (!rows || !rows.length) {
+        const tr = document.createElement('tr');
+        const td = _edgeCell('No data.', 'text-muted');
+        td.colSpan = 3;
+        tr.appendChild(td);
+        body.appendChild(tr);
+        return;
+    }
+    rows.forEach(r => {
+        const tr = document.createElement('tr');
+        const label = labelFn ? labelFn(r[key]) : r[key];
+        tr.append(_edgeCell(label, clsFn ? clsFn(r[key]) : ''),
+                  _edgeCell(Number(r.requests).toLocaleString(), 'text-end'),
+                  _edgeCell(r.share + '%', 'text-end'));
+        body.appendChild(tr);
+    });
+}
+
+function _edgeLineChart(key, canvasId, labels, series, yCallback) {
+    const datasets = series.map(([label, data, color]) => ({
+        label: label, data: data, borderColor: color, backgroundColor: color + '22',
+        fill: false, tension: 0.3, pointRadius: 0,
+    }));
+    if (_edgeCharts[key]) {
+        _edgeCharts[key].data.labels = labels;
+        _edgeCharts[key].data.datasets.forEach((ds, i) => { ds.data = datasets[i].data; });
+        _edgeCharts[key].update();
+        return;
+    }
+    const opts = {
+        type: 'line',
+        data: {labels: labels, datasets: datasets},
+        options: {
+            responsive: true, animation: false,
+            plugins: {legend: {display: series.length > 1, labels: {color: '#adb5bd', boxWidth: 10}}},
+            scales: {
+                x: {ticks: {color: '#6c757d', maxTicksLimit: 6}, grid: {color: '#2d2d2d'}},
+                y: {ticks: {color: '#6c757d'}, grid: {color: '#2d2d2d'}, beginAtZero: true},
+            },
+        },
+    };
+    if (yCallback) opts.options.scales.y.ticks.callback = yCallback;
+    _edgeCharts[key] = new Chart(document.getElementById(canvasId), opts);
+}
+
+function edgeLoad(timeframe, vhost) {
+    _edgeTimeframe = timeframe || _edgeTimeframe;
+    const loading = document.getElementById('edgeLoading');
+    const errEl = document.getElementById('edgeError');
+    const content = document.getElementById('edgeContent');
+    const warn = document.getElementById('edgeParseWarn');
+    const select = document.getElementById('edgeVhost');
+    loading.classList.remove('d-none');
+    errEl.classList.add('d-none');
+    warn.classList.add('d-none');
+
+    const qs = new URLSearchParams({timeframe: _edgeTimeframe});
+    if (vhost) qs.set('vhost', vhost);
+    const base = '/services/{{ service.id }}/mastodon/';
+
+    function fail(msg) {
+        loading.classList.add('d-none');
+        content.classList.add('d-none');
+        errEl.textContent = msg;
+        errEl.classList.remove('d-none');
+    }
+
+    fetch(base + 'edge-traffic-breakdown?' + qs, {cache: 'no-store'})
+    .then(r => r.json())
+    .then(data => {
+        if (!data.available) { fail(data.reason || 'Edge traffic is unavailable.'); return; }
+        if (!data.total_requests && !(data.vhosts || []).length) { fail('No requests logged by nginx in this window.'); return; }
+
+        // Site selector, rebuilt each load so newly seen vhosts appear
+        select.replaceChildren();
+        (data.vhosts || []).forEach(v => {
+            const opt = document.createElement('option');
+            opt.value = v.value;
+            opt.textContent = v.vhost + ' (' + Number(v.requests).toLocaleString() + ')';
+            if (v.value === data.vhost) opt.selected = true;
+            select.appendChild(opt);
+        });
+        select.disabled = select.options.length < 2;
+
+        const badge = document.getElementById('edgeTotal');
+        badge.textContent = Number(data.total_requests).toLocaleString() + ' req · ' + _edgeBytes(data.total_bytes);
+        badge.classList.remove('d-none');
+
+        if (data.parse_errors) {
+            warn.textContent = Number(data.parse_errors).toLocaleString() + ' log lines could not be parsed in this window. '
+                + 'Something other than the mstdnca_metrics format may be writing to /var/log/nginx/mstdnca-metrics.log.';
+            warn.classList.remove('d-none');
+        }
+
+        const routes = document.getElementById('edgeRoutes');
+        routes.replaceChildren();
+        (data.routes || []).forEach(r => {
+            const tr = document.createElement('tr');
+            tr.append(
+                _edgeCell(r.route, 'font-monospace small'),
+                _edgeCell(Number(r.requests).toLocaleString(), 'text-end'),
+                _edgeCell(r.share + '%', 'text-end'),
+                _edgeCell(_edgeBytes(r.bytes), 'text-end'),
+                _edgeCell(r.bytes_share + '%', 'text-end'),
+                _edgeCell(r.avg_ms == null ? '—' : r.avg_ms, 'text-end'),
+                _edgeCell(Number(r.errors_5xx).toLocaleString(), 'text-end' + (r.errors_5xx ? ' text-danger' : '')),
+            );
+            routes.appendChild(tr);
+        });
+        const clientNames = {fediverse: 'Fediverse servers', app: 'Apps', browser: 'Browsers', bot: 'Bots & scripts',
+                             other: 'Other', none: 'No user agent'};
+        _edgeFillShareTable('edgeClients', data.clients, 'client', c => clientNames[c] || c);
+        _edgeFillShareTable('edgeCache', data.cache, 'cache', c => (c === 'none' ? 'Not cached' : c));
+        _edgeFillShareTable('edgeStatus', data.statuses, 'status', null,
+                            c => (String(c).startsWith('5') ? 'text-danger' : String(c).startsWith('4') ? 'text-warning' : ''));
+
+        const seriesQs = new URLSearchParams({timeframe: _edgeTimeframe});
+        if (data.vhost) seriesQs.set('vhost', data.vhost);
+        return fetch(base + 'edge-traffic?' + seriesQs, {cache: 'no-store'})
+        .then(r => r.json())
+        .then(ts => {
+            loading.classList.add('d-none');
+            content.classList.remove('d-none');
+            const snaps = ts.snapshots || [];
+            if (typeof Chart === 'undefined' || !snaps.length) return;
+            const _ctz = window.USER_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
+            const labels = snaps.map(s => new Date(s.captured_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', timeZone: _ctz}));
+            const col = (k, f) => snaps.map(s => (s[k] != null ? +(f ? f(Number(s[k])) : Number(s[k])).toFixed(2) : null));
+            const mbit = v => v * 8 / 1e6;
+            const ms = v => v * 1000;
+            _edgeLineChart('req', 'edge-chart-req', labels, [
+                ['All', col('req_rate'), '#3b82f6'], ['4xx', col('rate_4xx'), '#f59e0b'], ['5xx', col('rate_5xx'), '#ef4444'],
+            ]);
+            _edgeLineChart('bw', 'edge-chart-bw', labels, [
+                ['Out', col('bytes_out_rate', mbit), '#22c55e'], ['In', col('bytes_in_rate', mbit), '#06b6d4'],
+            ]);
+            _edgeLineChart('latency', 'edge-chart-latency', labels, [
+                ['p50', col('p50_response_time', ms), '#8b5cf6'], ['p95', col('p95_response_time', ms), '#f59e0b'],
+                ['p95 upstream', col('p95_upstream_time', ms), '#ef4444'],
+            ], v => v + 'ms');
+            _edgeLineChart('clients', 'edge-chart-clients', labels, [
+                ['Fediverse', col('client_fediverse'), '#8b5cf6'], ['Apps', col('client_app'), '#22c55e'],
+                ['Browsers', col('client_browser'), '#3b82f6'], ['Bots', col('client_bot'), '#f59e0b'],
+                ['Other', col('client_other'), '#6c757d'],
+            ]);
+        });
+    })
+    .catch(() => fail('Failed to load edge traffic.'));
+}
+
+document.getElementById('edgeVhost').addEventListener('change', function() { edgeLoad(null, this.value); });
+document.querySelectorAll('#pumaChartTimeframe button').forEach(btn => {
+    btn.addEventListener('click', function() { edgeLoad(this.dataset.tf, document.getElementById('edgeVhost').value || null); });
+});
+
+document.addEventListener('DOMContentLoaded', function() { pumaLoadCharts('day'); pumaLoadTraffic('day'); edgeLoad('day'); });
 {% endif %}{# stats.type == 'puma' #}
 
 {% if stats.type == 'sidekiq' %}
